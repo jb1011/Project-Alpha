@@ -6,7 +6,7 @@
  * fake answers in the real client's shapes and outcome types, and refuses the arguments the
  * service refuses, with the same tool and the same leading code (Kleros docs, "One dispute, from
  * creation to a ruling"), so a rehearsal catches what a real filing would. It never reaches the
- * network: beyond types, its only import is a hash.
+ * network: beyond types and the error classes, its only import is a hash.
  */
 import { createHash } from "node:crypto";
 import type { Address, Hex } from "viem";
@@ -19,7 +19,7 @@ import type {
   PinOutcome,
   SubmitOutcome,
 } from "./disputeService";
-import { KlerosRefusal } from "./errors";
+import { KlerosRefusal, KlerosTransportError } from "./errors";
 
 export type FakeScript =
   | "pay"
@@ -55,18 +55,19 @@ interface FakeCase {
   since: number;
 }
 
-const SCRIPTS: readonly string[] = [
-  "pay",
-  "refund",
-  "tie",
-  "refuse",
-  "stalled",
-  "unknown-create",
-  "unknown-submit",
-  "write-in-progress-once",
-  "insufficient-balance",
-  "simulated",
-];
+/** Keyed by the union, so the compiler refuses a script missing here or unknown to the type. */
+const SCRIPTS: Readonly<Record<FakeScript, true>> = {
+  pay: true,
+  refund: true,
+  tie: true,
+  refuse: true,
+  stalled: true,
+  "unknown-create": true,
+  "unknown-submit": true,
+  "write-in-progress-once": true,
+  "insufficient-balance": true,
+  simulated: true,
+};
 const TOOLS: readonly string[] = [
   "dispute_create",
   "evidence_pin",
@@ -151,7 +152,7 @@ export class FakeDisputeService implements KlerosDisputeService {
   constructor(o: FakeDisputeServiceOptions) {
     // The script and the counts may come from a command line: a typo must not rehearse another
     // outcome than the one asked for.
-    if (!SCRIPTS.includes(o.script)) {
+    if (!Object.hasOwn(SCRIPTS, o.script)) {
       throw new Error(`unknown fake Dispute Service script ${JSON.stringify(o.script)}`);
     }
     const firstId = o.firstCoreId ?? 1000;
@@ -304,43 +305,54 @@ export class FakeDisputeService implements KlerosDisputeService {
     return { status: "mined", txHash };
   }
 
-  /** Each case walks its own script, one step per read of that case. */
+  /**
+   * Each case walks its own script, one step per read of that case. An id the fake never created
+   * gets the error the real client raises for an empty `items`, so a rehearsal takes the path a
+   * real read would.
+   */
   async getDispute(p: { chain: KlerosReadChain; coreDisputeId: string }): Promise<DisputeRead> {
     const at = this.#record("dispute_get", p);
     const c = this.#cases.get(p.coreDisputeId);
-    if (c === undefined) throw new KlerosRefusal("dispute_get", notFound(p.coreDisputeId));
+    if (c === undefined) {
+      throw new KlerosTransportError(`Kleros dispute_get: dispute not found on ${p.chain}`);
+    }
     c.reads++;
     const { status, ruling, tied } = this.#step(c.reads);
     if (status !== c.status) {
       c.status = status;
       c.since = at;
     }
-    const ruled = status === "Executed";
-    const rulingLabel = labelOf(ruling);
-    const deadline = this.#deadline(status, at);
-    return {
+    // The item as dispute_get answers it (Kleros docs, "The fields that matter": the unresolved
+    // pair is always present, and `ruled` is read on chain). The typed read is taken from it, as
+    // the real client takes it from `items[0]`, so the two cannot drift.
+    const raw = {
+      id: p.coreDisputeId,
       status,
       ruling,
       tied,
-      ruled,
+      ruled: status === "Executed",
+      ruledSemantics: "onchain",
       roundCount: 1,
-      rulingLabel,
+      rulingLabel: labelOf(ruling),
       rulingOptions: options(),
-      deadline,
+      deadline: this.#deadline(status, at),
       lastPeriodChange: iso(c.since),
-      unresolvedFields: [],
-      raw: {
-        id: p.coreDisputeId,
-        status,
-        ruling,
-        tied,
-        ruled,
-        roundCount: 1,
-        rulingLabel,
-        rulingOptions: options(),
-        deadline,
-        chain: p.chain,
-      },
+      unresolvedFields: [] as string[],
+      unresolvedReason: null,
+      chain: p.chain,
+    };
+    return {
+      status: raw.status,
+      ruling: raw.ruling,
+      tied: raw.tied,
+      ruled: raw.ruled,
+      roundCount: raw.roundCount,
+      rulingLabel: raw.rulingLabel,
+      rulingOptions: raw.rulingOptions.map((o) => ({ ...o })),
+      deadline: raw.deadline,
+      lastPeriodChange: raw.lastPeriodChange,
+      unresolvedFields: [...raw.unresolvedFields],
+      raw,
     };
   }
 

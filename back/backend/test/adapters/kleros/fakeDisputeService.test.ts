@@ -12,13 +12,14 @@ import { readFileSync } from "node:fs";
 import type { Address } from "viem";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CreateOutcome, DisputeRead } from "../../../src/adapters/kleros/disputeService";
-import { KlerosRefusal, sentOf } from "../../../src/adapters/kleros/errors";
+import { KlerosRefusal, KlerosTransportError, sentOf } from "../../../src/adapters/kleros/errors";
 import {
   FakeDisputeService,
   type FakeDisputeServiceOptions,
   type FakeScript,
 } from "../../../src/adapters/kleros/fakeDisputeService";
 import {
+  HttpDisputeService,
   normaliseRulingValue,
   parseToolPayload,
 } from "../../../src/adapters/kleros/httpDisputeService";
@@ -77,16 +78,45 @@ async function reads(h: Harness, id: string, n: number): Promise<DisputeRead[]> 
   return out;
 }
 
-/** The refusal a call rejects with; the test fails when the call resolves. */
-async function refusal(p: Promise<unknown>): Promise<KlerosRefusal> {
-  const e = await p.then(
+/** What a call rejects with; the test fails when the call resolves. */
+async function rejection(p: Promise<unknown>): Promise<unknown> {
+  return p.then(
     () => {
-      throw new Error("expected a refusal, the call resolved");
+      throw new Error("expected the call to reject, it resolved");
     },
     (err: unknown) => err,
   );
+}
+
+/** The refusal a call rejects with. */
+async function refusal(p: Promise<unknown>): Promise<KlerosRefusal> {
+  const e = await rejection(p);
   expect(e).toBeInstanceOf(KlerosRefusal);
   return e as KlerosRefusal;
+}
+
+/** No such case: the error the real client raises for an empty `items`, naming the chain. */
+async function expectNoCase(p: Promise<unknown>, chain: string) {
+  const e = await rejection(p);
+  expect(e).toBeInstanceOf(KlerosTransportError);
+  expect((e as Error).message).toBe(`Kleros dispute_get: dispute not found on ${chain}`);
+}
+
+/** The real client on the testnet key, its fetch answering every call with `payload`. */
+function realClientAnswering(payload: unknown): HttpDisputeService {
+  const frame = {
+    jsonrpc: "2.0",
+    id: 1,
+    result: { content: [{ type: "text", text: JSON.stringify(payload) }] },
+  };
+  return new HttpDisputeService({
+    apiUrl: "https://dispute-service.example.test/mcp",
+    apiKey: "test-key-testnet",
+    deployment: "testnet",
+    fetch: async () =>
+      new Response(`event: message\ndata: ${JSON.stringify(frame)}\n\n`, { status: 200 }),
+    sleep: async () => {},
+  });
 }
 
 async function expectRefusal(p: Promise<unknown>, tool: string, code: string) {
@@ -236,11 +266,7 @@ describe("the period walk and the ruling of each script", () => {
     expectWarningThenJson(created.text, created.txHash);
     // Never mined, however often it is asked, and there is no case to read.
     expect((await h.service.createDispute({ aliases: ALIASES })).status).toBe("unknown");
-    await expectRefusal(
-      h.service.getDispute({ chain: "fake", coreDisputeId: "1000" }),
-      "dispute_get",
-      "DISPUTE_NOT_FOUND",
-    );
+    await expectNoCase(h.service.getDispute({ chain: "fake", coreDisputeId: "1000" }), "fake");
   });
 
   it("unknown-submit: the filing mines, the submission answers unknown, and the case still reaches a ruling", async () => {
@@ -298,11 +324,7 @@ describe("the period walk and the ruling of each script", () => {
       );
       expect(sentOf("dispute_create", e.code)).toBe("no");
     }
-    await expectRefusal(
-      h.service.getDispute({ chain: "fake", coreDisputeId: "1000" }),
-      "dispute_get",
-      "DISPUTE_NOT_FOUND",
-    );
+    await expectNoCase(h.service.getDispute({ chain: "fake", coreDisputeId: "1000" }), "fake");
   });
 
   it("simulated: answers the raw simulated status, and nothing exists to submit to or read", async () => {
@@ -313,11 +335,7 @@ describe("the period walk and the ruling of each script", () => {
       "evidence_submit",
       "DISPUTE_NOT_FOUND",
     );
-    await expectRefusal(
-      h.service.getDispute({ chain: "fake", coreDisputeId: "1000" }),
-      "dispute_get",
-      "DISPUTE_NOT_FOUND",
-    );
+    await expectNoCase(h.service.getDispute({ chain: "fake", coreDisputeId: "1000" }), "fake");
   });
 
   it.each([
@@ -397,19 +415,39 @@ describe("the period walk and the ruling of each script", () => {
       chain: "arbitrum-sepolia-testnet",
       coreDisputeId: id,
     });
+    const at = T0 + 3 * MINUTE;
     expect(read.raw).toEqual({
       id,
       status: "Appeal",
       ruling: "2",
       tied: false,
       ruled: false,
+      ruledSemantics: "onchain",
       roundCount: 1,
       rulingLabel: "Refund the client",
       rulingOptions: OPTIONS,
-      deadline: read.deadline,
+      deadline: iso(at + 36 * HOUR),
+      lastPeriodChange: iso(at),
+      unresolvedFields: [],
+      unresolvedReason: null,
       chain: "arbitrum-sepolia-testnet",
     });
   });
+
+  it.each(["pay", "tie", "stalled"] as const)(
+    "%s: every read is exactly what the real client makes of its raw item",
+    async (script) => {
+      const h = harness(script);
+      const id = await createMined(h.service);
+      const chain = "arbitrum-sepolia-testnet";
+      for (let i = 0; i < 8; i++) {
+        h.clock.t += MINUTE;
+        const read = await h.service.getDispute({ chain, coreDisputeId: id });
+        const real = realClientAnswering({ items: [read.raw], nextCursor: null, hasMore: false });
+        expect(await real.getDispute({ chain, coreDisputeId: id })).toEqual(read);
+      }
+    },
+  );
 });
 
 describe("createDispute", () => {
@@ -629,13 +667,30 @@ describe("pin", () => {
 });
 
 describe("getDispute", () => {
-  it("refuses a read before any filing with DISPUTE_NOT_FOUND (no such case)", async () => {
+  it("throws the real client's no-such-case error for a read before any filing, naming the chain asked for", async () => {
     const h = harness("pay");
-    await expectRefusal(
-      h.service.getDispute({ chain: "fake", coreDisputeId: "1000" }),
-      "dispute_get",
-      "DISPUTE_NOT_FOUND",
+    await expectNoCase(h.service.getDispute({ chain: "fake", coreDisputeId: "1000" }), "fake");
+    await expectNoCase(
+      h.service.getDispute({ chain: "arbitrum-sepolia-testnet", coreDisputeId: "1000" }),
+      "arbitrum-sepolia-testnet",
     );
+    expect(h.service.calls.map((c) => c.tool)).toEqual(["dispute_get", "dispute_get"]);
+  });
+
+  it("throws the very error the real client throws for an empty read", async () => {
+    const chain = "arbitrum-sepolia-testnet";
+    const real = await rejection(
+      realClientAnswering({ items: [], nextCursor: null, hasMore: false }).getDispute({
+        chain,
+        coreDisputeId: "1000",
+      }),
+    );
+    const fake = await rejection(
+      harness("pay").service.getDispute({ chain, coreDisputeId: "1000" }),
+    );
+    expect(real).toBeInstanceOf(KlerosTransportError);
+    expect(fake).toBeInstanceOf(KlerosTransportError);
+    expect((fake as Error).message).toBe((real as Error).message);
   });
 
   it("answers any chain (it is the fake)", async () => {
@@ -768,7 +823,7 @@ describe("calls", () => {
     await refusal(h.service.createDispute({} as never));
     await refusal(h.service.getCourt({ chain: "fake", courtId: 99 }));
     await refusal(h.service.submitEvidence({ coreDisputeId: "5", name: "n", description: "d" }));
-    await refusal(h.service.getDispute({ chain: "fake", coreDisputeId: "5" }));
+    await expectNoCase(h.service.getDispute({ chain: "fake", coreDisputeId: "5" }), "fake");
     expect(h.service.calls.map((c) => c.tool)).toEqual([
       "evidence_pin",
       "dispute_create",
@@ -828,7 +883,7 @@ describe("no network", () => {
     if (filed instanceof KlerosRefusal || filed.status !== "mined") {
       expect(END[script]).toBeUndefined();
       await refusal(h.service.submitEvidence({ ...evidence, coreDisputeId: "1000" }));
-      await refusal(h.service.getDispute({ chain: "fake", coreDisputeId: "1000" }));
+      await expectNoCase(h.service.getDispute({ chain: "fake", coreDisputeId: "1000" }), "fake");
     } else {
       await h.service.submitEvidence({ ...evidence, coreDisputeId: filed.coreDisputeId });
       const r = await reads(h, filed.coreDisputeId, 10);
@@ -837,17 +892,59 @@ describe("no network", () => {
     expect(fetchStub).not.toHaveBeenCalled();
   });
 
+  /**
+   * Every module a source names: `from "m"` (imports and re-exports alike), a side-effect
+   * `import "m"`, and `import(...)` or `require(...)`, a non-literal argument shown as `<expr>`.
+   */
+  function modulesOf(source: string): string[] {
+    const found: string[] = [];
+    for (const m of source.matchAll(/\bfrom\s*["']([^"']+)["']/g)) found.push(m[1]!);
+    for (const m of source.matchAll(/^\s*import\s*["']([^"']+)["']/gm)) found.push(m[1]!);
+    for (const m of source.matchAll(/\b(?:import|require)\s*\(\s*([^)]*?)\s*\)/g)) {
+      const literal = /^["']([^"']+)["']$/.exec(m[1]!);
+      found.push(literal ? literal[1]! : `<${m[1]}>`);
+    }
+    return found;
+  }
+
+  it("the module scan finds every way a source can name a module", () => {
+    const sample = [
+      'import "node:http";',
+      'export * from "node:https";',
+      'export { request } from "node:net";',
+      'import { fetch as f } from "undici";',
+      'import type {\n  X,\n} from "viem";',
+      'const a = await import("node:dgram");',
+      'const b = require("node:tls");',
+      "const c = await import(name);",
+    ].join("\n");
+    expect(modulesOf(sample).sort()).toEqual(
+      [
+        "<name>",
+        "node:dgram",
+        "node:http",
+        "node:https",
+        "node:net",
+        "node:tls",
+        "undici",
+        "viem",
+      ].sort(),
+    );
+  });
+
   it("imports nothing that can reach the network", () => {
     const source = readFileSync(
       new URL("../../../src/adapters/kleros/fakeDisputeService.ts", import.meta.url),
       "utf8",
     );
-    const imports = [...source.matchAll(/^import\s+(type\s+)?[^;]*?from\s+"([^"]+)";/gm)];
-    expect(imports.length).toBeGreaterThan(0);
-    for (const [, typeOnly, from] of imports) {
-      if (from === "viem") expect(typeOnly).toBeDefined();
-      else expect(["node:crypto", "./deployments", "./disputeService", "./errors"]).toContain(from);
+    const modules = modulesOf(source);
+    expect(modules.length).toBeGreaterThan(0);
+    for (const m of modules) {
+      expect(["node:crypto", "viem", "./deployments", "./disputeService", "./errors"]).toContain(m);
     }
-    expect(source).not.toMatch(/\bfetch\s*\(|\brequire\s*\(|\bimport\s*\(/);
+    // viem for its types only: a value import would bring its transports with it.
+    const viem = source.match(/^(?:import|export)\b[^;]*?\bfrom\s*["']viem["']/gm) ?? [];
+    for (const statement of viem) expect(statement).toMatch(/^import type\b/);
+    expect(source).not.toMatch(/\bfetch\s*\(/);
   });
 });
