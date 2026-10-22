@@ -165,17 +165,27 @@ const disputes = (...items: unknown[]) => ({
 });
 const COURT = { id: "8", timesPerPeriod: ["900", "2700", "1800", "2700"], hiddenVotes: true };
 
-/** Every error any test provokes, checked at the end for the key. */
-const provoked: unknown[] = [];
+/** The error `p` rejects with, checked for either key at the point it is caught. */
 async function failure(p: Promise<unknown>): Promise<Error> {
   let value: unknown;
   try {
     value = await p;
   } catch (e) {
-    provoked.push(e);
+    expect(leaks(e)).toEqual([]);
     return e as Error;
   }
   throw new Error(`expected a failure, got ${JSON.stringify(value)}`);
+}
+
+/** Every ops line written while `run` runs, parsed. */
+async function opsLines(run: () => Promise<unknown>): Promise<Record<string, unknown>[]> {
+  const lines: string[] = [];
+  vi.spyOn(console, "log").mockImplementation((line: unknown) => {
+    lines.push(String(line));
+  });
+  await run();
+  for (const l of lines) expect(l).not.toContain(KEY);
+  return lines.map((l) => JSON.parse(l) as Record<string, unknown>);
 }
 
 afterEach(() => {
@@ -548,6 +558,180 @@ describe("dispute_create", () => {
   });
 });
 
+describe("a filing or a submission the client cannot read keeps the service's text", () => {
+  const create = (svc: HttpDisputeService) => svc.createDispute({ aliases: {} });
+  const submit = (svc: HttpDisputeService) =>
+    svc.submitEvidence({ coreDisputeId: "186", name: "n", description: "d" });
+
+  it.each([
+    ["txHash missing", { status: "mined", coreDisputeID: "186", localDisputeID: "42" }, "txHash"],
+    ["txHash spelled 0X", { ...MINED_CREATE, txHash: `0X${"ab".repeat(32)}` }, "txHash"],
+    [
+      "txHash under another name",
+      { status: "mined", coreDisputeID: "186", transactionHash: TX },
+      "txHash",
+    ],
+    ["coreDisputeID in hex", { ...MINED_CREATE, coreDisputeID: "0xba" }, "coreDisputeID"],
+    ["an undocumented status", { status: "pending", txHash: TX }, "status"],
+  ])("a mined create with %s names the field and keeps the text", async (_n, payload, field) => {
+    const { svc, requests } = harness([tool(payload), tool(MINED_CREATE)]);
+    const e = await failure(create(svc));
+    expect(e).toBeInstanceOf(KlerosTransportError);
+    expect(e.message).toContain(field);
+    expect(e.message).toContain(JSON.stringify(payload));
+    // A filing that may have spent is never sent twice.
+    expect(requests).toHaveLength(1);
+  });
+
+  it("keeps the core id of a mined create whose txHash is missing", async () => {
+    const { svc } = harness([tool({ status: "mined", coreDisputeID: "186" })]);
+    const e = await failure(create(svc));
+    expect(e.message).toContain("txHash");
+    expect(e.message).toContain('"coreDisputeID":"186"');
+  });
+
+  it("keeps an unparseable create text in the message", async () => {
+    const text = `Filed as dispute 186 in tx ${TX}, but the summary could not be rendered.`;
+    const { svc } = harness([toolText(text)]);
+    const e = await failure(create(svc));
+    expect(e).toBeInstanceOf(KlerosTransportError);
+    expect(e.message).toContain("no JSON object");
+    expect(e.message).toContain(text);
+  });
+
+  it("keeps every content entry: a warning and its JSON split across two", async () => {
+    const json = JSON.stringify({ status: "unknown", txHash: TX });
+    const { svc } = harness([
+      result({
+        content: [
+          { type: "text", text: UNKNOWN_PREFIX },
+          { type: "text", text: json },
+        ],
+      }),
+    ]);
+    const e = await failure(create(svc));
+    expect(e.message).toContain(UNKNOWN_PREFIX);
+    expect(e.message).toContain(json);
+  });
+
+  it("says so when the answer has no text at all", async () => {
+    const { svc } = harness([result({ content: [{ type: "image", data: "", mimeType: "x" }] })]);
+    const e = await failure(create(svc));
+    expect(e.message).toContain("no text content");
+    expect(e.message).toContain("(no text)");
+  });
+
+  it("bounds the text it keeps to 4,000 characters", async () => {
+    const long = `${"a".repeat(3_990)}0123456789${"z".repeat(6_000)}`;
+    const { svc } = harness([toolText(long)]);
+    const e = await failure(create(svc));
+    expect(e.message).toContain(`${"a".repeat(3_990)}0123456789 [cut]`);
+    expect(e.message).not.toContain("z");
+  });
+
+  it("scrubs the key from the text it keeps", async () => {
+    const { svc } = harness([toolText(`a text that quotes Bearer ${KEY} for no reason`)]);
+    const e = await failure(create(svc));
+    expect(e.message).toContain("a text that quotes Bearer");
+    expect(e.message).not.toContain(KEY);
+  });
+
+  it("keeps the text of a mined submission whose hash is short", async () => {
+    const payload = { status: "mined", txHash: "0xabc" };
+    const { svc, requests } = harness([tool(payload), tool({ status: "mined", txHash: TX })]);
+    const e = await failure(submit(svc));
+    expect(e).toBeInstanceOf(KlerosTransportError);
+    expect(e.message).toContain("txHash");
+    expect(e.message).toContain(JSON.stringify(payload));
+    expect(requests).toHaveLength(1);
+  });
+
+  it("keeps an unknown filing's malformed txHash in its text", async () => {
+    const text = `${UNKNOWN_PREFIX}\n${JSON.stringify({ status: "unknown", txHash: "0x123" })}`;
+    const { svc } = harness([toolText(text)]);
+    const out = await create(svc);
+    expect(out).toEqual({ status: "unknown", text });
+    expect("txHash" in out).toBe(false);
+    expect(out.status === "unknown" && out.text).toContain('"txHash":"0x123"');
+  });
+
+  it("keeps an unknown submission's malformed txHash in its text", async () => {
+    const text = `${UNKNOWN_PREFIX} ${JSON.stringify({ status: "unknown", txHash: "0xshort" })}`;
+    const { svc } = harness([toolText(text)]);
+    expect(await submit(svc)).toEqual({ status: "unknown", text });
+  });
+
+  it("does not add the text to a read's errors", async () => {
+    const item = { ...ITEM, tied: undefined };
+    const { svc } = harness(times(3, () => tool(disputes(item))));
+    const e = await failure(svc.getDispute({ chain: TESTNET, coreDisputeId: "186" }));
+    expect(e.message).toBe("Kleros dispute_get answered without a usable tied");
+  });
+
+  it.each([
+    ["a hex string", "0x2a", "0x2a"],
+    ["an object", { n: 42 }, '{"n":42}'],
+    ["null", null, "null"],
+  ])(
+    "logs a present but unreadable localDisputeID (%s), the filing still mined",
+    async (_n, raw, shown) => {
+      const { svc } = harness([tool({ ...MINED_CREATE, localDisputeID: raw })]);
+      let out: unknown;
+      const lines = await opsLines(async () => {
+        out = await create(svc);
+      });
+      expect(out).toEqual({ status: "mined", coreDisputeId: "186", txHash: TX });
+      expect(lines.filter((l) => l.opslog === "kleros_local_dispute_id_unreadable")).toEqual([
+        expect.objectContaining({
+          deployment: "testnet",
+          coreDisputeId: "186",
+          localDisputeID: shown,
+        }),
+      ]);
+    },
+  );
+
+  it("logs nothing for a localDisputeIDUnavailable or a readable localDisputeID", async () => {
+    const { localDisputeID: _drop, ...rest } = MINED_CREATE;
+    const { svc } = harness([
+      tool({ ...rest, localDisputeIDUnavailable: "the receipt could not be read back" }),
+      tool(MINED_CREATE),
+    ]);
+    const lines = await opsLines(async () => {
+      await create(svc);
+      await create(svc);
+    });
+    expect(lines.filter((l) => l.opslog === "kleros_local_dispute_id_unreadable")).toEqual([]);
+  });
+});
+
+describe("constructor", () => {
+  it.each([
+    ["createMs", 0],
+    ["createMs", -1],
+    ["submitMs", Number.NaN],
+    ["pinMs", Number.POSITIVE_INFINITY],
+    ["readMs", 0],
+  ])("refuses a %s deadline of %s", (name, ms) => {
+    expect(() => harness([], { deadlines: { [name]: ms } })).toThrow(
+      `Kleros deadline ${name} must be a positive number of milliseconds`,
+    );
+  });
+
+  it.each([[0], [-5], [1.5], [Number.NaN]])("refuses requestsPerMinute %s", (n) => {
+    expect(() => harness([], { requestsPerMinute: n })).toThrow(
+      "Kleros requestsPerMinute must be a positive integer",
+    );
+  });
+
+  it("keeps the default for a deadline given as undefined", async () => {
+    const { svc } = harness([tool(MINED_CREATE)], { deadlines: { createMs: undefined } });
+    deadlineMs.length = 0;
+    await svc.createDispute({ aliases: {} });
+    expect(deadlineMs).toEqual([240_000]);
+  });
+});
+
 describe("evidence_pin", () => {
   it("maps a published pin's fileURI to fileUri", async () => {
     const { svc } = harness([tool(PUBLISHED)]);
@@ -691,6 +875,8 @@ describe("dispute_get", () => {
     ["rulingOptions", { ...ITEM, rulingOptions: undefined }],
     ["rulingOptions", { ...ITEM, rulingOptions: [{ value: "0x01" }] }],
     ["unresolvedFields", { ...ITEM, unresolvedFields: "rulingOptions" }],
+    ["unresolvedFields", { ...ITEM, unresolvedFields: null }],
+    ["unresolvedFields", { ...ITEM, unresolvedFields: [1] }],
     ["deadline", { ...ITEM, deadline: 1_790_000_000 }],
   ])("a read without a usable %s is a transport error naming it", async (field, item) => {
     // A read retries a transport error twice, so the same answer is scripted three times.
@@ -989,6 +1175,7 @@ describe("retries", () => {
     ["an HTTP 413", () => http(413, '{"error":"request body too large"}')],
     ["an HTTP 429", () => http(429, '{"error":"rate limit exceeded"}')],
     ["FILE_TOO_LARGE", () => refused("FILE_TOO_LARGE: the limit that applied was 10 MiB")],
+    ["PRESET_SIMULATES", () => refused("PRESET_SIMULATES: nothing was published")],
     ["ATTACHMENT_INVALID", () => refused("ATTACHMENT_INVALID: not standard padded base64")],
   ])("does not retry a pin on %s", async (_name, reply) => {
     const { svc, requests } = harness([reply(), tool(PUBLISHED)]);
@@ -1109,10 +1296,43 @@ describe("the key", () => {
     }
   });
 
-  // Last in the file: by now every test above has added the errors it provoked.
-  it("appears in no thrown error's message or own properties", () => {
-    expect(provoked.length).toBeGreaterThan(40);
-    for (const e of provoked) expect(leaks(e)).toEqual([]);
+  // Every `failure()` in this file already checks its error at the point of catching; this test
+  // provokes one error of each kind on both keys itself, so it holds when run alone.
+  it("appears in no thrown error's message or own properties", async () => {
+    const errors: unknown[] = [];
+    const catchAll = async (p: Promise<unknown>) => {
+      try {
+        await p;
+      } catch (e) {
+        errors.push(e);
+      }
+    };
+    for (const [deployment, apiKey, other] of [
+      ["testnet", KEY, ARBITRUM_ONE],
+      ["live", LIVE_KEY, TESTNET],
+    ] as const) {
+      const { svc } = harness(
+        [
+          http(401, '{"error":"unauthorized"}'),
+          netDown(),
+          new TypeError(`fetch failed (authorization: Bearer ${apiKey})`),
+          sse({ jsonrpc: "2.0", id: 1, error: { code: -32602, message: "Invalid params" } }),
+          refused("INSUFFICIENT_BALANCE: the wallet cannot cover the fee"),
+          tool({ status: "simulated" }),
+          tool({ status: "mined", coreDisputeID: "186" }),
+          toolText(`no JSON, but Bearer ${apiKey} quoted`),
+          (req) =>
+            new Promise<Response>((_resolve, reject) => {
+              req.signal?.addEventListener("abort", () => reject(new Error(apiKey)));
+            }),
+        ],
+        { deployment, apiKey, deadlines: { createMs: 5 } },
+      );
+      for (let i = 0; i < 9; i++) await catchAll(svc.createDispute({ aliases: {} }));
+      await catchAll(svc.getDispute({ chain: other, coreDisputeId: "186" }));
+    }
+    expect(errors).toHaveLength(20);
+    for (const e of errors) expect(leaks(e)).toEqual([]);
   });
 });
 

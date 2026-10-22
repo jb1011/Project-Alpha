@@ -47,9 +47,9 @@ import {
   KlerosRefusal,
   KlerosTransportError,
   KlerosWrongDeploymentError,
-  PIN_NOT_PUBLISHED,
   PRESET_SIMULATES,
   type WriteTool,
+  sentOf,
 } from "./errors";
 
 export interface HttpDisputeServiceDeps {
@@ -81,6 +81,11 @@ const WRITE_IN_PROGRESS_WAIT_MS = 5_000;
 const WRITE_IN_PROGRESS_MAX_MS = 120_000;
 const MAX_TOOL_PAGES = 5;
 const HTTP_BODY_KEPT = 500;
+/** How much of the service's text a failed filing or submission carries in its error. */
+const SERVICE_TEXT_KEPT = 4_000;
+const LOCAL_ID_KEPT = 200;
+/** The two writes that spend on a chain: a failure to read their answer must keep the answer. */
+const CHAIN_WRITES: readonly string[] = ["dispute_create", "evidence_submit"];
 const SIMULATED = `${PRESET_SIMULATES}: the key simulated the write; nothing was sent`;
 const PERIODS: readonly string[] = ["Evidence", "Commit", "Vote", "Appeal", "Executed"];
 const INITIALIZE_PARAMS = {
@@ -120,8 +125,9 @@ export class HttpDisputeService implements KlerosDisputeService {
     if (!Number.isSafeInteger(this.#perMinute) || this.#perMinute <= 0) {
       throw new Error("Kleros requestsPerMinute must be a positive integer");
     }
-    // Field by field, so an explicit undefined from config keeps the default instead of becoming
-    // a deadline that fires at once.
+    // Field by field, so an explicit undefined from config keeps the default. A deadline that is
+    // not a positive number would fire as soon as a filing is on the wire and turn every filing
+    // into "maybe sent", so it is refused here, before anything is sent.
     const given = d.deadlines ?? {};
     this.#deadlines = {
       readMs: given.readMs ?? DEFAULT_DEADLINES.readMs,
@@ -129,6 +135,11 @@ export class HttpDisputeService implements KlerosDisputeService {
       createMs: given.createMs ?? DEFAULT_DEADLINES.createMs,
       submitMs: given.submitMs ?? DEFAULT_DEADLINES.submitMs,
     };
+    for (const [name, ms] of Object.entries(this.#deadlines)) {
+      if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) {
+        throw new Error(`Kleros deadline ${name} must be a positive number of milliseconds`);
+      }
+    }
   }
 
   async listTools(): Promise<string[]> {
@@ -178,20 +189,18 @@ export class HttpDisputeService implements KlerosDisputeService {
 
   async getCourt(p: { chain: KlerosReadChain; courtId: number }): Promise<CourtClock> {
     const chain = this.#ownChain(p.chain);
-    return this.#read(async () =>
-      courtClockOf(
-        await this.#callTool("court_get", { chain, id: String(p.courtId) }, this.#deadlines.readMs),
-        p.courtId,
+    return this.#read(() =>
+      this.#callTool("court_get", { chain, id: String(p.courtId) }, this.#deadlines.readMs, (pl) =>
+        courtClockOf(pl, p.courtId),
       ),
     );
   }
 
   async getDispute(p: { chain: KlerosReadChain; coreDisputeId: string }): Promise<DisputeRead> {
     const chain = this.#ownChain(p.chain);
-    return this.#read(async () =>
-      disputeReadOf(
-        await this.#callTool("dispute_get", { id: p.coreDisputeId, chain }, this.#deadlines.readMs),
-        chain,
+    return this.#read(() =>
+      this.#callTool("dispute_get", { id: p.coreDisputeId, chain }, this.#deadlines.readMs, (pl) =>
+        disputeReadOf(pl, chain),
       ),
     );
   }
@@ -213,7 +222,10 @@ export class HttpDisputeService implements KlerosDisputeService {
       "dispute_create",
       { aliases: p.aliases },
       this.#deadlines.createMs,
-      createOutcomeOf,
+      (pl, text) =>
+        createOutcomeOf(pl, text, (coreDisputeId, raw) =>
+          this.#noteUnreadableLocalId(coreDisputeId, raw),
+        ),
     );
   }
 
@@ -275,15 +287,14 @@ export class HttpDisputeService implements KlerosDisputeService {
     tool: WriteTool,
     args: Record<string, unknown>,
     ms: number,
-    outcome: (payload: Payload, text: string, tool: WriteTool) => T,
+    outcome: (payload: Payload, text: string) => T,
   ): Promise<T> {
     return withKeyedLock(this.#writeLock, async () => {
       let pinRetries = 0;
       let waitingSince: number | undefined;
       for (;;) {
         try {
-          const { payload, text } = await this.#callTool(tool, args, ms);
-          return outcome(payload, text, tool);
+          return await this.#callTool(tool, args, ms, outcome);
         } catch (e) {
           if (e instanceof KlerosRefusal && e.code === WRITE_IN_PROGRESS) {
             const now = this.#now();
@@ -300,28 +311,49 @@ export class HttpDisputeService implements KlerosDisputeService {
     });
   }
 
-  /** tools/call, then `isError`, then the payload: the last JSON object of `content[0].text`. */
-  async #callTool(
+  /**
+   * tools/call, then `isError`, then the payload (the last JSON object of `content[0].text`),
+   * then `map` into the outcome; `text` is every `content[].text`, joined.
+   *
+   * A filing or a submission that answered and could not be read may still have spent: a mined
+   * dispute exists whether or not its payload parses here. So on those two tools a failure to
+   * read the answer carries the service's own text in its message, and with it the core id and
+   * the transaction hash the caller needs to resolve the case by hand.
+   */
+  async #callTool<T>(
     tool: string,
     args: Record<string, unknown>,
     ms: number,
-  ): Promise<{ payload: Payload; text: string }> {
+    map: (payload: Payload, text: string) => T,
+  ): Promise<T> {
     const result = await this.#post(tool, "tools/call", { name: tool, arguments: args }, ms);
     const content = Array.isArray(result.content) ? result.content : [];
+    const texts = content.map((c) => (isRecord(c) && typeof c.text === "string" ? c.text : ""));
+    const text = texts.filter((t) => t !== "").join("\n");
     // A refusal is rendered prose with no code field: it is read before the payload, which
     // would otherwise fail on it as bad JSON.
-    if (result.isError === true) {
-      const texts = content.map((c) => (isRecord(c) && typeof c.text === "string" ? c.text : ""));
-      throw new KlerosRefusal(tool, texts.filter((t) => t !== "").join("\n"));
-    }
-    const first = content[0];
-    if (!isRecord(first) || typeof first.text !== "string") {
-      throw new KlerosTransportError(`Kleros ${tool} answered no text content`);
-    }
+    if (result.isError === true) throw new KlerosRefusal(tool, text);
     try {
-      return { payload: parseToolPayload(first.text) as Payload, text: first.text };
+      const first = content[0];
+      if (!isRecord(first) || typeof first.text !== "string") {
+        throw new KlerosTransportError(`Kleros ${tool} answered no text content`);
+      }
+      let payload: Payload;
+      try {
+        payload = parseToolPayload(first.text) as Payload;
+      } catch (e) {
+        throw new KlerosTransportError(`Kleros ${tool}: ${(e as Error).message}`);
+      }
+      return map(payload, text);
     } catch (e) {
-      throw new KlerosTransportError(`Kleros ${tool}: ${(e as Error).message}`);
+      if (!(e instanceof KlerosTransportError) || !CHAIN_WRITES.includes(tool)) throw e;
+      // Scrubbed before it is cut, so no part of a key survives at the cut.
+      const clean = this.#scrub(text);
+      const shown =
+        clean.length > SERVICE_TEXT_KEPT ? `${clean.slice(0, SERVICE_TEXT_KEPT)} [cut]` : clean;
+      throw new KlerosTransportError(
+        `${e.message}. The service answered: ${shown === "" ? "(no text)" : shown}`,
+      );
     }
   }
 
@@ -396,6 +428,24 @@ export class HttpDisputeService implements KlerosDisputeService {
     }
   }
 
+  /**
+   * The docs: a mined filing's payload is the only place `localDisputeID` appears. One that is
+   * present but unreadable leaves the outcome mined (the core id is good) and goes to the ops log
+   * as received, so an operator can still recover it.
+   */
+  #noteUnreadableLocalId(coreDisputeId: string, raw: unknown): void {
+    const shown = typeof raw === "string" ? raw : (JSON.stringify(raw) ?? String(raw));
+    try {
+      opsLog("kleros_local_dispute_id_unreadable", {
+        deployment: this.deployment,
+        coreDisputeId,
+        localDisputeID: this.#scrub(shown).slice(0, LOCAL_ID_KEPT),
+      });
+    } catch {
+      // observe, never gate
+    }
+  }
+
   /** Error text from below the service (the network stack) is ours to keep the key out of. */
   #scrub(text: string): string {
     return this.#apiKey === "" ? text : text.split(this.#apiKey).join("[key]");
@@ -448,17 +498,19 @@ export function normaliseRulingValue(v: unknown): bigint | null {
 
 /**
  * What a pin retries: a transport error (a deadline included), an HTTP status other than 401,
- * 413 and 429, or a refusal outside the "nothing was published" list ("in doubt": the same bytes
- * give the same CID, so a repeat publishes nothing new).
+ * 413 and 429, or a refusal the docs leave "in doubt" (`sentOf` answers "maybe": the same bytes
+ * give the same CID, so a repeat publishes nothing new). A "nothing was published" refusal,
+ * `PRESET_SIMULATES` included, is final.
  */
 function pinMayRetry(e: unknown): boolean {
   if (e instanceof KlerosTransportError) return true;
   if (e instanceof KlerosHttpError) return e.status !== 401 && e.status !== 413 && e.status !== 429;
-  if (e instanceof KlerosRefusal) return e.code === null || !PIN_NOT_PUBLISHED.includes(e.code);
+  if (e instanceof KlerosRefusal) return sentOf("evidence_pin", e.code) === "maybe";
   return false;
 }
 
-function pinOutcomeOf(p: Payload, _text: string, tool: WriteTool): PinOutcome {
+function pinOutcomeOf(p: Payload): PinOutcome {
+  const tool = "evidence_pin";
   if (p.status === "checked") return { status: "checked" };
   if (p.status !== "published") throw noField(tool, "status");
   if (typeof p.fileURI !== "string" || p.fileURI === "") throw noField(tool, "fileURI");
@@ -466,20 +518,31 @@ function pinOutcomeOf(p: Payload, _text: string, tool: WriteTool): PinOutcome {
   return { status: "published", fileUri: p.fileURI, cid: p.cid };
 }
 
-function createOutcomeOf(p: Payload, text: string, tool: WriteTool): CreateOutcome {
+function createOutcomeOf(
+  p: Payload,
+  text: string,
+  onUnreadableLocalId: (coreDisputeId: string, raw: unknown) => void,
+): CreateOutcome {
+  const tool = "dispute_create";
   if (p.status !== "mined") return chainWriteOutcomeOf(p, text, tool);
   const coreDisputeId = decimalIdOf(p.coreDisputeID);
   if (coreDisputeId === null) throw noField(tool, "coreDisputeID");
   const txHash = txHashOf(p.txHash);
   if (txHash === null) throw noField(tool, "txHash");
   // localDisputeIDUnavailable stands in when the receipt could not be read back: never a guess.
-  const local = "localDisputeIDUnavailable" in p ? null : decimalIdOf(p.localDisputeID);
-  return local === null
-    ? { status: "mined", coreDisputeId, txHash }
-    : { status: "mined", coreDisputeId, localDisputeId: local, txHash };
+  if ("localDisputeIDUnavailable" in p || p.localDisputeID === undefined) {
+    return { status: "mined", coreDisputeId, txHash };
+  }
+  const local = decimalIdOf(p.localDisputeID);
+  if (local === null) {
+    onUnreadableLocalId(coreDisputeId, p.localDisputeID);
+    return { status: "mined", coreDisputeId, txHash };
+  }
+  return { status: "mined", coreDisputeId, localDisputeId: local, txHash };
 }
 
-function submitOutcomeOf(p: Payload, text: string, tool: WriteTool): SubmitOutcome {
+function submitOutcomeOf(p: Payload, text: string): SubmitOutcome {
+  const tool = "evidence_submit";
   if (p.status !== "mined") return chainWriteOutcomeOf(p, text, tool);
   const txHash = txHashOf(p.txHash);
   if (txHash === null) throw noField(tool, "txHash");
@@ -487,7 +550,8 @@ function submitOutcomeOf(p: Payload, text: string, tool: WriteTool): SubmitOutco
 }
 
 /**
- * `unknown` (broadcast, no receipt in time) keeps the whole text for the human it goes to.
+ * `unknown` (broadcast, no receipt in time) keeps the service's whole text, every content entry,
+ * for the human it goes to.
  * `simulated` sent nothing, but neither key is meant to simulate: it is raised as a refusal so
  * no caller can record it as a filing.
  */
@@ -506,7 +570,7 @@ function chainWriteOutcomeOf(
  * court_get's payload shape is not documented: the court is read at the top level or as
  * `items[0]`; contract values often travel as strings. The court id is the one asked for.
  */
-function courtClockOf({ payload }: { payload: Payload }, courtId: number): CourtClock {
+function courtClockOf(payload: Payload, courtId: number): CourtClock {
   const tool = "court_get";
   const court = Array.isArray(payload.items) ? payload.items[0] : payload;
   if (!isRecord(court)) throw noField(tool, "items[0]");
@@ -531,7 +595,7 @@ function courtClockOf({ payload }: { payload: Payload }, courtId: number): Court
  * be missing only when `unresolvedFields` names it, and is then empty (a mismatch downstream, so
  * nothing acts on it).
  */
-function disputeReadOf({ payload }: { payload: Payload }, chain: KlerosChain): DisputeRead {
+function disputeReadOf(payload: Payload, chain: KlerosChain): DisputeRead {
   const tool = "dispute_get";
   if (!Array.isArray(payload.items)) throw noField(tool, "items");
   if (payload.items.length === 0) {
@@ -552,7 +616,8 @@ function disputeReadOf({ payload }: { payload: Payload }, chain: KlerosChain): D
   if (typeof item.ruled !== "boolean") throw noField(tool, "ruled");
   const roundCount = countOf(item.roundCount);
   if (roundCount === null) throw noField(tool, "roundCount");
-  const unresolvedFields = item.unresolvedFields ?? [];
+  // [] only when the field is absent: a present null is not an empty list.
+  const unresolvedFields = item.unresolvedFields === undefined ? [] : item.unresolvedFields;
   if (!Array.isArray(unresolvedFields) || !unresolvedFields.every((f) => typeof f === "string")) {
     throw noField(tool, "unresolvedFields");
   }
