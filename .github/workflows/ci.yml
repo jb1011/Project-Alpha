@@ -139,6 +139,7 @@ jobs:
           filters: |
             client:
               - 'back/hedera-client/**'
+              - '.github/workflows/ci.yml'
 
       - uses: actions/setup-node@v4
         if: steps.changes.outputs.client == 'true'

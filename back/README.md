@@ -171,7 +171,7 @@ forge build && forge test
 > they were first deployed) and with `via_ir`. Both are set in `foundry.toml`: keep them, the
 > deployed bytecode was built that way.
 
-### Backend (TypeScript, Node 20.18.2 or later)
+### Backend (TypeScript, Node 22 or later)
 
 ```bash
 cd backend
