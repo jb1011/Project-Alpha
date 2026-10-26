@@ -153,6 +153,21 @@ describe("pilot:agent on anvil", () => {
     expect(await ownerOf(buyerAgentId)).toBe(ctx.addresses.buyer);
   });
 
+  test("a second register --yes is refused without --again; with --again it mints id 2", async () => {
+    const before = await nonceOf(ctx.addresses.buyer);
+    await expect(run(["register", "--party", "buyer", "--yes"])).rejects.toThrow(
+      /refusing: .*already holds an identity on the registry \(count 1\): pass --again/,
+    );
+    expect(await nonceOf(ctx.addresses.buyer)).toBe(before);
+
+    const dry = await run(["register", "--party", "buyer"]);
+    expect(dry.existingIdentities).toBe("1");
+
+    const printed = await run(["register", "--party", "buyer", "--again", "--yes"]);
+    expect(printed.agentId).toBe("2");
+    expect(await ownerOf(2n)).toBe(ctx.addresses.buyer);
+  });
+
   test("point --yes writes the legalBody metadata readable by getMetadata", async () => {
     const value = "0x00000000000000000000000000000000000000000000000000000000000beef1";
     const printed = await run([

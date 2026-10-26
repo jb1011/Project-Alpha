@@ -38,29 +38,31 @@ export function openPilotContext(): PilotContext {
       "refusing: the pilot keys are not set on this box (PILOT_BUYER_PRIVATE_KEY, PILOT_SELLER_PRIVATE_KEY, PILOT_REFEREE_PRIVATE_KEY)",
     );
   const db = openDatabase(cfg.dbPath);
+  // Everything after the open is inside the try, so a throw from migrate or any constructor below
+  // closes the database instead of leaking it.
   try {
     migrate(db);
+    return {
+      cfg,
+      db,
+      cases: new SqlitePilotCaseRepository(db),
+      docStore: new FileDocumentStore(cfg.docStoreDir),
+      publicClient: publicClientFor(cfg),
+      sendClient: sendClientFor(cfg),
+      wallets: {
+        buyer: walletClientForKey(cfg, pilot.buyerPrivateKey),
+        seller: walletClientForKey(cfg, pilot.sellerPrivateKey),
+        referee: walletClientForKey(cfg, pilot.refereePrivateKey),
+      },
+      addresses: {
+        buyer: privateKeyToAccount(pilot.buyerPrivateKey).address,
+        seller: privateKeyToAccount(pilot.sellerPrivateKey).address,
+        referee: privateKeyToAccount(pilot.refereePrivateKey).address,
+      },
+      close: () => db.close(),
+    };
   } catch (e) {
     db.close();
     throw e;
   }
-  return {
-    cfg,
-    db,
-    cases: new SqlitePilotCaseRepository(db),
-    docStore: new FileDocumentStore(cfg.docStoreDir),
-    publicClient: publicClientFor(cfg),
-    sendClient: sendClientFor(cfg),
-    wallets: {
-      buyer: walletClientForKey(cfg, pilot.buyerPrivateKey),
-      seller: walletClientForKey(cfg, pilot.sellerPrivateKey),
-      referee: walletClientForKey(cfg, pilot.refereePrivateKey),
-    },
-    addresses: {
-      buyer: privateKeyToAccount(pilot.buyerPrivateKey).address,
-      seller: privateKeyToAccount(pilot.sellerPrivateKey).address,
-      referee: privateKeyToAccount(pilot.refereePrivateKey).address,
-    },
-    close: () => db.close(),
-  };
 }

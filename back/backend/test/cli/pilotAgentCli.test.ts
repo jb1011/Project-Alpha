@@ -17,8 +17,11 @@ import {
   createWalletClient,
   custom,
   decodeFunctionData,
+  encodeEventTopics,
   getAddress,
+  parseAbiItem,
   verifyTypedData,
+  zeroAddress,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { type MockInstance, afterEach, describe, expect, test, vi } from "vitest";
@@ -53,6 +56,9 @@ interface Fake {
   };
   writes: MockInstance[];
   closed: () => number;
+  /** The context opener `run` hands the commands; it counts its calls. */
+  open: () => PilotContext;
+  opened: () => number;
 }
 
 function makeFake(read: (fn: string, args: readonly unknown[]) => unknown = () => 0n): Fake {
@@ -112,7 +118,12 @@ function makeFake(read: (fn: string, args: readonly unknown[]) => unknown = () =
       closes++;
     },
   } as unknown as PilotContext;
-  return { ctx, transportCalls, pub, writes, closed: () => closes };
+  let opens = 0;
+  const open = () => {
+    opens++;
+    return ctx;
+  };
+  return { ctx, transportCalls, pub, writes, closed: () => closes, open, opened: () => opens };
 }
 
 /** Runs one command line; returns what it printed. Throws what the command throws. */
@@ -120,7 +131,7 @@ async function run(fake: Fake, argv: string[]): Promise<string> {
   const program = new Command();
   program.exitOverride();
   program.configureOutput({ writeOut: () => {}, writeErr: () => {} });
-  registerPilotCommands(program, () => fake.ctx);
+  registerPilotCommands(program, fake.open);
   const logs: string[] = [];
   const spy = vi.spyOn(console, "log").mockImplementation((m) => logs.push(String(m)));
   try {
@@ -194,6 +205,99 @@ describe("pilot:agent register", () => {
     await expect(run(fake, ["register"])).rejects.toThrow(/--party/);
     expectNothingSent(fake);
   });
+
+  test("a bad --party is refused before the context opens, in every command", async () => {
+    const fake = makeFake();
+    const lines = [
+      ["register", "--party", "referee"],
+      ["sign-link", "--party", "referee", "--typed-data", "/nonexistent.json"],
+      ["point", "--party", "referee", "--agent", "1", "--value", "0x01"],
+      ["show", "--party", "referee"],
+    ];
+    for (const argv of lines)
+      await expect(run(fake, argv)).rejects.toThrow(/refusing: --party must be buyer or seller/);
+    await expect(
+      run(fake, ["point", "--party", "buyer", "--agent", "x", "--value", "0x01"]),
+    ).rejects.toThrow(/refusing: --agent/);
+    await expect(
+      run(fake, ["point", "--party", "buyer", "--agent", "1", "--value", "0x1"]),
+    ).rejects.toThrow(/refusing: --value/);
+    await expect(run(fake, ["show", "--party", "buyer", "--agent", "-1"])).rejects.toThrow(
+      /refusing: --agent/,
+    );
+    expect(fake.opened()).toBe(0);
+    expectNothingSent(fake);
+  });
+
+  test("the dry run prints how many identities the party's wallet already holds", async () => {
+    const fake = makeFake((fn) => (fn === "balanceOf" ? 2n : 0n));
+    const printed = JSON.parse(await run(fake, ["register", "--party", "buyer"]));
+    expect(printed.existingIdentities).toBe("2");
+    expect(fake.pub.readContract).toHaveBeenCalledWith(
+      expect.objectContaining({
+        address: REGISTRY,
+        functionName: "balanceOf",
+        args: [fake.ctx.addresses.buyer],
+      }),
+    );
+    expectNothingSent(fake);
+  });
+
+  test("--yes refuses when the wallet already holds an identity, unless --again is passed", async () => {
+    const TX: Hex = `0x${"aa".repeat(32)}`;
+    const fake = makeFake((fn) => (fn === "balanceOf" ? 1n : 0n));
+    await expect(run(fake, ["register", "--party", "buyer", "--yes"])).rejects.toThrow(
+      /refusing: .*already holds an identity on the registry \(count 1\): pass --again/,
+    );
+    expectNothingSent(fake);
+
+    // With --again it simulates and sends; the receipt carries the one mint to the buyer.
+    const buyer = fake.ctx.addresses.buyer;
+    fake.pub.simulateContract.mockResolvedValue({ request: { functionName: "register" } });
+    const write = fake.writes[0] as MockInstance;
+    write.mockResolvedValue(TX);
+    fake.pub.waitForTransactionReceipt.mockResolvedValue({ status: "success" });
+    fake.pub.getTransactionReceipt.mockResolvedValue({
+      logs: [
+        {
+          address: REGISTRY,
+          topics: encodeEventTopics({
+            abi: [
+              parseAbiItem(
+                "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)",
+              ),
+            ],
+            eventName: "Transfer",
+            args: { from: zeroAddress, to: buyer, tokenId: 7n },
+          }),
+          data: "0x",
+          blockNumber: 1n,
+          blockHash: `0x${"bb".repeat(32)}`,
+          logIndex: 0,
+          transactionHash: TX,
+          transactionIndex: 0,
+          removed: false,
+        },
+      ],
+    });
+    const printed = JSON.parse(
+      await run(fake, ["register", "--party", "buyer", "--again", "--yes"]),
+    );
+    expect(printed).toEqual({ party: "buyer", address: buyer, agentId: "7", txHash: TX });
+    expect(fake.pub.simulateContract).toHaveBeenCalledOnce();
+    expect(write).toHaveBeenCalledOnce();
+  });
+
+  test("a reverting simulation on register --yes sends nothing", async () => {
+    const fake = makeFake();
+    fake.pub.simulateContract.mockRejectedValue(new Error("execution reverted"));
+    await expect(run(fake, ["register", "--party", "buyer", "--yes"])).rejects.toThrow(
+      /execution reverted/,
+    );
+    expect(fake.pub.simulateContract).toHaveBeenCalledOnce();
+    for (const w of fake.writes) expect(w).not.toHaveBeenCalled();
+    expect(fake.transportCalls).toEqual([]);
+  });
 });
 
 describe("pilot:agent point", () => {
@@ -239,6 +343,17 @@ describe("pilot:agent point", () => {
     ).rejects.toThrow(/refusing: --agent/);
     expect(fake.pub.readContract).not.toHaveBeenCalled();
     expectNothingSent(fake);
+  });
+
+  test("a reverting simulation on point --yes sends nothing", async () => {
+    const fake = makeFake((fn) => (fn === "ownerOf" ? fake.ctx.addresses.buyer : 0n));
+    fake.pub.simulateContract.mockRejectedValue(new Error("execution reverted"));
+    await expect(
+      run(fake, ["point", "--party", "buyer", "--agent", "42", "--value", VALUE, "--yes"]),
+    ).rejects.toThrow(/execution reverted/);
+    expect(fake.pub.simulateContract).toHaveBeenCalledOnce();
+    for (const w of fake.writes) expect(w).not.toHaveBeenCalled();
+    expect(fake.transportCalls).toEqual([]);
   });
 });
 
@@ -325,6 +440,60 @@ describe("pilot:agent sign-link", () => {
     await expect(
       run(fake, ["sign-link", "--party", "buyer", "--typed-data", otherFactory]),
     ).rejects.toThrow(/refusing: the link's domain/);
+  });
+
+  test("refuses on a box with no legal-body factory configured", async () => {
+    const fake = makeFake();
+    (fake.ctx.cfg as { legalBodyFactory?: Address }).legalBodyFactory = undefined;
+    await expect(
+      run(fake, ["sign-link", "--party", "buyer", "--typed-data", typedDataFile()]),
+    ).rejects.toThrow(/refusing: this box has no legal-body factory configured/);
+    expectNothingSent(fake);
+  });
+
+  test("refuses a malformed link message", async () => {
+    const fake = makeFake();
+    const path = typedDataFile((t) => ({
+      ...t,
+      message: { ...(t.message as object), agentId: "042" },
+    }));
+    await expect(
+      run(fake, ["sign-link", "--party", "buyer", "--typed-data", path]),
+    ).rejects.toThrow(
+      /refusing: the link message is malformed: agentId is not a canonical decimal string/,
+    );
+    expectNothingSent(fake);
+  });
+
+  test("refuses a file it cannot read, naming the path", async () => {
+    const fake = makeFake();
+    const path = join(mkdtempSync(join(tmpdir(), "pilot-sign-link-")), "missing.json");
+    await expect(
+      run(fake, ["sign-link", "--party", "buyer", "--typed-data", path]),
+    ).rejects.toThrow(`refusing: --typed-data ${path} cannot be read`);
+    expectNothingSent(fake);
+  });
+
+  test("refuses a file that is not JSON without echoing any of its content", async () => {
+    // A hex string shaped like a key (not a real one): the parser's own message would quote it.
+    const content = "de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a1";
+    const path = join(mkdtempSync(join(tmpdir(), "pilot-sign-link-")), "not-json.txt");
+    writeFileSync(path, content);
+    const fake = makeFake();
+    let message = "";
+    let out = "";
+    try {
+      out = await run(fake, ["sign-link", "--party", "buyer", "--typed-data", path]);
+    } catch (e) {
+      message = String(e);
+    }
+    expect(message).toContain(`refusing: --typed-data ${path} cannot be read as JSON`);
+    for (let i = 0; i + 8 <= content.length; i++) {
+      const piece = content.slice(i, i + 8);
+      expect(message).not.toContain(piece);
+      expect(out).not.toContain(piece);
+    }
+    expectNothingSent(fake);
   });
 });
 

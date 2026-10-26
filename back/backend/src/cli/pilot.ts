@@ -53,6 +53,9 @@ const TRANSFER_EVENT = parseAbiItem(
   "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)",
 );
 
+/** ERC-721 `balanceOf`, read inline as `Transfer` is: the identity registry's ABI does not carry it. */
+const BALANCE_OF = parseAbiItem("function balanceOf(address owner) view returns (uint256)");
+
 /** A uint256 as a canonical decimal: no sign, no leading zero, at most 78 digits. */
 const CANONICAL_DECIMAL = /^(?:0|[1-9][0-9]{0,77})$/;
 const UINT256_MAX = (1n << 256n) - 1n;
@@ -139,20 +142,33 @@ async function register(
   party: Party,
   metadataUri: string,
   yes: boolean,
+  again: boolean,
 ): Promise<Record<string, unknown>> {
   const { address } = walletOf(ctx, party);
   const contract = ctx.cfg.identityRegistry;
   const args = [metadataUri] as const;
+  // A second identity for the same wallet is almost always a repeated command, so it needs --again.
+  const existing = await ctx.publicClient.readContract({
+    address: contract,
+    abi: [BALANCE_OF],
+    functionName: "balanceOf",
+    args: [address],
+  });
   if (!yes)
     return {
       dryRun: true,
       party,
       address,
       contract,
+      existingIdentities: existing.toString(),
       call: { functionName: "register", args },
       data: encodeFunctionData({ abi: iIdentityRegistryAbi, functionName: "register", args }),
       next: "nothing was sent: run the same command with --yes to send it",
     };
+  if (existing > 0n && !again)
+    refuse(
+      `the ${party} (${address}) already holds an identity on the registry (count ${existing}): pass --again to register another`,
+    );
 
   const txHash = await sendRegistryCall(ctx, party, { functionName: "register", args });
   const receipt = await ctx.publicClient.getTransactionReceipt({ hash: txHash });
@@ -215,11 +231,19 @@ async function signLink(
   typedDataPath: string,
 ): Promise<Record<string, unknown>> {
   const { wallet, address } = walletOf(ctx, party);
+  let text: string;
+  try {
+    text = readFileSync(typedDataPath, "utf8");
+  } catch (e) {
+    // The read error names the path, not the content.
+    refuse(`--typed-data ${typedDataPath} cannot be read: ${(e as Error).message}`);
+  }
   let served: unknown;
   try {
-    served = JSON.parse(readFileSync(typedDataPath, "utf8"));
-  } catch (e) {
-    refuse(`--typed-data cannot be read as JSON: ${(e as Error).message}`);
+    served = JSON.parse(text);
+  } catch {
+    // Never echo the parser's message: it quotes the file's opening bytes, which may be a key.
+    refuse(`--typed-data ${typedDataPath} cannot be read as JSON`);
   }
   if (typeof served !== "object" || served === null)
     refuse("the typed data is not the legal-body link message");
@@ -322,11 +346,15 @@ export function registerPilotCommands(
     .description("register an ERC-8004 identity owned by the party's wallet")
     .requiredOption("--party <buyer|seller>", "the test agent whose wallet registers")
     .option("--metadata-uri <uri>", "the registration URI (empty when not given)")
+    .option("--again", "register even though the party's wallet already holds an identity")
     .option("--yes", "confirm: send the transaction")
-    .action((opts: PartyOption & { metadataUri?: string; yes?: boolean }) =>
-      withPilot(open, async (ctx) =>
-        print(await register(ctx, parseParty(opts.party), opts.metadataUri ?? "", !!opts.yes)),
-      ),
+    .action(
+      async (opts: PartyOption & { metadataUri?: string; again?: boolean; yes?: boolean }) => {
+        const party = parseParty(opts.party);
+        await withPilot(open, async (ctx) =>
+          print(await register(ctx, party, opts.metadataUri ?? "", !!opts.yes, !!opts.again)),
+        );
+      },
     );
 
   agent
@@ -336,11 +364,10 @@ export function registerPilotCommands(
     )
     .requiredOption("--party <buyer|seller>", "the test agent whose wallet signs")
     .requiredOption("--typed-data <file>", "the served typed data, as JSON")
-    .action((opts: PartyOption & { typedData: string }) =>
-      withPilot(open, async (ctx) =>
-        print(await signLink(ctx, parseParty(opts.party), opts.typedData)),
-      ),
-    );
+    .action(async (opts: PartyOption & { typedData: string }) => {
+      const party = parseParty(opts.party);
+      await withPilot(open, async (ctx) => print(await signLink(ctx, party, opts.typedData)));
+    });
 
   agent
     .command("point")
@@ -351,14 +378,15 @@ export function registerPilotCommands(
     .requiredOption("--agent <id>", "the agent id, in decimal")
     .requiredOption("--value <hex>", "the pointer value, as 0x hex")
     .option("--yes", "confirm: send the transaction")
-    .action((opts: PartyOption & { agent: string; value: string; yes?: boolean }) =>
-      withPilot(open, async (ctx) => {
-        const party = parseParty(opts.party);
-        const agentId = parseAgentId(opts.agent);
-        const value = parseValue(opts.value);
-        print(await point(ctx, party, agentId, value, !!opts.yes));
-      }),
-    );
+    .action(async (opts: PartyOption & { agent: string; value: string; yes?: boolean }) => {
+      // Options are parsed before the context opens, so a bad one never opens the database.
+      const party = parseParty(opts.party);
+      const agentId = parseAgentId(opts.agent);
+      const value = parseValue(opts.value);
+      await withPilot(open, async (ctx) =>
+        print(await point(ctx, party, agentId, value, !!opts.yes)),
+      );
+    });
 
   agent
     .command("show")
@@ -367,11 +395,9 @@ export function registerPilotCommands(
     )
     .requiredOption("--party <buyer|seller>", "the test agent to show")
     .option("--agent <id>", "the agent id, in decimal")
-    .action((opts: PartyOption & { agent?: string }) =>
-      withPilot(open, async (ctx) => {
-        const party = parseParty(opts.party);
-        const agentId = opts.agent === undefined ? undefined : parseAgentId(opts.agent);
-        print(await show(ctx, party, agentId));
-      }),
-    );
+    .action(async (opts: PartyOption & { agent?: string }) => {
+      const party = parseParty(opts.party);
+      const agentId = opts.agent === undefined ? undefined : parseAgentId(opts.agent);
+      await withPilot(open, async (ctx) => print(await show(ctx, party, agentId)));
+    });
 }
