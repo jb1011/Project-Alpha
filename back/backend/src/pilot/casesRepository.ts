@@ -48,9 +48,9 @@ export interface PilotCaseRepository {
   transaction<T>(fn: () => T): T;
 }
 
-/** The fields a patch may write, and their columns. `caseId`, `status`, `createdAt` and
- *  `updatedAt` are absent on purpose: the key never changes, status moves only by `advance`, and
- *  the timestamps are the database's. */
+/** Every column but the key, the status and the timestamps, by field. `caseId`, `status`,
+ *  `createdAt` and `updatedAt` are absent on purpose: the key never changes, status moves only by
+ *  `advance`, and the timestamps are the database's. */
 type PatchableField = Exclude<
   keyof PilotCaseRecord,
   "caseId" | "status" | "createdAt" | "updatedAt"
@@ -112,6 +112,14 @@ const COLUMN_OF = {
   escrowOutcome: "escrow_outcome",
   error: "error",
 } as const satisfies Record<PatchableField, string>;
+
+/** The case's identity, fixed at insert: a patch never writes these. A `mode` patch would move a
+ *  row from one mode's cap to the other's, and the chain and contract name the job itself. */
+const IDENTITY_FIELDS: ReadonlySet<string> = new Set(["mode", "chainId", "jobContract"]);
+
+/** The Kleros deployment of the case, written together by the `contested` to `filing` advance.
+ *  Once `kleros_chain` is set, none of the three changes (design section 5.2). */
+const KLEROS_DEPLOYMENT_FIELDS = ["klerosChain", "klerosCourtId", "klerosPolicyUri"] as const;
 
 /** The row as SQLite returns it: one property per column, snake_case. */
 type Row = Record<string, unknown>;
@@ -308,7 +316,8 @@ export class SqlitePilotCaseRepository implements PilotCaseRepository {
 
   /**
    * The SET terms for a patch, each followed by a comma, with their named parameters. Refuses a
-   * field outside `COLUMN_OF`, and a `klerosChain` that differs from a non-null one on the row.
+   * field outside `COLUMN_OF`, an identity field, and, once the row's `kleros_chain` is set, any
+   * change to `kleros_chain`, `kleros_court_id` or `kleros_policy_uri`.
    * Must run inside `transaction`, so the row it compares against is the row the UPDATE writes.
    */
   private setClause(
@@ -319,18 +328,20 @@ export class SqlitePilotCaseRepository implements PilotCaseRepository {
     const params: Record<string, unknown> = {};
     for (const [field, value] of Object.entries(patch)) {
       if (value === undefined) continue;
-      if (!Object.hasOwn(COLUMN_OF, field))
+      if (!Object.hasOwn(COLUMN_OF, field) || IDENTITY_FIELDS.has(field))
         throw new Error(`a pilot case patch cannot set ${field}`);
       const column = COLUMN_OF[field as PatchableField];
       sql += `${column} = @${column}, `;
       params[column] = value;
     }
-    if (patch.klerosChain !== undefined) {
-      const current = this.find(caseId)?.klerosChain ?? null;
-      if (current !== null && current !== patch.klerosChain)
-        throw new Error(
-          `pilot case ${caseId}: kleros_chain is ${current} and is never changed (asked: ${patch.klerosChain})`,
-        );
+    if (KLEROS_DEPLOYMENT_FIELDS.some((f) => patch[f] !== undefined)) {
+      const current = this.find(caseId);
+      if (current !== undefined && current.klerosChain !== null)
+        for (const f of KLEROS_DEPLOYMENT_FIELDS)
+          if (patch[f] !== undefined && patch[f] !== current[f])
+            throw new Error(
+              `pilot case ${caseId}: ${COLUMN_OF[f]} is ${current[f]} and is never changed once kleros_chain is set (asked: ${patch[f]})`,
+            );
     }
     return { sql, params };
   }

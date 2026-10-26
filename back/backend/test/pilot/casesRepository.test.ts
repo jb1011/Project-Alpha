@@ -156,6 +156,40 @@ describe("the Kleros chain on the row is written once", () => {
     expect(repo.find(id)).toEqual(before);
   });
 
+  test("once kleros_chain is set, a change to kleros_court_id or kleros_policy_uri is refused", () => {
+    const id = at("contested");
+    repo.advance(id, "contested", "filing", {
+      klerosChain: "arbitrum-sepolia-testnet",
+      klerosCourtId: 8,
+      klerosPolicyUri: "/ipfs/QmPolicy",
+    });
+    const before = repo.find(id);
+
+    expect(() => repo.patch(id, { klerosCourtId: 34 })).toThrow(/kleros_court_id/);
+    expect(() => repo.patch(id, { klerosCourtId: null })).toThrow(/kleros_court_id/);
+    expect(() => repo.advance(id, "filing", "filed", { klerosCourtId: 34 })).toThrow(
+      /kleros_court_id/,
+    );
+    expect(() => repo.patch(id, { klerosPolicyUri: "/ipfs/QmOther" })).toThrow(/kleros_policy_uri/);
+    expect(() => repo.patch(id, { klerosPolicyUri: null })).toThrow(/kleros_policy_uri/);
+    expect(() => repo.advance(id, "filing", "filed", { klerosPolicyUri: "/ipfs/QmOther" })).toThrow(
+      /kleros_policy_uri/,
+    );
+    expect(repo.find(id)).toEqual(before);
+
+    // The same values again are not a change.
+    expect(
+      repo.advance(id, "filing", "filed", { klerosCourtId: 8, klerosPolicyUri: "/ipfs/QmPolicy" })
+        ?.status,
+    ).toBe("filed");
+  });
+
+  test("before kleros_chain is set, the court and the policy may be written", () => {
+    const id = at("contested");
+    repo.patch(id, { klerosCourtId: 8, klerosPolicyUri: "/ipfs/QmPolicy" });
+    expect(repo.patch(id, { klerosCourtId: 34 }).klerosCourtId).toBe(34);
+  });
+
   test("the same value again is not a change, and a NULL chain may be set", () => {
     const id = at("contested");
     repo.patch(id, { klerosChain: "fake" });
@@ -179,6 +213,19 @@ describe("patch", () => {
       label: rec.label,
     });
     expect(out.updatedAt).not.toBe("2000-01-01 00:00:00");
+  });
+
+  test("refuses the identity columns mode, chainId and jobContract, in patch and advance", () => {
+    const rec = repo.insert(newCase({ mode: "testnet" }));
+    const before = repo.find(rec.caseId);
+    expect(() => repo.patch(rec.caseId, { mode: "live" })).toThrow(/mode/);
+    expect(() => repo.patch(rec.caseId, { chainId: 1 })).toThrow(/chainId/);
+    expect(() =>
+      repo.patch(rec.caseId, { jobContract: "0x00000000000000000000000000000000000000c2" }),
+    ).toThrow(/jobContract/);
+    expect(() => repo.advance(rec.caseId, "created", "funded", { mode: "live" })).toThrow(/mode/);
+    expect(repo.find(rec.caseId)).toEqual(before);
+    expect(repo.countFiled("live")).toBe(0);
   });
 
   test("refuses a status, a case id or a timestamp column, and an unknown case", () => {
