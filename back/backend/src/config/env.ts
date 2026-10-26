@@ -89,7 +89,7 @@ export const DEFAULT_KLEROS_EXPECTED_OPTIONS = "1=Pay the provider;2=Refund the 
 
 /**
  * "1=Pay the provider;2=Refund the client" to { "1": "Pay the provider", "2": "Refund the client" }.
- * Each key is a non-negative number, decimal or 0x hex, stored as the decimal string of its value,
+ * Each key is a non-negative number, decimal or 0x (or 0X) hex, stored as the decimal string of its value,
  * so "0x01" and "1" are the same option. THROWS on a malformed pair rather than skipping it: this
  * map is the settlement's assertion, and a dropped option would make it assert less than it says.
  */
@@ -97,10 +97,11 @@ export function parseExpectedOptions(raw: string): Record<string, string> {
   const out: Record<string, string> = {};
   for (const pair of raw.split(";")) {
     const eq = pair.indexOf("=");
+    if (!pair.trim()) throw new Error('an empty pair (a trailing ";"?)');
     if (eq < 0) throw new Error(`"${pair.trim()}" is not value=label`);
     const value = pair.slice(0, eq).trim();
     const label = pair.slice(eq + 1).trim();
-    if (!/^(0x[0-9a-fA-F]+|[0-9]+)$/.test(value))
+    if (!/^(0[xX][0-9a-fA-F]+|[0-9]+)$/.test(value))
       throw new Error(`"${value}" is not a non-negative number (decimal or 0x hex)`);
     if (!label) throw new Error(`option ${value} has an empty label`);
     const key = BigInt(value).toString();
@@ -541,22 +542,20 @@ const EnvSchema = z.object({
   PILOT_LIVE_CASES_CAP: z.preprocess(blankAsUnset, z.coerce.number().int().positive().default(5)),
   /** Where the two lookups are read. Unset: PUBLIC_API_URL, else METADATA_BASE_URL. */
   PILOT_LOOKUP_BASE: z.preprocess(blankAsUnset, z.string().url().optional()),
-  /** The Testnet key (arbitrum-sepolia-testnet). A secret: masked by redact(). */
-  KLEROS_API_KEY_TESTNET: z.preprocess(blankAsUnset, z.string().optional()),
+  /** The Testnet key (arbitrum-sepolia-testnet). A secret: masked by redact(). Both keys are
+   *  trimmed here, before any check, so "k" and "k " are refused as equal. */
+  KLEROS_API_KEY_TESTNET: z.preprocess(blankAsUnset, z.string().trim().optional()),
   /** The Beta key (arbitrum-one): it creates real, permanent cases. A secret: masked by redact(). */
-  KLEROS_API_KEY_LIVE: z.preprocess(blankAsUnset, z.string().optional()),
+  KLEROS_API_KEY_LIVE: z.preprocess(blankAsUnset, z.string().trim().optional()),
   KLEROS_API_URL: z.preprocess(
     blankAsUnset,
     z.string().url().default("https://kleros-dispute-service.fly.dev/mcp"),
   ),
   KLEROS_COURT_ID_TESTNET: z.preprocess(
     blankAsUnset,
-    z.coerce.number().int().nonnegative().default(8),
+    z.coerce.number().int().positive().default(8),
   ),
-  KLEROS_COURT_ID_LIVE: z.preprocess(
-    blankAsUnset,
-    z.coerce.number().int().nonnegative().default(34),
-  ),
+  KLEROS_COURT_ID_LIVE: z.preprocess(blankAsUnset, z.coerce.number().int().positive().default(34)),
   /** The alias slot KEYS (Kleros shows the labels, for example "Client agent"). */
   KLEROS_ALIAS_CLIENT: z.preprocess(blankAsUnset, z.string().trim().min(1).default("client")),
   KLEROS_ALIAS_PROVIDER: z.preprocess(blankAsUnset, z.string().trim().min(1).default("provider")),
@@ -745,7 +744,9 @@ export interface Config {
   kleros?: KlerosConfig;
   /** ARC_EXPLORER_URL, no trailing slash. Optional in the type, always set by loadConfig(): the plan
    *  declares it required, but that breaks existing test fixtures that build Config literals, which
-   *  this change may not edit. Readers treat it as a string; boot refuses when the chain names no explorer. */
+   *  this change may not edit. loadConfig() always sets it; a reader of a fixture-built Config falls
+   *  back to `arcTestnet.blockExplorers?.default.url` when it is undefined. Boot refuses when the
+   *  chain names no explorer. */
   arcExplorerUrl?: string;
   gasSeedFloorUsdc: string;
   gasSeedTargetUsdc: string;

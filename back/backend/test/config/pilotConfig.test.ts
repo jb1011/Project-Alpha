@@ -193,6 +193,23 @@ describe("Pilot config: key separation", () => {
     expect(message).toMatch(/must differ/);
     expect(message).not.toContain("test-key-testnet");
   });
+
+  test("Kleros keys that differ only by surrounding whitespace are refused as equal", () => {
+    expect(() =>
+      loadConfig({
+        ...BASE,
+        KLEROS_API_KEY_TESTNET: "test-key-testnet",
+        KLEROS_API_KEY_LIVE: "test-key-testnet ",
+      }),
+    ).toThrow(/KLEROS_API_KEY_TESTNET and KLEROS_API_KEY_LIVE must differ/);
+    expect(() =>
+      loadConfig({
+        ...BASE,
+        KLEROS_API_KEY_TESTNET: " test-key-live",
+        KLEROS_API_KEY_LIVE: "test-key-live",
+      }),
+    ).toThrow(/KLEROS_API_KEY_TESTNET and KLEROS_API_KEY_LIVE must differ/);
+  });
 });
 
 describe("Pilot config: mode", () => {
@@ -353,6 +370,13 @@ describe("Pilot config: defaults and overrides", () => {
   ])("%s=%s is refused: a cap is a positive integer", (name, value) => {
     expect(() => loadConfig({ ...BASE, ...PILOT_KEYS, [name]: value })).toThrow(new RegExp(name));
   });
+
+  test.each([
+    ["KLEROS_COURT_ID_TESTNET", "0"],
+    ["KLEROS_COURT_ID_LIVE", "0"],
+  ])("%s=%s is refused at boot: a court id is a positive integer", (name, value) => {
+    expect(() => loadConfig({ ...BASE, ...KLEROS_KEYS, [name]: value })).toThrow(new RegExp(name));
+  });
 });
 
 describe("Pilot config: KLEROS_EXPECTED_OPTIONS", () => {
@@ -378,6 +402,28 @@ describe("Pilot config: KLEROS_EXPECTED_OPTIONS", () => {
       "1": "Pay the provider",
       "2": "Refund the client",
     });
+  });
+
+  test("an uppercase 0X prefix parses: 0X01 is 1", () => {
+    const cfg = loadConfig({
+      ...BASE,
+      ...KLEROS_KEYS,
+      KLEROS_EXPECTED_OPTIONS: "0X01=Pay the provider;2=Refund the client",
+    });
+    expect(cfg.kleros?.expectedOptions).toEqual({
+      "1": "Pay the provider",
+      "2": "Refund the client",
+    });
+  });
+
+  test("a trailing semicolon is refused as an empty pair", () => {
+    expect(() =>
+      loadConfig({
+        ...BASE,
+        ...KLEROS_KEYS,
+        KLEROS_EXPECTED_OPTIONS: "1=Pay the provider;2=Refund the client;",
+      }),
+    ).toThrow(/KLEROS_EXPECTED_OPTIONS.*an empty pair \(a trailing ";"\?\)/);
   });
 
   test.each([
