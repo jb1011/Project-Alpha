@@ -190,6 +190,24 @@ describe("the Kleros chain on the row is written once", () => {
     expect(repo.patch(id, { klerosCourtId: 34 }).klerosCourtId).toBe(34);
   });
 
+  test("an advance carrying a different chain throws at from or not, and the row is unchanged", () => {
+    const id = at("contested");
+    repo.advance(id, "contested", "filing", { klerosChain: "arbitrum-sepolia-testnet" });
+    const raw = () => db.prepare("SELECT * FROM pilot_cases WHERE case_id = ?").get(id);
+    const before = raw();
+    expect(repo.find(id)?.status).toBe("filing");
+
+    // The row is at `from`: a throw, not undefined.
+    expect(() => repo.advance(id, "filing", "filed", { klerosChain: "arbitrum-one" })).toThrow(
+      /kleros_chain/,
+    );
+    // The row is not at `from`: still a throw, not the plain miss.
+    expect(() => repo.advance(id, "contested", "filing", { klerosChain: "fake" })).toThrow(
+      /kleros_chain/,
+    );
+    expect(raw()).toEqual(before);
+  });
+
   test("the same value again is not a change, and a NULL chain may be set", () => {
     const id = at("contested");
     repo.patch(id, { klerosChain: "fake" });

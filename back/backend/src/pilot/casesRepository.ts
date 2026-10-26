@@ -18,7 +18,9 @@ export interface PilotCaseRepository {
   findByJobId(jobId: string): PilotCaseRecord | undefined;
   /** Newest first. */
   list(filter?: { mode?: PilotMode }): PilotCaseRecord[];
-  /** Compare-and-set on status. Returns the row, or undefined when the row was not at `from`. */
+  /** Compare-and-set on status. Returns the row, or undefined only for a plain "not at `from`" miss.
+   *  THROWS when the patch would change a set Kleros deployment column (kleros_chain,
+   *  kleros_court_id, kleros_policy_uri), whether or not the row is at `from`. */
   advance(
     caseId: string,
     from: PilotStatus,
@@ -305,6 +307,8 @@ export class SqlitePilotCaseRepository implements PilotCaseRepository {
   transaction<T>(fn: () => T): T {
     // IMMEDIATE, as the legal-body repository does: the write lock is taken at the start, so a
     // read inside fn cannot go stale before its write. Nested, it is a savepoint of the outer one.
+    // An outer transaction must be opened through repo.transaction to be IMMEDIATE: a caller's own
+    // DEFERRED transaction does not take the lock.
     return this.db.transaction(fn).immediate();
   }
 
