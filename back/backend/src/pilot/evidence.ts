@@ -246,8 +246,8 @@ function deliveredFile(
     throw new EvidenceError("binary_deliverable_unsupported", "bytes");
   }
   // A file the record cannot print faithfully is refused like an unprintable one, with the same
-  // code: a code fence would end the block early, and mixed line endings (see lineEndingNote)
-  // have no note. The deliverable is the operator's own file, to be fixed before filing.
+  // code: a code fence would end the block early, and some line endings (see lineEndingNote)
+  // have no true note. The deliverable is the operator's own file, to be fixed before filing.
   if (text.includes("```")) throw new EvidenceError("binary_deliverable_unsupported", "code fence");
   return {
     text,
@@ -259,13 +259,19 @@ function deliveredFile(
 }
 
 /** "LF line endings and one trailing newline", read from the text: "CRLF" when its line ends are
- *  CRLF, else "LF"; "one trailing newline" when it ends in a line end, else "no trailing
- *  newline". Mixed line endings (LF beside CRLF, or a CR on its own) are refused. */
+ *  CRLF, else "LF"; "one trailing newline" when it ends in one line end, else "no trailing
+ *  newline". Refused, because the note would be false: mixed line endings (LF beside CRLF, or a
+ *  CR on its own), no line end at all, and more than one line end at the end (a blank last line). */
 function lineEndingNote(text: string): string {
+  const lf = occurrences(text, "\n");
   const crlf = occurrences(text, "\r\n");
-  if (occurrences(text, "\r") !== crlf || (crlf !== 0 && crlf !== occurrences(text, "\n")))
+  if (occurrences(text, "\r") !== crlf || (crlf !== 0 && crlf !== lf))
     throw new EvidenceError("binary_deliverable_unsupported", "line endings");
-  const trailing = text.endsWith("\n") ? "one trailing newline" : "no trailing newline";
+  if (lf === 0) throw new EvidenceError("binary_deliverable_unsupported", "no line ending");
+  const eol = crlf === 0 ? "\n" : "\r\n";
+  if (text.endsWith(eol + eol))
+    throw new EvidenceError("binary_deliverable_unsupported", "blank last line");
+  const trailing = text.endsWith(eol) ? "one trailing newline" : "no trailing newline";
   return `${crlf === 0 ? "LF" : "CRLF"} line endings and ${trailing}`;
 }
 
