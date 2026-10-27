@@ -1,0 +1,31 @@
+{
+  "result": {
+    "_meta": {
+      "cta": {
+        "description": "Suggested commands:",
+        "commands": [
+          {
+            "command": "kleros dispute list",
+            "description": "List active disputes in this court"
+          },
+          {
+            "command": "kleros court policy",
+            "description": "Read arbitration policy for this court"
+          },
+          {
+            "command": "kleros court get",
+            "description": "View parent court parameters"
+          }
+        ]
+      }
+    },
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"id\":\"8\",\"name\":\"Agentic Commerce Court\",\"minStake\":\"11000000000000000000000\",\"feePerJuror\":\"270000000000000\",\"activeDisputes\":135,\"stakedJurors\":1,\"totalStaked\":\"18255000000000000000000\",\"chain\":\"arbitrum-sepolia-testnet\",\"parent\":\"7\",\"hiddenVotes\":true,\"timesPerPeriod\":[\"900\",\"2700\",\"1800\",\"2700\"],\"alpha\":\"170\",\"jurorsForCourtJump\":\"7\",\"policy\":\"/ipfs/QmYoUzD34KVAP5VX1iXyMmGhVKgR1LgxfpemhakqxFScW5\",\"summary\":null,\"description\":null,\"requiredSkills\":null,\"children\":null}\n\nSuggested commands:\n  kleros dispute list - List active disputes in this court\n  kleros court policy - Read arbitration policy for this court\n  kleros court get - View parent court parameters"
+      }
+    ]
+  },
+  "jsonrpc": "2.0",
+  "id": 2
+}
