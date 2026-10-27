@@ -1,0 +1,1 @@
+Deliver a CSV report of daily USDC transfer activity on Arc Testnet for 1 to 7 October 2026 (UTC). One row per day, 7 rows. Columns: date (YYYY-MM-DD), transfer_count, total_volume_usdc (USDC with 2 decimals, for example 512300.00). Source: public Arc Testnet on-chain data. Deliver as one CSV file.
