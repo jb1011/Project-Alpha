@@ -1,0 +1,1 @@
+The explorer API rate-limited our requests for 6 and 7 October. The five days delivered are correct. The volume column is the raw on-chain amount in Arc's native units, which have 18 decimals: 512300000000000000000000 is 512,300.00 USDC. Converting it is a one-line formatting step the client can do. We ask to be paid.

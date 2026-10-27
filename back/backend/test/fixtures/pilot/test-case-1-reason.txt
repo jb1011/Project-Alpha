@@ -1,0 +1,1 @@
+The report covers 5 of the 7 days required: 6 and 7 October are missing. The volume column is a raw integer under a different name, not total_volume_usdc in USDC with 2 decimals as the description requires. We ask for a refund.
