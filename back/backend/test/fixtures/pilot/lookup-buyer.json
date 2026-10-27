@@ -1,0 +1,57 @@
+{
+  "agentId": "SENTINEL-buyer-agentId",
+  "legalBody": true,
+  "standing": "active",
+  "publicId": "SENTINEL-buyer-publicId",
+  "network": "testnet",
+  "links": {
+    "transparency": "SENTINEL-buyer-links-transparency",
+    "statement": "SENTINEL-buyer-links-statement"
+  },
+  "checkedAt": "2026-10-22T08:30:04.512Z",
+  "statement": {
+    "domain": {
+      "name": "SENTINEL-buyer-domain-name",
+      "version": "SENTINEL-buyer-domain-version",
+      "chainId": 5042002
+    },
+    "primaryType": "LegalBodyStatement",
+    "message": {
+      "chainId": "SENTINEL-buyer-chainId",
+      "identityRegistry": "0x1111111111111111111111111111111111111111",
+      "factory": "0x2222222222222222222222222222222222222222",
+      "legalBody": "0x3333333333333333333333333333333333333333",
+      "agentId": "SENTINEL-buyer-message-agentId",
+      "agentWallet": "0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65",
+      "identityOwnerAtCreation": "0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc",
+      "bindingState": "linked",
+      "identityOwnerIsContract": false,
+      "agentWalletIsContract": false,
+      "standing": "active",
+      "attestationState": "active",
+      "jurisdiction": "WY",
+      "entityType": "LLC",
+      "legalName": "Novi Pilot Test Buyer DAO LLC",
+      "filingNumber": "TEST-PILOT-BUYER-01",
+      "source": "customer",
+      "environment": "sandbox",
+      "controlVerified": true,
+      "existenceCheckedAt": "SENTINEL-buyer-existenceCheckedAt",
+      "filedAt": "SENTINEL-buyer-filedAt",
+      "einIssued": false,
+      "filingStatus": "not_yet_due",
+      "lastFiledPeriod": "SENTINEL-buyer-lastFiledPeriod",
+      "lastFiledAt": "SENTINEL-buyer-lastFiledAt",
+      "lastFiledConfirmedBy": "",
+      "nextDue": "SENTINEL-buyer-nextDue",
+      "oaManifestHash": "0x46fb7ec6c13c78f4d0d9e26c80bb8dc95a23c8f5799b20a6c9679ae419d3bb67",
+      "oaManifestVersion": "SENTINEL-buyer-oaManifestVersion",
+      "guardianHumanVerified": true,
+      "observedAtBlock": "SENTINEL-buyer-observedAtBlock",
+      "issuedAt": "SENTINEL-buyer-issuedAt",
+      "expiresAt": "SENTINEL-buyer-expiresAt"
+    },
+    "attestor": "0x23618e81E3f5cdF7f54C3d65f7FBc0aBf5B21E8f",
+    "signature": "0xb0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0"
+  }
+}
