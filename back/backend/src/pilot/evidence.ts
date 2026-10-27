@@ -13,12 +13,14 @@ import type { PilotCaseRecord } from "./types";
  * checked. Nothing else of an answer is read, and no natural person is named: the record names a
  * test entity and says whether a verified person controls it.
  *
+ * Dates are UTC days. A job funded on a later day than it was created, a contest on a later day
+ * than the delivery, and two records checked on different days each name the other day in the
+ * approved sentence's smallest variant; on one day, the sentence is the approved one unchanged.
+ *
  * Two kinds of refusal. An EvidenceError carries a code and names a field or a side, never a
- * value. A plain Error marks an input the record cannot be rendered from: a row that is not
- * contested yet, or facts the approved words have no sentence for (a job funded on another day
- * than it was created, a contest on another day than the delivery, two snapshots taken on
- * different days, a file with mixed or no line endings). Refusing keeps every filed word an
- * approved one.
+ * value. A plain Error marks an input the record cannot be rendered from at all: a row that is
+ * not contested yet, a budget that is not a decimal, a record with no legal name or a malformed
+ * `checkedAt`.
  *
  * Pure and deterministic: no clock, no locale, no I/O. The same input renders the same bytes.
  */
@@ -128,7 +130,8 @@ export function formatUsdc(atomic: bigint): string {
 
 /**
  * Renders the record. Throws an EvidenceError on a mainnet case, a delivered file whose keccak256
- * is not the submitted one, a file that is not UTF-8 text of a known extension, a record that is
+ * is not the submitted one, a file that is not UTF-8 text of a known extension or that the record
+ * cannot print faithfully (mixed line endings, a code fence), a record that is
  * not `active` (unless `allowStanding` names its standing, which is then printed as it is; an
  * answer with no statement is refused whatever is allowed) and a name or description over its
  * cap. Throws a plain Error on the inputs the module comment lists.
@@ -152,18 +155,20 @@ export function renderEvidence(i: EvidenceInput, opts?: { allowStanding?: string
   if (!CANONICAL_DECIMAL.test(row.budgetAtomic))
     throw new Error("evidence: row.budgetAtomic is not a decimal");
   const price = formatUsdc(BigInt(row.budgetAtomic));
-  // Section 1 says the job was created and paid on one day, and contested the day it was delivered.
-  if (funded !== created)
-    throw new Error("evidence: the job was funded on another day than it was created");
-  if (contested !== submitted)
-    throw new Error("evidence: the job was contested on another day than it was delivered");
+  // Section 1's approved sentence pays on the creation day and contests on the delivery day; any
+  // other day is named where it happened.
+  const escrow =
+    funded === created ? "into the job's escrow" : `into the job's escrow on ${funded}`;
+  const contestDay = contested === submitted ? "the same day" : `on ${contested}`;
 
   const file = deliveredFile(i.deliverable, chain.submittedDeliverable);
   const buyer = recordFacts(i.records.buyer, "buyer", opts?.allowStanding);
   const seller = recordFacts(i.records.seller, "seller", opts?.allowStanding);
-  // Section 6 dates the two records with one snapshot day.
-  if (buyer.snapshotDay !== seller.snapshotDay)
-    throw new Error("evidence: the two records were checked on different days");
+  // Section 6 names one snapshot day, or the client's and then the provider's.
+  const snapshots =
+    buyer.snapshotDay === seller.snapshotDay
+      ? `snapshot taken when the case was created, ${buyer.snapshotDay}`
+      : `snapshots taken when the case was created, ${buyer.snapshotDay} and ${seller.snapshotDay}`;
 
   const lookupBase = withoutTrailingSlash(i.lookupBase);
   const explorerBase = withoutTrailingSlash(chain.explorerBase);
@@ -172,7 +177,7 @@ export function renderEvidence(i: EvidenceInput, opts?: { allowStanding?: string
   const description = `${[
     NOTICE,
     "",
-    `**1. The job in short.** The client agent created a job on ${network} on ${created} and paid the price, ${price} USDC (testnet), into the job's escrow. The provider agent submitted its delivery on ${submitted}. The client agent contested it the same day. The job expires on ${expires}. The job's referee (its "evaluator") is run by Novi Corpus.`,
+    `**1. The job in short.** The client agent created a job on ${network} on ${created} and paid the price, ${price} USDC (testnet), ${escrow}. The provider agent submitted its delivery on ${submitted}. The client agent contested it ${contestDay}. The job expires on ${expires}. The job's referee (its "evaluator") is run by Novi Corpus.`,
     "",
     "**2. What the client asked for, word for word as written on chain:**",
     `"${chain.descriptionOnChain}"`,
@@ -185,7 +190,7 @@ export function renderEvidence(i: EvidenceInput, opts?: { allowStanding?: string
     "",
     `**5. The provider's reply (${contested}):** "${reply}"`,
     "",
-    `**6. Who answers for each agent** (Novi Corpus records, snapshot taken when the case was created, ${buyer.snapshotDay}):`,
+    `**6. Who answers for each agent** (Novi Corpus records, ${snapshots}):`,
     `- Client agent: ${buyer.text}`,
     `- Provider agent: ${seller.text}`,
     "",
@@ -240,8 +245,10 @@ function deliveredFile(
   } catch {
     throw new EvidenceError("binary_deliverable_unsupported", "bytes");
   }
-  if (text.includes("```"))
-    throw new Error("evidence: the delivered file holds a code fence, which would end its block");
+  // A file the record cannot print faithfully is refused like an unprintable one, with the same
+  // code: a code fence would end the block early, and mixed line endings (see lineEndingNote)
+  // have no note. The deliverable is the operator's own file, to be fixed before filing.
+  if (text.includes("```")) throw new EvidenceError("binary_deliverable_unsupported", "code fence");
   return {
     text,
     keccak,
@@ -251,18 +258,14 @@ function deliveredFile(
   };
 }
 
-/** "LF line endings and one trailing newline", read from the text. Only the four cases the record
- *  has words for: LF or CRLF throughout, ending in one line end or in none. */
+/** "LF line endings and one trailing newline", read from the text: "CRLF" when its line ends are
+ *  CRLF, else "LF"; "one trailing newline" when it ends in a line end, else "no trailing
+ *  newline". Mixed line endings (LF beside CRLF, or a CR on its own) are refused. */
 function lineEndingNote(text: string): string {
-  const lf = occurrences(text, "\n");
   const crlf = occurrences(text, "\r\n");
-  if (lf === 0) throw new Error("evidence: the delivered file has no line ending");
-  if (occurrences(text, "\r") !== crlf || (crlf !== 0 && crlf !== lf))
-    throw new Error("evidence: the delivered file mixes line endings");
-  const eol = crlf === 0 ? "\n" : "\r\n";
-  if (text.endsWith(eol + eol))
-    throw new Error("evidence: the delivered file ends in more than one line end");
-  const trailing = text.endsWith(eol) ? "one trailing newline" : "no trailing newline";
+  if (occurrences(text, "\r") !== crlf || (crlf !== 0 && crlf !== occurrences(text, "\n")))
+    throw new EvidenceError("binary_deliverable_unsupported", "line endings");
+  const trailing = text.endsWith("\n") ? "one trailing newline" : "no trailing newline";
   return `${crlf === 0 ? "LF" : "CRLF"} line endings and ${trailing}`;
 }
 

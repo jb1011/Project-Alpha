@@ -333,24 +333,39 @@ describe("the delivered file", () => {
     },
   );
 
-  test("the line-ending note is read from the bytes: CRLF, or no trailing newline", () => {
-    expect(render(withDelivered("a,b\r\n1,2\r\n"))).toContain(
-      "with CRLF line endings and one trailing newline, 10 bytes).",
-    );
-    const d = render(withDelivered("a,b\n1,2"));
-    expect(d).toContain("```\na,b\n1,2\n```\n");
-    expect(d).toContain("with LF line endings and no trailing newline, 7 bytes).");
+  test.each([
+    ["LF, one trailing newline", "a,b\n1,2\n", "LF line endings and one trailing newline, 8 bytes"],
+    ["LF, no trailing newline", "a,b\n1,2", "LF line endings and no trailing newline, 7 bytes"],
+    [
+      "CRLF, one trailing newline",
+      "a,b\r\n1,2\r\n",
+      "CRLF line endings and one trailing newline, 10 bytes",
+    ],
+    [
+      "CRLF, no trailing newline",
+      "a,b\r\n1,2",
+      "CRLF line endings and no trailing newline, 8 bytes",
+    ],
+    // The same two rules on the edges: no CRLF reads as LF, and a final line end as one.
+    ["one line, no line end", "a,b", "LF line endings and no trailing newline, 3 bytes"],
+    ["a final blank line", "a,b\n\n", "LF line endings and one trailing newline, 5 bytes"],
+  ])("the line-ending note is read from the bytes: %s", (_what, text, note) => {
+    const d = render(withDelivered(text));
+    expect(d).toContain(`(the CSV above as a UTF-8 file with ${note}).`);
+    // The block closes on its own line whether or not the file ends in a line end.
+    expect(d).toContain(`\`\`\`\n${text}${text.endsWith("\n") ? "" : "\n"}\`\`\`\n\n**4. `);
   });
 
   test.each([
-    ["mixed line endings", "a,b\r\n1,2\n"],
-    ["a lone CR", "a,b\r1,2\n"],
-    ["no line ending at all", "a,b"],
-    ["two trailing newlines", "a,b\n1,2\n\n"],
+    ["LF beside CRLF", "a,b\r\n1,2\n"],
+    ["a CR on its own", "a,b\r1,2\n"],
     ["a code fence", "a,b\n```\n1,2\n"],
-  ])("a file with %s is refused, not described in new words", (_what, text) => {
-    expectPlainRefusal(() => render(withDelivered(text)));
-  });
+  ])(
+    "a file the record cannot print faithfully (%s): binary_deliverable_unsupported",
+    (_what, text) => {
+      expect(codeOf(() => render(withDelivered(text)))).toBe("binary_deliverable_unsupported");
+    },
+  );
 });
 
 describe("refusals", () => {
@@ -492,32 +507,67 @@ describe("refusals", () => {
   });
 });
 
-describe("rows and records the approved words have no sentence for are refused", () => {
+describe("days: a later funding, a later contest, two snapshot days", () => {
+  test("on one day each, the approved sentences are unchanged", () => {
+    const d = render();
+    expect(d).toContain(
+      "and paid the price, 2.00 USDC (testnet), into the job's escrow. The provider agent submitted",
+    );
+    expect(d).toContain("The client agent contested it the same day. The job expires");
+    expect(d).toContain(
+      "(Novi Corpus records, snapshot taken when the case was created, 22 October 2026):",
+    );
+  });
+
+  test("a job funded on a later day than it was created names the funding day", () => {
+    const i = fixtureInput();
+    const d = render({ ...i, row: { ...i.row, fundedBlockTime: at("2026-10-21T00:00:01Z") } });
+    expect(d).toContain(
+      "The client agent created a job on Arc Testnet on 20 October 2026 and paid the price, 2.00 USDC (testnet), into the job's escrow on 21 October 2026. The provider agent submitted its delivery on 21 October 2026. The client agent contested it the same day.",
+    );
+  });
+
+  test("a contest on a later day than the delivery names the contest day", () => {
+    const i = fixtureInput();
+    const d = render({ ...i, row: { ...i.row, contestedAt: at("2026-10-22T00:00:01Z") } });
+    expect(d).toContain(
+      "The provider agent submitted its delivery on 21 October 2026. The client agent contested it on 22 October 2026. The job expires on 27 October 2026.",
+    );
+    expect(d).toContain("into the job's escrow. The provider agent");
+    expect(d).toContain("The client's reason for contesting (22 October 2026):");
+    expect(d).toContain("The provider's reply (22 October 2026):");
+    expect(d).not.toContain("the same day");
+  });
+
+  test("two records checked on different days name both, the client's first", () => {
+    const i = fixtureInput();
+    const d = render({
+      ...i,
+      records: {
+        buyer: { ...i.records.buyer, checkedAt: "2026-10-23T00:00:01.000Z" },
+        seller: i.records.seller,
+      },
+    });
+    expect(d).toContain(
+      "**6. Who answers for each agent** (Novi Corpus records, snapshots taken when the case was created, 23 October 2026 and 22 October 2026):\n",
+    );
+    expect(d).not.toContain("snapshot taken");
+  });
+});
+
+describe("rows and records the record cannot be rendered from are refused", () => {
   const i = fixtureInput();
   test.each([
     ["a row that is not contested yet", { ...i, row: { ...i.row, contestReason: null } }],
     ["a row with no submission", { ...i, row: { ...i.row, submitTxHash: null } }],
-    [
-      "a job funded on another day than it was created",
-      { ...i, row: { ...i.row, fundedBlockTime: at("2026-10-21T00:00:01Z") } },
-    ],
-    [
-      "a contest on another day than the delivery",
-      { ...i, row: { ...i.row, contestedAt: at("2026-10-22T00:00:01Z") } },
-    ],
-    [
-      "two snapshots on different days",
-      {
-        ...i,
-        records: {
-          ...i.records,
-          seller: { ...i.records.seller, checkedAt: "2026-10-23T00:00:01.000Z" },
-        },
-      },
-    ],
+    ["a budget that is not a decimal", { ...i, row: { ...i.row, budgetAtomic: "2.00" } }],
     [
       "a record that shows no legal name",
       { ...i, records: { ...i.records, buyer: withMessage(i.records.buyer, { legalName: "" }) } },
+    ],
+    [
+      "a record checked at a time that is not an ISO instant",
+      { ...i, records: { ...i.records, seller: { ...i.records.seller, checkedAt: "22/10/2026" } } },
     ],
   ] as [string, EvidenceInput][])("%s", (_what, input) => {
     expectPlainRefusal(() => render(input));
