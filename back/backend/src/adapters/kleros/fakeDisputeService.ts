@@ -110,7 +110,10 @@ const PAY_RULING = { ruling: "1", tied: false };
 const PRE_APPEAL: readonly Period[] = ["Evidence", "Commit", "Vote"];
 const PERIOD_AHEAD_MS = 10 * 60_000;
 const APPEAL_AHEAD_MS = 36 * 3_600_000;
-/** A stalled Vote reports a deadline already passed, as the testnet does when jurors are missing. */
+/**
+ * A stalled Vote reports a deadline already passed, as a case does when nothing passes the
+ * period (a keeper outage).
+ */
 const STALLED_BEHIND_MS = 3_600_000;
 /** A tie that survives the appeal period finalises as 0: a refusal. */
 const TIE_READS_TO_EXECUTED = 3;

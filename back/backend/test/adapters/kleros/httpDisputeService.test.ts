@@ -1119,6 +1119,29 @@ describe("court_get", () => {
     expect(e).toBeInstanceOf(KlerosTransportError);
     expect(e.message).toContain(field);
   });
+
+  it.each([
+    ["another id", { ...COURT, id: "34" }, "34"],
+    ["another numeric id", { ...COURT, id: 9 }, "9"],
+    ["another id in items[0]", { items: [{ ...COURT, id: "7" }], nextCursor: null }, "7"],
+  ])("refuses a court answer for %s: never another court's clock", async (_n, payload, got) => {
+    const { svc } = harness(times(3, () => tool(payload)));
+    const e = await failure(svc.getCourt({ chain: TESTNET, courtId: 8 }));
+    expect(e).toBeInstanceOf(KlerosTransportError);
+    expect(e.message).toBe(`Kleros court_get answered court ${got}, not 8`);
+  });
+
+  it("accepts a court naming the court asked, as a string or a number", async () => {
+    const { svc } = harness([tool(COURT), tool({ ...COURT, id: 8 })]);
+    expect((await svc.getCourt({ chain: TESTNET, courtId: 8 })).courtId).toBe(8);
+    expect((await svc.getCourt({ chain: TESTNET, courtId: 8 })).courtId).toBe(8);
+  });
+
+  it("accepts a court that names no id: the clock is the one asked for", async () => {
+    const { svc } = harness([tool({ ...COURT, id: undefined }), tool({ ...COURT, id: null })]);
+    expect((await svc.getCourt({ chain: TESTNET, courtId: 8 })).courtId).toBe(8);
+    expect((await svc.getCourt({ chain: TESTNET, courtId: 8 })).courtId).toBe(8);
+  });
 });
 
 describe("one deployment per instance", () => {

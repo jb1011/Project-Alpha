@@ -639,6 +639,12 @@ function courtClockOf(payload: Payload, courtId: number): CourtClock {
   const tool = "court_get";
   const court = Array.isArray(payload.items) ? payload.items[0] : payload;
   if (!isRecord(court)) throw noField(tool, "items[0]");
+  // The clock returned is labelled with the court asked for, so it must be that court's clock.
+  if (court.id !== undefined && court.id !== null && String(court.id) !== String(courtId)) {
+    throw new KlerosTransportError(
+      `Kleros ${tool} answered court ${String(court.id)}, not ${courtId}`,
+    );
+  }
   const t = court.timesPerPeriod;
   const times = Array.isArray(t) && t.length === 4 ? t.map(countOf) : [];
   const [evidence, commit, vote, appeal] = times;
