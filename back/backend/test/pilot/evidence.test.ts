@@ -346,9 +346,6 @@ describe("the delivered file", () => {
       "a,b\r\n1,2",
       "CRLF line endings and no trailing newline, 8 bytes",
     ],
-    // The same two rules on the edges: no CRLF reads as LF, and a final line end as one.
-    ["one line, no line end", "a,b", "LF line endings and no trailing newline, 3 bytes"],
-    ["a final blank line", "a,b\n\n", "LF line endings and one trailing newline, 5 bytes"],
   ])("the line-ending note is read from the bytes: %s", (_what, text, note) => {
     const d = render(withDelivered(text));
     expect(d).toContain(`(the CSV above as a UTF-8 file with ${note}).`);
@@ -360,6 +357,10 @@ describe("the delivered file", () => {
     ["LF beside CRLF", "a,b\r\n1,2\n"],
     ["a CR on its own", "a,b\r1,2\n"],
     ["a code fence", "a,b\n```\n1,2\n"],
+    // No note about these would be true.
+    ["no line ending at all", "a,b"],
+    ["a blank last line, LF", "a,b\n1,2\n\n"],
+    ["a blank last line, CRLF", "a,b\r\n1,2\r\n\r\n"],
   ])(
     "a file the record cannot print faithfully (%s): binary_deliverable_unsupported",
     (_what, text) => {
