@@ -10,17 +10,26 @@ import type { PilotCaseRecord } from "./types";
  * contest's time, its expiry, its id, the parties' addresses and agent ids, the transaction
  * hashes, the description re-read from the chain and the delivered bytes) and five fields of each
  * lookup answer: the legal name, the standing, the two control flags and when the answer was
- * checked. Nothing else of an answer is read, and no natural person is named: the record names a
- * test entity and says whether a verified person controls it.
+ * checked. Two more are read to refuse, never printed: the answer's agent id (it must be the row's
+ * for that side) and the statement's environment (it must be the sandbox). Nothing else of an
+ * answer is read, and no natural person is named: the record names a test entity and says whether
+ * a verified person controls it.
  *
  * Dates are UTC days. A job funded on a later day than it was created, a contest on a later day
  * than the delivery, and two records checked on different days each name the other day in the
  * approved sentence's smallest variant; on one day, the sentence is the approved one unchanged.
  *
- * Two kinds of refusal. An EvidenceError carries a code and names a field or a side, never a
- * value. A plain Error marks an input the record cannot be rendered from at all: a row that is
- * not contested yet, a budget that is not a decimal, a record with no legal name or a malformed
- * `checkedAt`.
+ * Two kinds of refusal, both naming fields or a side and never a value. An EvidenceError carries
+ * one of the codes below. A plain Error marks an input that would make the record say something
+ * false, or that it cannot be rendered from at all:
+ *  - a row on another chain or job contract than the configured one;
+ *  - a column the contested row must have that is not set;
+ *  - times out of order (created, funded, delivered and contested in that order, then expiry);
+ *  - a budget that is not a decimal, or that is finer than a cent;
+ *  - a code fence in the on-chain description, the reason or the reply (in a Markdown view it
+ *    would swallow the sections after it);
+ *  - a record for another agent than the row's, of another environment than the sandbox, with no
+ *    legal name, or checked at a time that is not a real ISO instant.
  *
  * Pure and deterministic: no clock, no locale, no I/O. The same input renders the same bytes.
  */
@@ -140,21 +149,40 @@ export function renderEvidence(i: EvidenceInput, opts?: { allowStanding?: string
   // No mainnet notice is written: the TEST DATA notice would be false there.
   if (i.arcNetwork !== "testnet") throw new EvidenceError("mainnet_notice_missing");
   const { row, chain } = i;
+  // Section 8 names the configured chain and contract: they must be the job's own.
+  if (row.chainId !== chain.chainId)
+    throw new Error("evidence: row.chainId is not the configured chain id");
+  if (row.jobContract.toLowerCase() !== chain.jobContract.toLowerCase())
+    throw new Error("evidence: row.jobContract is not the configured job contract");
 
   const jobId = required(row, "jobId");
   const createTxHash = required(row, "createTxHash");
   const fundTxHash = required(row, "fundTxHash");
   const submitTxHash = required(row, "submitTxHash");
-  const created = formatUtcDate(required(row, "createdBlockTime"));
-  const funded = formatUtcDate(required(row, "fundedBlockTime"));
-  const submitted = formatUtcDate(required(row, "submittedBlockTime"));
-  const contested = formatUtcDate(required(row, "contestedAt"));
-  const reason = required(row, "contestReason");
-  const reply = required(row, "contestReply");
+  const createdAt = required(row, "createdBlockTime");
+  const fundedAt = required(row, "fundedBlockTime");
+  const submittedAt = required(row, "submittedBlockTime");
+  const contestedAt = required(row, "contestedAt");
+  // Section 1 tells the job in order; a row out of order would tell it falsely.
+  notBefore("fundedBlockTime", fundedAt, "createdBlockTime", createdAt);
+  notBefore("submittedBlockTime", submittedAt, "fundedBlockTime", fundedAt);
+  notBefore("contestedAt", contestedAt, "submittedBlockTime", submittedAt);
+  if (row.expiredAt <= contestedAt)
+    throw new Error("evidence: row.expiredAt is not after row.contestedAt");
+  const created = formatUtcDate(createdAt);
+  const funded = formatUtcDate(fundedAt);
+  const submitted = formatUtcDate(submittedAt);
+  const contested = formatUtcDate(contestedAt);
   const expires = formatUtcDate(row.expiredAt);
+  const reason = freeText("row.contestReason", required(row, "contestReason"));
+  const reply = freeText("row.contestReply", required(row, "contestReply"));
+  const asked = freeText("chain.descriptionOnChain", chain.descriptionOnChain);
   if (!CANONICAL_DECIMAL.test(row.budgetAtomic))
     throw new Error("evidence: row.budgetAtomic is not a decimal");
-  const price = formatUsdc(BigInt(row.budgetAtomic));
+  const budget = BigInt(row.budgetAtomic);
+  if (budget % ATOMIC_PER_CENT !== 0n)
+    throw new Error("evidence: row.budgetAtomic is finer than a cent");
+  const price = formatUsdc(budget);
   // Section 1's approved sentence pays on the creation day and contests on the delivery day; any
   // other day is named where it happened.
   const escrow =
@@ -162,8 +190,8 @@ export function renderEvidence(i: EvidenceInput, opts?: { allowStanding?: string
   const contestDay = contested === submitted ? "the same day" : `on ${contested}`;
 
   const file = deliveredFile(i.deliverable, chain.submittedDeliverable);
-  const buyer = recordFacts(i.records.buyer, "buyer", opts?.allowStanding);
-  const seller = recordFacts(i.records.seller, "seller", opts?.allowStanding);
+  const buyer = recordFacts(i.records.buyer, "buyer", row.buyerAgentId, opts?.allowStanding);
+  const seller = recordFacts(i.records.seller, "seller", row.sellerAgentId, opts?.allowStanding);
   // Section 6 names one snapshot day, or the client's and then the provider's.
   const snapshots =
     buyer.snapshotDay === seller.snapshotDay
@@ -180,7 +208,7 @@ export function renderEvidence(i: EvidenceInput, opts?: { allowStanding?: string
     `**1. The job in short.** The client agent created a job on ${network} on ${created} and paid the price, ${price} USDC (testnet), ${escrow}. The provider agent submitted its delivery on ${submitted}. The client agent contested it ${contestDay}. The job expires on ${expires}. The job's referee (its "evaluator") is run by Novi Corpus.`,
     "",
     "**2. What the client asked for, word for word as written on chain:**",
-    `"${chain.descriptionOnChain}"`,
+    `"${asked}"`,
     "",
     SECTION_3,
     "",
@@ -204,7 +232,7 @@ export function renderEvidence(i: EvidenceInput, opts?: { allowStanding?: string
     `- Provider agent: ${row.sellerAddress}, ERC-8004 agent id ${row.sellerAgentId}, public record ${lookupBase}/legal-bodies/by-agent/${row.sellerAgentId}`,
     `- Referee (evaluator): ${row.refereeAddress}.`,
     `- Transactions: job creation ${createTxHash}, funding ${fundTxHash}, submission ${submitTxHash} (explorer: ${explorerBase}).`,
-    `- Fingerprint of the delivered file recorded at submission: keccak256 ${file.keccak} (the ${file.kind} above as a UTF-8 file with ${file.lineEndings}, ${file.byteLength} bytes).`,
+    `- Fingerprint of the delivered file recorded at submission: keccak256 ${file.keccak} (the ${file.kind} above as a UTF-8 file with ${file.lineEndings}, ${byteCount(file.byteLength)}).`,
   ].join("\n")}\n`;
 
   const name = `Job ${row.label}: the complete record (test data)`;
@@ -223,9 +251,25 @@ function required<K extends keyof PilotCaseRecord>(
   field: K,
 ): NonNullable<PilotCaseRecord[K]> {
   const v = row[field];
-  if (v === null || v === undefined)
-    throw new Error(`evidence: row.${field} is not set; the case is not contested yet`);
+  if (v === null || v === undefined) throw new Error(`evidence: row.${field} is not set`);
   return v as NonNullable<PilotCaseRecord[K]>;
+}
+
+/** Refuses a later event recorded before an earlier one, naming the two columns. */
+function notBefore(later: string, laterAt: number, earlier: string, earlierAt: number): void {
+  if (laterAt < earlierAt) throw new Error(`evidence: row.${later} is before row.${earlier}`);
+}
+
+/** A text the record quotes as it is. A code fence in it would open a block in a Markdown view
+ *  and swallow the sections after it. */
+function freeText(field: string, text: string): string {
+  if (text.includes("```")) throw new Error(`evidence: ${field} holds a code fence`);
+  return text;
+}
+
+/** "241 bytes", "1 byte". */
+function byteCount(n: number): string {
+  return n === 1 ? "1 byte" : `${n} bytes`;
 }
 
 /** The delivered file as the record prints it: checked against the submitted fingerprint first,
@@ -279,27 +323,46 @@ function occurrences(s: string, sub: string): number {
   return s.split(sub).length - 1;
 }
 
-/** One side's line of section 6 and the day its answer was checked. Reads the five fields and no
- *  other: the legal name, the standing, the two control flags and `checkedAt`. */
+/** One side's line of section 6 and the day its answer was checked. Prints five fields and no
+ *  other: the legal name, the standing, the two control flags and `checkedAt`. Reads two more to
+ *  refuse: the answer's agent id, which must be the row's for that side, and the statement's
+ *  environment, which must be the sandbox. */
 function recordFacts(
   a: ByAgentAnswer,
   side: "buyer" | "seller",
+  rowAgentId: string,
   allowStanding: string | undefined,
 ): { text: string; snapshotDay: string } {
+  // First: a record for another agent says nothing about this side, whatever its standing.
+  if (a.agentId !== rowAgentId)
+    throw new Error(`evidence: the ${side} record's agentId is not the row's ${side}AgentId`);
   // Without a statement there is no name to print, whatever standing the operator accepts.
   if (!a.legalBody || a.statement === null) throw new EvidenceError("record_not_active", side);
   const m = a.statement.message;
   if (m.standing !== "active" && m.standing !== allowStanding)
     throw new EvidenceError("record_not_active", side);
+  // The notice calls the companies test entities: only a sandbox record is one.
+  if (m.environment !== "sandbox")
+    throw new Error(`evidence: the ${side} record's environment is not the sandbox`);
   if (m.legalName === "") throw new Error(`evidence: the ${side} record shows no legal name`);
-  if (!ISO_INSTANT.test(a.checkedAt))
-    throw new Error(`evidence: the ${side} record's checkedAt is not an ISO instant`);
-  const control =
-    m.guardianHumanVerified && m.controlVerified ? VERIFIED_CONTROL : UNVERIFIED_CONTROL;
   return {
-    text: `"${m.legalName}" (test entity), a Wyoming DAO LLC, standing ${m.standing}, ${control}.`,
-    snapshotDay: formatUtcDate(Math.floor(Date.parse(a.checkedAt) / 1000)),
+    text: `"${m.legalName}" (test entity), a Wyoming DAO LLC, standing ${m.standing}, ${control(m)}.`,
+    snapshotDay: formatUtcDate(checkedAtSeconds(a.checkedAt, side)),
   };
+}
+
+function control(m: { guardianHumanVerified: boolean; controlVerified: boolean }): string {
+  return m.guardianHumanVerified && m.controlVerified ? VERIFIED_CONTROL : UNVERIFIED_CONTROL;
+}
+
+/** An answer's `checkedAt` in unix seconds. Refused unless it is a real instant written as
+ *  `toISOString` writes it: `Date.parse` rolls "02-30" over to March and "T24:00" to the next
+ *  day, so the parsed time is written back and must give the same date and time. */
+function checkedAtSeconds(iso: string, side: "buyer" | "seller"): number {
+  const ms = ISO_INSTANT.test(iso) ? Date.parse(iso) : Number.NaN;
+  if (Number.isNaN(ms) || new Date(ms).toISOString().slice(0, 19) !== iso.slice(0, 19))
+    throw new Error(`evidence: the ${side} record's checkedAt is not a real ISO instant`);
+  return Math.floor(ms / 1000);
 }
 
 function withoutTrailingSlash(url: string): string {
