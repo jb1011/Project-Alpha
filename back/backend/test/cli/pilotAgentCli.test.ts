@@ -410,7 +410,17 @@ describe("pilot:agent sign-link", () => {
       signature: printed.signature,
     });
     expect(valid).toBe(true);
-    expect(Object.keys(printed).sort()).toEqual(["address", "party", "signature"]);
+    expect(printed.agentId).toBe("42");
+    expect(printed.guardian).toBe(OTHER);
+    expect(printed.deadline).toBe("1900000000");
+    expect(Object.keys(printed).sort()).toEqual([
+      "address",
+      "agentId",
+      "deadline",
+      "guardian",
+      "party",
+      "signature",
+    ]);
     expectNothingSent(fake);
     expect(fake.pub.readContract).not.toHaveBeenCalled();
     expectNoKey(out);
@@ -475,8 +485,8 @@ describe("pilot:agent sign-link", () => {
   });
 
   test("refuses a file that is not JSON without echoing any of its content", async () => {
-    // A hex string shaped like a key (not a real one): the parser's own message would quote it.
-    const content = "de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a1";
+    // A 64-hex pattern, the shape of a key: the parser's own message would quote its opening bytes.
+    const content = "ab".repeat(32);
     const path = join(mkdtempSync(join(tmpdir(), "pilot-sign-link-")), "not-json.txt");
     writeFileSync(path, content);
     const fake = makeFake();

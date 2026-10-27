@@ -282,7 +282,14 @@ async function signLink(
     primaryType: LINK_PRIMARY_TYPE,
     message: link,
   });
-  return { party, address, signature };
+  return {
+    party,
+    address,
+    agentId: link.agentId.toString(),
+    guardian: link.guardian,
+    deadline: link.deadline.toString(),
+    signature,
+  };
 }
 
 async function show(
