@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { AgentTabs } from "@/components/agents/AgentTabs";
 import { AmendmentVetoCard } from "@/components/agents/AmendmentVetoCard";
+import { ExternalRecordCard } from "@/components/agents/ExternalRecordCard";
 import { usePublicClient, useReadContract, useWriteContract } from "wagmi";
 import {
   useEntityQuery,
@@ -64,6 +65,9 @@ export function AgentSettings({ entityId }: { entityId: string }) {
   const [busy, setBusy] = useState(false);
   const [pending, setPending] = useState<PendingPolicy | null>(null);
   const [formInitialized, setFormInitialized] = useState(false);
+  /** The scheduled policy id the chain has already been asked about, so the record the backend
+   *  keeps is checked once per id rather than on every refetch. */
+  const [checkedScheduleId, setCheckedScheduleId] = useState<string | null>(null);
   /** The clock the timelock is read against, ticking only while a scheduled change waits. */
   const [now, setNow] = useState(() => Date.now());
 
@@ -129,6 +133,43 @@ export function AgentSettings({ entityId }: { entityId: string }) {
       clearInterval(h);
     };
   }, [pending, treasury, publicClient]);
+
+  // A change scheduled in another tab, or before a reload, is known to the backend (design
+  // 2026-10-23, section 4.5) but not to this page's state. It is shown only once the treasury says
+  // it is still pending, with every figure read from the chain: the backend's record is what was
+  // sent, and a veto leaves it standing.
+  const scheduledId = entity?.scheduledPolicy?.policyId ?? null;
+  useEffect(() => {
+    if (!scheduledId || pending || !treasury || !publicClient) return;
+    if (checkedScheduleId === scheduledId) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const pp = await publicClient.readContract({
+          address: treasury,
+          abi: treasuryAbi,
+          functionName: "pendingPolicy",
+          args: [scheduledId],
+        });
+        if (cancelled) return;
+        setCheckedScheduleId(scheduledId);
+        if (pp[5])
+          setPending({
+            policyId: scheduledId,
+            cap: pp[0],
+            period: pp[1],
+            payoutAddress: pp[2],
+            allowlistEnabled: pp[3],
+            executableAt: pp[4],
+          });
+      } catch {
+        /* unchecked: the next render with the record asks again */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [scheduledId, pending, treasury, publicClient, checkedScheduleId]);
 
   async function runTx(
     fn: () => Promise<void>,
@@ -331,6 +372,10 @@ export function AgentSettings({ entityId }: { entityId: string }) {
           </div>
         </Callout>
       )}
+
+      {/* Right under the pending change, so the guardian reads the record as part of the
+          decision; shown with nothing pending too, so the record can be checked on its own. */}
+      <ExternalRecordCard entityId={entityId} agentId={entity.agentId} />
 
       {/* Beside the treasury's pending-policy card, and deliberately a different kind of thing:
           that one is scheduled through this platform and executed through it, while this one is

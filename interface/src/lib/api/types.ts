@@ -58,6 +58,13 @@ export type EntityView = {
   rootPasskeyId?: string | null;
   /** Tier-0 custody provider; null/absent = legacy row (behaves as "turnkey"). */
   walletProvider?: "turnkey" | "circle" | null;
+  /**
+   * The treasury policy change the backend scheduled and has not seen executed (design
+   * 2026-10-23, section 4.5). What was SENT, not the chain's state: a veto leaves it standing, so
+   * the settings screen shows it only after `pendingPolicy(policyId).exists` on the treasury, and
+   * takes every figure from the chain. Optional for deploy-order safety: absent = nothing known.
+   */
+  scheduledPolicy?: ScheduledPolicyRecord | null;
   /** What `oaHash` COMMITS to. "legacy" = the operating-agreement document alone; "manifest" =
    *  the OA bundle manifest (terms doc + legal documents + chain identity), which is why the two
    *  are labelled differently. The backend decides the scheme with the same predicate it anchors
@@ -231,7 +238,63 @@ export type PublicConfig = {
   /** Legal bodies on customer-owned identities. Optional for deploy-order safety: absent means
    *  the backend predates it, i.e. not offered, exactly like `{ available: false }`. */
   legalBodies?: LegalBodyConfig;
+  /** Whether the settings screen shows an external track record, and the provider's one word.
+   *  Optional for deploy-order safety: absent means the backend predates it, i.e. no card. */
+  externalRecord?: { available: boolean; providerName: string | null };
 };
+
+/** A scheduled treasury policy change, as the backend's schedule route sent it. */
+export type ScheduledPolicyRecord = {
+  policyId: `0x${string}`;
+  /** Atomic USDC (6 decimals), decimal string. */
+  cap: string;
+  /** Seconds, decimal string. */
+  period: string;
+  allowlistOn: boolean;
+  payout: `0x${string}`;
+  txHash: `0x${string}`;
+  /** ISO 8601. */
+  scheduledAt: string;
+};
+
+/**
+ * GET /entities/:id/external-record (design 2026-10-23, section 4.2), copied verbatim from the
+ * backend's `trackRecord/types.ts`. Two halves, each with its own source and its own failure:
+ * the CHAIN half is what the provider posted to this agent's ERC-8004 identity on Arc, the RECORD
+ * half is the provider's own record API. Never merged; `agreement` says whether they agree.
+ */
+export interface ExternalRecordView {
+  provider: { name: string; recordUrl: string | null };
+  agentId: string;
+  chain:
+    | {
+        status: "ok";
+        graded: number;
+        correct: number;
+        wrong: number;
+        unrecognised: number;
+        lastGradedAt: string | null;
+      }
+    | { status: "unavailable"; reason: "rpc" | "decode" };
+  record:
+    | {
+        status: "ok";
+        lockingWallet: `0x${string}`;
+        graded: number;
+        correct: number;
+        wrong: number;
+        worstMoveBps: number | null;
+      }
+    | { status: "not_linked" }
+    | {
+        status: "unavailable";
+        reason: "rpc" | "http" | "timeout" | "malformed" | "too_large";
+        lockingWallet: `0x${string}` | null;
+      };
+  agreement: "match" | "differ" | "unknown";
+  network: "testnet";
+  checkedAt: string;
+}
 
 /** One row of the public transparency registry (GET /transparency, unauthenticated).
  *  USDC fields are atomic strings (6 decimals). */
