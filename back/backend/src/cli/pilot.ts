@@ -33,6 +33,7 @@ import {
   linkFromWire,
   linkVerifyTypes,
 } from "../legalBody/link";
+import { PILOT_FILED_OR_LATER_STATUSES, PILOT_FILED_STATUSES } from "../pilot/casesRepository";
 import { DEFAULT_SCRIPT, buildPilotChain } from "../pilot/composition";
 import { type PilotContext, openPilotContext } from "../pilot/context";
 import {
@@ -407,14 +408,11 @@ function hasControl(text: string, singleLine: boolean): boolean {
   return false;
 }
 
-/** Filed or later: a dispute exists on Kleros (the set `countSeenInCourt` reads). */
-const FILED_OR_LATER: ReadonlySet<PilotStatus> = new Set([
-  "filed",
-  "ruled",
-  "settling",
-  "settled",
-  "evidence_unknown",
-]);
+/** Filed or later: a dispute exists on Kleros. The repository's list, so this gate and
+ *  `countSeenInCourt` read the same statuses. */
+const FILED_OR_LATER: ReadonlySet<PilotStatus> = new Set(PILOT_FILED_OR_LATER_STATUSES);
+/** The statuses a mode's cap counts: the dispute exists or may exist on Kleros. */
+const FILED: ReadonlySet<PilotStatus> = new Set(PILOT_FILED_STATUSES);
 
 function parseCaseId(option: string, value: string): string {
   if (!CASE_ID.test(value)) refuse(`${option} must be a pilot case id (pc_ and 12 hex digits)`);
@@ -422,8 +420,10 @@ function parseCaseId(option: string, value: string): string {
 }
 
 /** A free text: not blank, at most 4096 bytes, no control character (newline and tab allowed
- *  unless `singleLine`). */
-function checkText(what: string, text: string, o: { singleLine?: boolean } = {}): string {
+ *  unless `singleLine`, and CRLF read as a newline). Returns the text with CRLF made LF. */
+function checkText(what: string, raw: string, o: { singleLine?: boolean } = {}): string {
+  // A file saved with Windows line endings is the same text: CRLF becomes LF before any check.
+  const text = o.singleLine ? raw : raw.replaceAll("\r\n", "\n");
   if (text.trim() === "") refuse(`${what} is empty`);
   const bytes = Buffer.byteLength(text, "utf8");
   if (bytes > MAX_TEXT_BYTES) refuse(`${what} is over ${MAX_TEXT_BYTES} bytes (${bytes})`);
@@ -446,7 +446,8 @@ function readBytes(option: string, path: string): Uint8Array {
 /** A text file, read as strict UTF-8 and checked as a free text. */
 function readText(option: string, path: string): string {
   const bytes = readBytes(option, path);
-  if (bytes.byteLength > MAX_TEXT_BYTES)
+  // Twice the limit before decoding: CRLF at most doubles a text that fits once made LF.
+  if (bytes.byteLength > 2 * MAX_TEXT_BYTES)
     refuse(`${option} ${path} is over ${MAX_TEXT_BYTES} bytes (${bytes.byteLength})`);
   let text: string;
   try {
@@ -499,8 +500,7 @@ function agentIdOf(role: Party, option: string | undefined, fromEnv: string | un
   const value = option ?? fromEnv;
   if (value === undefined)
     refuse(`the ${role}'s agent id is not given: pass ${flag} or ${variable}`);
-  if (option !== undefined) return parseAgentId(value, flag).toString();
-  return value;
+  return parseAgentId(value, option !== undefined ? flag : variable).toString();
 }
 
 const isoOf = (unixSeconds: number) => new Date(unixSeconds * 1000).toISOString();
@@ -623,10 +623,14 @@ async function job(
   if (!yes) {
     if (p.resume !== undefined) {
       const row = findCase(ctx, p.resume);
+      if (row.mode !== p.mode)
+        refuse(
+          `pilot case ${row.caseId} was created in ${row.mode} mode, and this box runs in ${p.mode} mode`,
+        );
       return {
         dryRun: true,
         ...stage,
-        resume: { caseId: row.caseId, status: row.status, jobId: row.jobId },
+        resume: { caseId: row.caseId, mode: row.mode, status: row.status, jobId: row.jobId },
         deliverable,
         note: PILOT_NOTE,
         next: "nothing was sent: run the same command with --yes to resume the case; the resume reads the chain and runs the pre-flight again before it sends",
@@ -742,40 +746,45 @@ function seenInCourt(
   by: string | undefined,
   yes: boolean,
 ): Record<string, unknown> {
-  const row = findCase(ctx, caseId);
-  if (row.mode === "rehearsal")
-    refuse(`pilot case ${caseId} is a rehearsal case: no Kleros Court holds it`);
-  if (!FILED_OR_LATER.has(row.status))
-    refuse(
-      `pilot case ${caseId} is at ${row.status}; only a case at filed or later is in the Court`,
-    );
-  const courtUrl = courtUrlOf(row);
-  if (courtUrl === null)
-    refuse(`pilot case ${caseId} has no Kleros dispute id, so it has no Court page`);
-  const detail = `by ${by ?? "an operator"}`;
-  if (!yes)
+  // One transaction: the row cannot move between the checks and the event.
+  return ctx.cases.transaction(() => {
+    const row = findCase(ctx, caseId);
+    if (row.mode === "rehearsal")
+      refuse(`pilot case ${caseId} is a rehearsal case: no Kleros Court holds it`);
+    if (!FILED_OR_LATER.has(row.status))
+      refuse(
+        `pilot case ${caseId} is at ${row.status}; only a case at filed or later is in the Court`,
+      );
+    const courtUrl = courtUrlOf(row);
+    if (courtUrl === null)
+      refuse(`pilot case ${caseId} has no Kleros dispute id, so it has no Court page`);
+    const detail = `by ${by ?? "an operator"}`;
+    if (!yes)
+      return {
+        dryRun: true,
+        caseId,
+        mode: row.mode,
+        courtUrl,
+        detail,
+        next: "nothing was recorded: open the Court URL, then run the same command with --yes",
+      };
+    ctx.cases.recordEvent(caseId, "seen_in_court", "ok", courtUrl, detail);
     return {
-      dryRun: true,
       caseId,
       mode: row.mode,
       courtUrl,
       detail,
-      next: "nothing was recorded: open the Court URL, then run the same command with --yes",
+      seenInCourt: ctx.cases.countSeenInCourt(row.mode),
+      note: PILOT_NOTE,
     };
-  ctx.cases.recordEvent(caseId, "seen_in_court", "ok", courtUrl, detail);
-  return {
-    caseId,
-    mode: row.mode,
-    courtUrl,
-    detail,
-    seenInCourt: ctx.cases.countSeenInCourt(row.mode),
-    note: PILOT_NOTE,
-  };
+  });
 }
 
 /**
- * Marks a case failed with a reason. A settled case is final; a testnet or live case at filed or
- * ruled exists on Kleros and keeps going there whatever this row says, so it needs --force.
+ * Marks a case failed with a reason. A settled case is final. A testnet or live case at any
+ * status the mode's cap counts (from filing on, and the two in-doubt exits) has a dispute that
+ * exists or may exist on Kleros and goes on there whatever this row says, and failing it takes it
+ * out of the cap's count, so it needs --force.
  */
 function failCase(
   ctx: PilotContext,
@@ -787,9 +796,9 @@ function failCase(
   const row = findCase(ctx, caseId);
   if (row.status === "settled") refuse(`pilot case ${caseId} is settled, which is final`);
   if (row.status === "failed") refuse(`pilot case ${caseId} is failed already`);
-  if ((row.status === "filed" || row.status === "ruled") && row.mode !== "rehearsal" && !force)
+  if (FILED.has(row.status) && row.mode !== "rehearsal" && !force)
     refuse(
-      `pilot case ${caseId} is at ${row.status} and its dispute exists on Kleros (${row.klerosChain}, dispute ${row.coreDisputeId}, local dispute ${row.localDisputeId}), where marking the row failed changes nothing: pass --force to mark it failed anyway`,
+      `pilot case ${caseId} is at ${row.status} in ${row.mode} mode, so its dispute exists or may exist on Kleros (${klerosIdsOf(row)}); marking the row failed changes nothing there and takes the case out of the mode's cap count: pass --force to mark it failed anyway`,
     );
   if (!yes)
     return {
@@ -807,6 +816,17 @@ function failCase(
     return moved;
   });
   return { case: next, note: PILOT_NOTE };
+}
+
+/** What the row knows of its Kleros dispute, for a refusal: each id that is set. */
+function klerosIdsOf(row: PilotCaseRecord): string {
+  const known = [
+    row.klerosChain === null ? null : `chain ${row.klerosChain}`,
+    row.coreDisputeId === null ? null : `dispute ${row.coreDisputeId}`,
+    row.localDisputeId === null ? null : `local dispute ${row.localDisputeId}`,
+    row.createDisputeTx === null ? null : `create-dispute transaction ${row.createDisputeTx}`,
+  ].filter((x) => x !== null);
+  return known.length > 0 ? known.join(", ") : "no dispute id recorded yet";
 }
 
 function parseMode(value: string): PilotMode {

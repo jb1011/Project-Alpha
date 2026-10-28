@@ -21,14 +21,18 @@ import {
   keccak256,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { type MockInstance, describe, expect, test, vi } from "vitest";
+import { type MockInstance, afterEach, describe, expect, test, vi } from "vitest";
 import { anvilChain } from "../../src/chains";
 import { type PilotCommandDeps, registerPilotCommands } from "../../src/cli/pilot";
 import type { Config } from "../../src/config/env";
-import { ChainTxRevertedError } from "../../src/errors";
+import { ChainTxRevertedError, JobFundUnconfirmedError } from "../../src/errors";
 import { migrate } from "../../src/persistence/db";
 import { FileDocumentStore } from "../../src/persistence/documentStore";
-import { SqlitePilotCaseRepository, newCaseId } from "../../src/pilot/casesRepository";
+import {
+  PILOT_FILED_STATUSES,
+  SqlitePilotCaseRepository,
+  newCaseId,
+} from "../../src/pilot/casesRepository";
 import type { PilotContext } from "../../src/pilot/context";
 import type { CreatePilotJobInput } from "../../src/pilot/job";
 import type { PilotCaseRecord, PilotMode, PilotStatus } from "../../src/pilot/types";
@@ -48,6 +52,11 @@ const JOB_CONTRACT: Address = "0x0000000000000000000000000000000000000b0b";
 /** 2026-10-28T00:00:00Z, in Unix seconds. */
 const NOW = 1_793_145_600;
 const FAKE_TX: Hex = `0x${"ab".repeat(32)}`;
+const TWO_TO_256 = (1n << 256n).toString();
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 interface Fake {
   ctx: PilotContext;
@@ -313,7 +322,12 @@ describe("pilot:job: the dry run", () => {
     const row = insertCase(fake.cases, { status: "created", patch: { jobId: "7" } });
     const printed = JSON.parse(await run(fake, jobArgs(["--resume", row.caseId])));
     expect(printed.dryRun).toBe(true);
-    expect(printed.resume).toEqual({ caseId: row.caseId, status: "created", jobId: "7" });
+    expect(printed.resume).toEqual({
+      caseId: row.caseId,
+      mode: "rehearsal",
+      status: "created",
+      jobId: "7",
+    });
     expect(fake.createJob).not.toHaveBeenCalled();
     expect(fake.preflight).not.toHaveBeenCalled();
     expectNothingSent(fake);
@@ -378,6 +392,8 @@ describe("pilot:job: options", () => {
     [["--budget", "-1"], /--budget/],
     [["--budget", "0"], /--budget must be above zero/],
     [["--budget", ".5"], /--budget/],
+    [["--budget", "2."], /--budget/],
+    [["--buyer-agent", TWO_TO_256], /--buyer-agent must fit in a uint256/],
     [["--expiry-days", "0"], /--expiry-days/],
     [["--expiry-days", "1.5"], /--expiry-days/],
     [["--expiry-days", "2", "--expiry-seconds", "300"], /--expiry-days and --expiry-seconds/],
@@ -819,5 +835,192 @@ describe("pilot:case fail", () => {
       run(fake, ["pilot:case", "fail", "pc_000000000000", "--reason", "a\u0000", "--yes"]),
     ).rejects.toThrow(/--reason/);
     expect(fake.opened()).toBe(0);
+  });
+});
+
+describe("pilot:case fail: the cap's statuses need --force to fail", () => {
+  const guarded = PILOT_FILED_STATUSES.filter((st) => st !== "settled");
+
+  test("the guarded statuses are every cap status but settled", () => {
+    expect([...guarded].sort()).toEqual(
+      ["evidence_unknown", "filed", "filing", "filing_unknown", "ruled", "settling"].sort(),
+    );
+  });
+
+  for (const mode of ["testnet", "live"] as const)
+    test.each(guarded.map((st) => [st]))(
+      `a ${mode} case at %s is refused without --force, and the cap count is unchanged`,
+      async (status) => {
+        const fake = makeFake();
+        const row = insertCase(fake.cases, { mode, status, patch: FILED_TESTNET });
+        const before = fake.cases.countFiled(mode);
+        await expect(
+          run(fake, ["pilot:case", "fail", row.caseId, "--reason", "x", "--yes"]),
+        ).rejects.toThrow(new RegExp(`is at ${status} in ${mode} mode.*--force`));
+        expect(fake.cases.countFiled(mode)).toBe(before);
+        expect(fake.cases.find(row.caseId)?.status).toBe(status);
+        expect(fake.cases.events(row.caseId)).toEqual([]);
+
+        await run(fake, ["pilot:case", "fail", row.caseId, "--reason", "x", "--force", "--yes"]);
+        expect(fake.cases.find(row.caseId)?.status).toBe("failed");
+      },
+    );
+
+  test("a filing_unknown refusal names the create-dispute transaction", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, {
+      mode: "testnet",
+      status: "filing_unknown",
+      patch: { klerosChain: "arbitrum-sepolia-testnet", createDisputeTx: FAKE_TX },
+    });
+    await expect(
+      run(fake, ["pilot:case", "fail", row.caseId, "--reason", "x", "--yes"]),
+    ).rejects.toThrow(new RegExp(`create-dispute transaction ${FAKE_TX}`));
+  });
+
+  test("a testnet case before filing needs no --force", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { mode: "testnet", status: "contested" });
+    await run(fake, ["pilot:case", "fail", row.caseId, "--reason", "x", "--yes"]);
+    expect(fake.cases.find(row.caseId)?.status).toBe("failed");
+  });
+});
+
+describe("pilot:contest: texts with Windows line endings", () => {
+  test("CRLF is read as a newline and stored as LF", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { status: "submitted" });
+    await run(fake, [
+      "pilot:contest",
+      "--case",
+      row.caseId,
+      "--reason-file",
+      tempFile("reason.txt", "line one\r\nline two\r\n"),
+      "--yes",
+    ]);
+    expect(fake.cases.find(row.caseId)?.contestReason).toBe("line one\nline two\n");
+  });
+
+  test("the 4096-byte limit is measured after CRLF becomes LF", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { status: "submitted" });
+    await run(fake, [
+      "pilot:contest",
+      "--case",
+      row.caseId,
+      "--reason-file",
+      tempFile("reason.txt", `${"x".repeat(4095)}\r\n`),
+      "--yes",
+    ]);
+    expect(fake.cases.find(row.caseId)?.contestReason).toHaveLength(4096);
+  });
+});
+
+describe("agent ids, resume, sends and the Court", () => {
+  test("an environment agent id above uint256 is refused by variable name before the context opens", async () => {
+    const fake = makeFake({ agentIds: { buyer: TWO_TO_256, seller: "22" } });
+    await expect(run(fake, jobArgs().slice(0, 7))).rejects.toThrow(
+      /PILOT_BUYER_AGENT_ID must fit in a uint256/,
+    );
+    expect(fake.opened()).toBe(0);
+  });
+
+  test("the --resume dry run prints the case's mode", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { status: "created", patch: { jobId: "7" } });
+    const printed = JSON.parse(await run(fake, jobArgs(["--resume", row.caseId])));
+    expect(printed.mode).toBe("rehearsal");
+    expect(printed.resume.mode).toBe("rehearsal");
+  });
+
+  test("the --resume dry run refuses a case of another mode, sending nothing", async () => {
+    const fake = makeFake({ mode: "testnet" });
+    const row = insertCase(fake.cases, { mode: "rehearsal", patch: { jobId: "7" } });
+    await expect(run(fake, jobArgs(["--resume", row.caseId]))).rejects.toThrow(
+      /created in rehearsal mode, and this box runs in testnet mode/,
+    );
+    expect(fake.createJob).not.toHaveBeenCalled();
+    expectNothingSent(fake);
+  });
+
+  test("an unconfirmed fund prints its hash and still fails", async () => {
+    const fake = makeFake();
+    fake.createJob.mockRejectedValueOnce(new JobFundUnconfirmedError("fund", FAKE_TX, 7n));
+    const logs: string[] = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((m) => logs.push(String(m)));
+    const program = new Command();
+    program.exitOverride();
+    registerPilotCommands(program, fake.open, fake.deps);
+    try {
+      await expect(program.parseAsync(["node", "cli", ...jobArgs(["--yes"])])).rejects.toThrow(
+        /could not confirm it in time/,
+      );
+    } finally {
+      spy.mockRestore();
+    }
+    expect(JSON.parse(logs.join("\n")).txHash).toBe(FAKE_TX);
+  });
+
+  test("seen-in-court records a filed live case with the live Court URL", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, {
+      mode: "live",
+      status: "filed",
+      patch: { klerosChain: "arbitrum-one", coreDisputeId: "287", localDisputeId: "1" },
+    });
+    const printed = JSON.parse(
+      await run(fake, ["pilot:case", "seen-in-court", row.caseId, "--by", "Martin", "--yes"]),
+    );
+    expect(printed.courtUrl).toBe("https://v2.kleros.builders/#/cases/287/overview");
+    expect(fake.cases.events(row.caseId)).toMatchObject([
+      { step: "seen_in_court", status: "ok", detail: "by Martin" },
+    ]);
+    expect(fake.cases.countSeenInCourt("live")).toBe(1);
+  });
+});
+
+describe("pilot:job: the default pre-flight wiring", () => {
+  test("the dry run runs the real pre-flight over the chain and lookup built from the context", async () => {
+    const fake = makeFake();
+    // Only the pre-flight is left at its default: the chain and the lookup are built from ctx.
+    const { preflight: _stubbed, ...deps } = fake.deps;
+    fake.deps = deps;
+    const names: Record<string, string> = { "11": "Buyer Wired LLC", "12": "Seller Wired LLC" };
+    const fetched: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        fetched.push(url);
+        const id = url.split("/").at(-1) as string;
+        return new Response(
+          JSON.stringify({
+            agentId: id,
+            legalBody: true,
+            standing: "active",
+            statement: { message: { legalName: names[id] } },
+          }),
+          { status: 200 },
+        );
+      }),
+    );
+    const owners: Record<string, Address> = { "11": ADDR.buyer, "12": ADDR.seller };
+    const pub = fake.ctx.publicClient as unknown as { readContract: ReturnType<typeof vi.fn> };
+    pub.readContract.mockImplementation(
+      async (p: { functionName: string; args: readonly unknown[] }) => {
+        if (p.functionName === "ownerOf") return owners[String(p.args[0])];
+        if (p.functionName === "balanceOf") return 5_250_000n;
+        throw new Error(`unexpected read ${p.functionName}`);
+      },
+    );
+    const printed = JSON.parse(await run(fake, jobArgs()));
+    expect(fetched).toEqual([
+      "https://api.example.com/legal-bodies/by-agent/11",
+      "https://api.example.com/legal-bodies/by-agent/12",
+    ]);
+    expect(printed.buyer.legalName).toBe("Buyer Wired LLC");
+    expect(printed.seller.legalName).toBe("Seller Wired LLC");
+    expect(printed.buyerBalanceAtomic).toBe("5250000");
+    expect(fake.createJob).not.toHaveBeenCalled();
+    expectNothingSent(fake);
   });
 });

@@ -83,6 +83,17 @@ const blankAsUnset = (v: unknown): unknown =>
 
 /** A uint256 agent id in canonical decimal: no sign, no leading zero, at most 78 digits. */
 const AGENT_ID_DECIMAL = /^(?:0|[1-9][0-9]{0,77})$/;
+const UINT256_MAX = (1n << 256n) - 1n;
+/** An optional agent id: canonical decimal, at most 2^256 - 1. */
+const agentIdSchema = z.preprocess(
+  blankAsUnset,
+  z
+    .string()
+    .regex(AGENT_ID_DECIMAL, "must be an agent id in decimal")
+    // Zod runs a refinement even after the regex fails, so BigInt sees only a decimal here.
+    .refine((v) => !AGENT_ID_DECIMAL.test(v) || BigInt(v) <= UINT256_MAX, "must fit in a uint256")
+    .optional(),
+);
 
 /** A URL with its trailing slashes removed, so a caller can append "/path" without doubling it. */
 const withoutTrailingSlash = (url: string): string => url.replace(/\/+$/, "");
@@ -547,14 +558,8 @@ const EnvSchema = z.object({
   PILOT_LOOKUP_BASE: z.preprocess(blankAsUnset, z.string().url().optional()),
   /** The pilot job's two test agents, as ERC-8004 agent ids in decimal. A command's
    *  --buyer-agent and --seller-agent take precedence. */
-  PILOT_BUYER_AGENT_ID: z.preprocess(
-    blankAsUnset,
-    z.string().regex(AGENT_ID_DECIMAL, "must be an agent id in decimal").optional(),
-  ),
-  PILOT_SELLER_AGENT_ID: z.preprocess(
-    blankAsUnset,
-    z.string().regex(AGENT_ID_DECIMAL, "must be an agent id in decimal").optional(),
-  ),
+  PILOT_BUYER_AGENT_ID: agentIdSchema,
+  PILOT_SELLER_AGENT_ID: agentIdSchema,
   /** The Testnet key (arbitrum-sepolia-testnet). A secret: masked by redact(). Both keys are
    *  trimmed here, before any check, so "k" and "k " are refused as equal. */
   KLEROS_API_KEY_TESTNET: z.preprocess(blankAsUnset, z.string().trim().optional()),

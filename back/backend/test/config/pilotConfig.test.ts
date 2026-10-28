@@ -505,4 +505,15 @@ describe("Pilot config: the two agent ids", () => {
   ])("%s=%s is refused by name: an agent id is a decimal", (name, value) => {
     expect(() => loadConfig({ ...BASE, ...PILOT_KEYS, [name]: value })).toThrow(new RegExp(name));
   });
+
+  test("an agent id is bounded to uint256: 2^256 - 1 is accepted, 2^256 refused by name", () => {
+    const max = ((1n << 256n) - 1n).toString();
+    expect(
+      loadConfig({ ...BASE, ...PILOT_KEYS, PILOT_BUYER_AGENT_ID: max }).pilot?.buyerAgentId,
+    ).toBe(max);
+    for (const name of ["PILOT_BUYER_AGENT_ID", "PILOT_SELLER_AGENT_ID"])
+      expect(() => loadConfig({ ...BASE, ...PILOT_KEYS, [name]: (1n << 256n).toString() })).toThrow(
+        new RegExp(`${name}.*uint256`),
+      );
+  });
 });

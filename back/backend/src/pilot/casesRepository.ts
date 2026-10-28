@@ -139,10 +139,28 @@ function toRecord(r: Row): PilotCaseRecord {
 
 /** The statuses that count against a mode's cap: every status from `filing` on, and the two
  *  in-doubt exits. `failed` is not among them: it is an error before any money moved. */
-const FILED_STATUSES_SQL =
-  "('filing','filed','ruled','settling','settled','filing_unknown','evidence_unknown')";
+export const PILOT_FILED_STATUSES: readonly PilotStatus[] = Object.freeze([
+  "filing",
+  "filed",
+  "ruled",
+  "settling",
+  "settled",
+  "filing_unknown",
+  "evidence_unknown",
+]);
 /** Filed or later: the dispute exists. `filing` and `filing_unknown` are before it is known to. */
-const FILED_OR_LATER_SQL = "('filed','ruled','settling','settled','evidence_unknown')";
+export const PILOT_FILED_OR_LATER_STATUSES: readonly PilotStatus[] = Object.freeze([
+  "filed",
+  "ruled",
+  "settling",
+  "settled",
+  "evidence_unknown",
+]);
+/** A status list as an SQL `IN` list. The statuses are the fixed words above, never input. */
+const sqlList = (statuses: readonly PilotStatus[]) =>
+  `(${statuses.map((s) => `'${s}'`).join(",")})`;
+const FILED_STATUSES_SQL = sqlList(PILOT_FILED_STATUSES);
+const FILED_OR_LATER_SQL = sqlList(PILOT_FILED_OR_LATER_STATUSES);
 
 export class SqlitePilotCaseRepository implements PilotCaseRepository {
   private readonly stmts;
