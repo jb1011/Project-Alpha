@@ -635,6 +635,11 @@ const FILED_TESTNET = {
   coreDisputeId: "186",
   localDisputeId: "4",
 } as const;
+const FILED_LIVE = {
+  klerosChain: "arbitrum-one",
+  coreDisputeId: "287",
+  localDisputeId: "1",
+} as const;
 const COURT_URL = "https://v2-testnet.kleros.builders/#/cases/186/overview";
 
 describe("pilot:case show and list", () => {
@@ -825,8 +830,12 @@ describe("pilot:case fail", () => {
   test("a filed rehearsal case needs no --force", async () => {
     const fake = makeFake();
     const row = insertCase(fake.cases, { status: "filed" });
-    await run(fake, ["pilot:case", "fail", row.caseId, "--reason", "x", "--yes"]);
+    const printed = JSON.parse(
+      await run(fake, ["pilot:case", "fail", row.caseId, "--reason", "x", "--yes"]),
+    );
     expect(fake.cases.find(row.caseId)?.status).toBe("failed");
+    expect(fake.cases.events(row.caseId).at(-1)?.detail).toBe("x");
+    expect(printed.note).not.toContain("forced");
   });
 
   test("a reason with a control character is refused before the context opens", async () => {
@@ -852,7 +861,8 @@ describe("pilot:case fail: the cap's statuses need --force to fail", () => {
       `a ${mode} case at %s is refused without --force, and the cap count is unchanged`,
       async (status) => {
         const fake = makeFake();
-        const row = insertCase(fake.cases, { mode, status, patch: FILED_TESTNET });
+        const patch = mode === "live" ? FILED_LIVE : FILED_TESTNET;
+        const row = insertCase(fake.cases, { mode, status, patch });
         const before = fake.cases.countFiled(mode);
         await expect(
           run(fake, ["pilot:case", "fail", row.caseId, "--reason", "x", "--yes"]),
@@ -861,8 +871,13 @@ describe("pilot:case fail: the cap's statuses need --force to fail", () => {
         expect(fake.cases.find(row.caseId)?.status).toBe(status);
         expect(fake.cases.events(row.caseId)).toEqual([]);
 
-        await run(fake, ["pilot:case", "fail", row.caseId, "--reason", "x", "--force", "--yes"]);
+        const printed = JSON.parse(
+          await run(fake, ["pilot:case", "fail", row.caseId, "--reason", "x", "--force", "--yes"]),
+        );
         expect(fake.cases.find(row.caseId)?.status).toBe("failed");
+        const forced = `forced: x (the case leaves the ${mode} cap count)`;
+        expect(fake.cases.events(row.caseId).at(-1)?.detail).toBe(forced);
+        expect(printed.note).toContain(forced);
       },
     );
 
@@ -881,8 +896,12 @@ describe("pilot:case fail: the cap's statuses need --force to fail", () => {
   test("a testnet case before filing needs no --force", async () => {
     const fake = makeFake();
     const row = insertCase(fake.cases, { mode: "testnet", status: "contested" });
-    await run(fake, ["pilot:case", "fail", row.caseId, "--reason", "x", "--yes"]);
+    const printed = JSON.parse(
+      await run(fake, ["pilot:case", "fail", row.caseId, "--reason", "x", "--yes"]),
+    );
     expect(fake.cases.find(row.caseId)?.status).toBe("failed");
+    expect(fake.cases.events(row.caseId).at(-1)?.detail).toBe("x");
+    expect(printed.note).not.toContain("forced");
   });
 });
 

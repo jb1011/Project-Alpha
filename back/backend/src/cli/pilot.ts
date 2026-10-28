@@ -796,7 +796,8 @@ function failCase(
   const row = findCase(ctx, caseId);
   if (row.status === "settled") refuse(`pilot case ${caseId} is settled, which is final`);
   if (row.status === "failed") refuse(`pilot case ${caseId} is failed already`);
-  if (FILED.has(row.status) && row.mode !== "rehearsal" && !force)
+  const guarded = FILED.has(row.status) && row.mode !== "rehearsal";
+  if (guarded && !force)
     refuse(
       `pilot case ${caseId} is at ${row.status} in ${row.mode} mode, so its dispute exists or may exist on Kleros (${klerosIdsOf(row)}); marking the row failed changes nothing there and takes the case out of the mode's cap count: pass --force to mark it failed anyway`,
     );
@@ -809,13 +810,15 @@ function failCase(
       reason,
       next: "nothing was changed: run the same command with --yes to mark the case failed",
     };
+  // A forced fail leaves a trace: the event says the guard was overridden and what it cost.
+  const detail = guarded ? `forced: ${reason} (the case leaves the ${row.mode} cap count)` : reason;
   const next = ctx.cases.transaction(() => {
     const moved = ctx.cases.advance(caseId, row.status, "failed", { error: reason });
     if (!moved) refuse(`pilot case ${caseId} moved from ${row.status} while this command ran`);
-    ctx.cases.recordEvent(caseId, "failed", "ok", null, reason);
+    ctx.cases.recordEvent(caseId, "failed", "ok", null, detail);
     return moved;
   });
-  return { case: next, note: PILOT_NOTE };
+  return { case: next, note: guarded ? `${detail}. ${PILOT_NOTE}` : PILOT_NOTE };
 }
 
 /** What the row knows of its Kleros dispute, for a refusal: each id that is set. */
