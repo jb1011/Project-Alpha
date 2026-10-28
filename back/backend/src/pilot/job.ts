@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
-import { type Hex, keccak256, parseEventLogs } from "viem";
-import { iIdentityRegistryAbi } from "../abis/generated";
+import { type Hex, decodeFunctionData, keccak256, parseEventLogs } from "viem";
+import { iErc8183JobAbi, iIdentityRegistryAbi } from "../abis/generated";
 import {
   ChainTxRevertedError,
   ChainTxUnconfirmedError,
@@ -58,9 +58,9 @@ const FUNDED = 1;
 const SUBMITTED = 2;
 
 /**
- * The job contract's `Submitted` event, as the mock contract and the backend's earlier plans
- * declare it: the backend's interface ABI carries no events. A log of another shape is simply not
- * found, and the case refuses rather than guessing.
+ * The job contract's `Submitted` event, as the mock contract declares it: the backend's interface
+ * ABI carries no events, and a deployed contract may emit none. Adoption never depends on it: a
+ * log of this shape, when present, is only a second confirmation of the submit call itself.
  */
 const submittedEventAbi = [
   {
@@ -93,7 +93,8 @@ export async function preflightPilotJob(
 async function checks(
   d: PilotJobDeps,
   input: Pick<CreatePilotJobInput, "budgetAtomic" | "expirySeconds" | "mode" | "deliverable">,
-  o: { balance: boolean },
+  /** `resumingJob`: the expiry is the time this job has left, not an option the operator gave. */
+  o: { balance: boolean; resumingJob?: bigint },
 ): Promise<
   | { ok: true; buyerBalance: bigint | null; buyerName: string; sellerName: string }
   | { ok: false; problem: string }
@@ -105,7 +106,10 @@ async function checks(
     return refuse(
       `the budget ${input.budgetAtomic} is above the maximum of ${d.maxBudgetAtomic} (atomic USDC)`,
     );
-  const expiryProblem = expiryProblemOf(input.mode, input.expirySeconds);
+  const expiryProblem =
+    o.resumingJob === undefined
+      ? expiryProblemOf(input.mode, input.expirySeconds)
+      : timeLeftProblemOf(input.mode, input.expirySeconds, o.resumingJob);
   if (expiryProblem) return refuse(expiryProblem);
   if (!/^[A-Za-z0-9]{1,16}$/.test(input.deliverable.extension))
     return refuse(
@@ -174,6 +178,18 @@ function expiryProblemOf(mode: PilotMode, seconds: number): string | undefined {
   return seconds >= MIN_EXPIRY_SECONDS && seconds <= MAX_EXPIRY_SECONDS
     ? undefined
     : `the expiry must be between ${MIN_EXPIRY_SECONDS} and ${MAX_EXPIRY_SECONDS} seconds in ${mode} mode (got ${seconds})`;
+}
+
+/** On a resume: a job with less time left than the mode's minimum is not continued. */
+function timeLeftProblemOf(
+  mode: PilotMode,
+  secondsLeft: number,
+  jobId: bigint,
+): string | undefined {
+  const minimum = mode === "rehearsal" ? MIN_REHEARSAL_EXPIRY_SECONDS : MIN_EXPIRY_SECONDS;
+  if (Number.isSafeInteger(secondsLeft) && secondsLeft < minimum)
+    return `job ${jobId} has ${Math.max(secondsLeft, 0)} seconds left, under the minimum of ${minimum} for ${mode} mode; it waits for expiry and a refund`;
+  return expiryProblemOf(mode, secondsLeft);
 }
 
 /** Pre-flight, then create, budget and fund, submit; resumable from created and funded. */
@@ -277,7 +293,7 @@ async function resume(
         mode: row.mode,
         deliverable: input.deliverable,
       },
-      { balance: onChain === OPEN },
+      { balance: onChain === OPEN, resumingJob: BigInt(row.jobId as string) },
     );
     if (!pre.ok) throw new Error(`refusing to resume pilot case ${row.caseId}: ${pre.problem}`);
   }
@@ -285,19 +301,25 @@ async function resume(
 }
 
 /**
- * The job's status on chain, once the job is shown to be this case's: its client is the buyer
- * and its evaluator the referee, and once funded its budget is the row's. A job id taken from a
- * simulate can name another job, and adopting that job would make the row lie.
+ * The job's status on chain, once the job is shown to be this case's: its client is the buyer,
+ * its provider the seller, its evaluator the referee, its expiry and description the row's, and
+ * once funded its budget the row's. A job id taken from a simulate can name another job (two
+ * creates at once with the same keys), and adopting that job would make the row lie.
  */
 async function chainStatusOf(d: PilotJobDeps, row: PilotCaseRecord): Promise<number> {
   const jobId = BigInt(row.jobId as string);
-  const s = await d.chain.job.escrowState(jobId);
+  const s = await d.chain.job.getJob(jobId);
   const refuse = (what: string) =>
     new Error(`refusing to continue pilot case ${row.caseId}: job ${jobId} ${what}`);
   if (!sameAddress(s.client, row.buyerAddress))
     throw refuse(`has client ${s.client}, not the buyer ${row.buyerAddress}`);
+  if (!sameAddress(s.provider, row.sellerAddress))
+    throw refuse(`has provider ${s.provider}, not the seller ${row.sellerAddress}`);
   if (!sameAddress(s.evaluator, row.refereeAddress))
     throw refuse(`has evaluator ${s.evaluator}, not the referee ${row.refereeAddress}`);
+  if (s.expiredAt !== BigInt(row.expiredAt))
+    throw refuse(`expires at ${s.expiredAt}, not at the case's ${row.expiredAt}`);
+  if (s.description !== row.description) throw refuse("has another description than the case's");
   if ((s.status === FUNDED || s.status === SUBMITTED) && s.budget.toString() !== row.budgetAtomic)
     throw refuse(`holds a budget of ${s.budget}, not the case's ${row.budgetAtomic}`);
   return s.status;
@@ -370,9 +392,12 @@ const SENT_STATUSES: ReadonlySet<string> = new Set(["mined", "unconfirmed"]);
 
 /**
  * The row says funded and the chain says Submitted: a submit this process sent landed after the
- * run stopped (unconfirmed in time, or mined and the block read after it failed). The row is
- * moved only when the last submit event's transaction mined a `Submitted` log for this job whose
- * deliverable is the hash of the bytes given now; the hash and block time come from its receipt.
+ * run stopped (unconfirmed in time, or mined and the block read after it failed). The case's sent
+ * submits are tried newest first, and the first one proven to be this case's submit is adopted:
+ * a transaction to the job contract from the seller whose calldata is `submit` of this job with
+ * the hash of the bytes given now, with a successful receipt. A `Submitted` log, when the
+ * contract emits one, must agree; its absence is not a refusal. The hash and block time come
+ * from the adopted transaction's receipt.
  */
 async function adoptSubmit(
   d: PilotJobDeps,
@@ -386,41 +411,85 @@ async function adoptSubmit(
   const sent = cases
     .events(row.caseId)
     .filter((e) => e.step === "submit" && e.ref !== null && SENT_STATUSES.has(e.status))
-    .at(-1)?.ref as Hex | undefined;
-  if (!sent)
+    .map((e) => e.ref as Hex);
+  const newestFirst = [...new Set(sent.reverse())];
+  if (newestFirst.length === 0)
     throw refuse(`job ${jobId} is Submitted on chain but this case recorded no submit transaction`);
-  let receipt: Awaited<ReturnType<typeof chain.publicClient.getTransactionReceipt>>;
-  try {
-    receipt = await chain.publicClient.getTransactionReceipt({ hash: sent });
-  } catch {
-    throw refuse(`the receipt of ${sent} could not be read yet; resume again once it is mined`);
-  }
-  if (receipt.status !== "success") throw refuse(`${sent} reverted on chain`);
-  const log = parseEventLogs({ abi: submittedEventAbi, logs: receipt.logs }).find(
-    (l) => sameAddress(l.address, chain.jobContract) && l.args.jobId === jobId,
-  );
-  if (!log) throw refuse(`${sent} carries no Submitted log for job ${jobId}`);
   const { bytes, extension } = input.deliverable;
   const deliverableHash = keccak256(bytes);
-  if (log.args.deliverable.toLowerCase() !== deliverableHash.toLowerCase())
-    throw refuse(
-      `the chain holds deliverable hash ${log.args.deliverable}, and the deliverable given hashes to ${deliverableHash}`,
+  const misses: string[] = [];
+  for (const hash of newestFirst) {
+    const proof = await submitProofOf(d, row, jobId, hash, deliverableHash);
+    if (typeof proof === "string") {
+      misses.push(`${hash} ${proof}`);
+      continue;
+    }
+    const block = await chain.publicClient.getBlock({ blockNumber: proof.blockNumber });
+    const stored = d.docStore.putBytes(
+      `pilot-${row.caseId}-deliverable.${extension}`,
+      Buffer.from(bytes),
     );
-  const block = await chain.publicClient.getBlock({ blockNumber: receipt.blockNumber });
-  const stored = d.docStore.putBytes(
-    `pilot-${row.caseId}-deliverable.${extension}`,
-    Buffer.from(bytes),
-  );
-  return cases.transaction(() => {
-    cases.recordEvent(row.caseId, "submit", "observed_on_chain", sent, null);
-    return moved(d, row, "submitted", {
-      deliverablePath: stored.path,
-      deliverableHash,
-      deliverableExtension: extension,
-      submitTxHash: sent,
-      submittedBlockTime: Number(block.timestamp),
+    return cases.transaction(() => {
+      cases.recordEvent(row.caseId, "submit", "observed_on_chain", hash, null);
+      return moved(d, row, "submitted", {
+        deliverablePath: stored.path,
+        deliverableHash,
+        deliverableExtension: extension,
+        submitTxHash: hash,
+        submittedBlockTime: Number(block.timestamp),
+      });
     });
-  });
+  }
+  throw refuse(misses.join("; "));
+}
+
+/**
+ * Whether one sent transaction is this case's submit: its receipt's block number when it is, or
+ * what did not match (recipient, sender, call, job id, deliverable hash, receipt or log). Hashes
+ * and addresses only; never the calldata or the deliverable's bytes.
+ */
+async function submitProofOf(
+  d: PilotJobDeps,
+  row: PilotCaseRecord,
+  jobId: bigint,
+  hash: Hex,
+  deliverableHash: Hex,
+): Promise<{ blockNumber: bigint } | string> {
+  const { chain } = d;
+  let tx: Awaited<ReturnType<typeof chain.publicClient.getTransaction>>;
+  try {
+    tx = await chain.publicClient.getTransaction({ hash });
+  } catch {
+    return "could not be read from the node yet; resume again once it is mined";
+  }
+  if (tx.to === null || tx.to === undefined || !sameAddress(tx.to, chain.jobContract))
+    return `has recipient ${tx.to ?? "none"}, not the job contract ${chain.jobContract}`;
+  if (!sameAddress(tx.from, row.sellerAddress))
+    return `has sender ${tx.from}, not the seller ${row.sellerAddress}`;
+  let call: ReturnType<typeof decodeFunctionData<typeof iErc8183JobAbi>>;
+  try {
+    call = decodeFunctionData({ abi: iErc8183JobAbi, data: tx.input });
+  } catch {
+    return "is not a call of the job contract's submit";
+  }
+  if (call.functionName !== "submit") return `calls ${call.functionName}, not submit`;
+  const [calledJob, calledDeliverable] = call.args;
+  if (calledJob !== jobId) return `submits job ${calledJob}, not job ${jobId}`;
+  if (calledDeliverable.toLowerCase() !== deliverableHash.toLowerCase())
+    return `submits deliverable hash ${calledDeliverable}, and the deliverable given hashes to ${deliverableHash}`;
+  let receipt: Awaited<ReturnType<typeof chain.publicClient.getTransactionReceipt>>;
+  try {
+    receipt = await chain.publicClient.getTransactionReceipt({ hash });
+  } catch {
+    return "has a receipt that could not be read yet; resume again once it is mined";
+  }
+  if (receipt.status !== "success") return "has a receipt that says it reverted on chain";
+  const logs = parseEventLogs({ abi: submittedEventAbi, logs: receipt.logs }).filter(
+    (l) => sameAddress(l.address, chain.jobContract) && l.args.jobId === jobId,
+  );
+  if (logs.some((l) => l.args.deliverable.toLowerCase() !== deliverableHash.toLowerCase()))
+    return `has a Submitted log for job ${jobId} with another deliverable hash than ${deliverableHash}`;
+  return { blockNumber: receipt.blockNumber };
 }
 
 async function submitDeliverable(
@@ -479,7 +548,7 @@ async function recorded(
   try {
     return await send();
   } catch (e) {
-    const detail = publicErrorMessage(e);
+    const detail = withoutEmDash(publicErrorMessage(e));
     if (e instanceof ChainTxRevertedError || e instanceof JobFundRevertedError)
       d.cases.recordEvent(caseId, stepOf(e, step), "reverted", e.txHash, detail);
     else if (e instanceof ChainTxUnconfirmedError || e instanceof JobFundUnconfirmedError)
@@ -488,6 +557,12 @@ async function recorded(
     throw e;
   }
 }
+
+/**
+ * The text of an existing error class, made fit to persist or print: each em dash it carries
+ * becomes a colon, and nothing else changes.
+ */
+export const withoutEmDash = (text: string): string => text.replace(/\s*\u2014\s*/g, ": ");
 
 /** The escrow funding names its own sub-step (`approve` or `fund`); the others are the step. */
 const stepOf = (e: Error, step: string): string =>

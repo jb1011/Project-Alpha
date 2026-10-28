@@ -180,6 +180,17 @@ export interface UsdcJobNodeOptions {
    * is mined as `other` and changes nothing, as before.
    */
   runSubmit?: boolean;
+  /**
+   * With {runSubmit}, mine a successful `submit` without its `Submitted` log: a deployment whose
+   * contract emits no such event. Off by default, where the log is written as before.
+   */
+  omitSubmittedLog?: boolean;
+  /**
+   * Answer `eth_getTransactionByHash` with the transaction the node accepted under that hash
+   * (pending, with no block, while its receipt is withheld). Off by default, where the node
+   * answers null to every hash, as before.
+   */
+  answerTransactions?: boolean;
 }
 
 /** The `Submitted` event as the mock job contract emits it. */
@@ -213,6 +224,8 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
   const logsOf = new Map<string, { jobId: bigint; deliverable: Hex }>();
   /** The `Submitted` log of the transaction being executed, picked up when it is accepted. */
   let pendingLog: { jobId: bigint; deliverable: Hex } | undefined;
+  /** The raw signed transaction accepted under each hash, for {answerTransactions}. */
+  const rawOf = new Map<string, Hex>();
   const actions: NodeAction[] = [];
   const sends: { hash: Hex; from: Address; nonce: number; to: Address }[] = [];
   let jobCounter = 0n;
@@ -373,7 +386,7 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
       if (!j || j.status !== 1 || from.toLowerCase() !== j.provider.toLowerCase())
         return { call: "submit", from, status: "reverted" };
       j.status = 2; // Submitted
-      pendingLog = { jobId, deliverable };
+      if (!opts.omitSubmittedLog) pendingLog = { jobId, deliverable };
       return { call: "submit", from, status: "success" };
     }
     // ── The two refunds, with the contract's own rules (see `test/mocks/MockERC8183Job.sol`) ──
@@ -456,6 +469,7 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
         const action = execute(from, tx.to as Address, tx.data);
         actions.push(action);
         const hash = keccak256(raw);
+        rawOf.set(hash, raw);
         if (pendingLog) logsOf.set(hash, pendingLog);
         pendingLog = undefined;
         if (opts.withholdReceipt === action.call && !withheld) {
@@ -468,8 +482,12 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
       // A node knows nothing about a hash it never accepted, and says so by answering null. The
       // default used to be "success", which is a way to write a green test about a transaction
       // that never existed.
-      case "eth_getTransactionByHash":
-        return null;
+      case "eth_getTransactionByHash": {
+        const hash = (params as Hex[])[0]!;
+        const raw = opts.answerTransactions ? rawOf.get(hash) : undefined;
+        if (!raw) return null;
+        return await rpcTransactionOf(hash, raw, receipts.has(hash));
+      }
       case "eth_getTransactionReceipt": {
         const hash = (params as Hex[])[0]!;
         const status = receipts.get(hash);
@@ -577,6 +595,38 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
 }
 
 export type UsdcJobNode = ReturnType<typeof usdcJobNode>;
+
+const hex = (v: bigint | number | undefined): Hex => `0x${BigInt(v ?? 0).toString(16)}`;
+
+/** A transaction as a node returns it: in block 1 once its receipt is out, pending before. */
+async function rpcTransactionOf(hash: Hex, raw: Hex, mined: boolean) {
+  const tx = parseTransaction(raw);
+  const from = await recoverTransactionAddress({
+    serializedTransaction: raw as `0x02${string}`,
+  });
+  return {
+    hash,
+    from,
+    to: tx.to ?? null,
+    input: tx.data ?? "0x",
+    nonce: hex(tx.nonce),
+    value: hex(tx.value),
+    gas: hex(tx.gas),
+    maxFeePerGas: hex(tx.maxFeePerGas),
+    maxPriorityFeePerGas: hex(tx.maxPriorityFeePerGas),
+    gasPrice: hex(tx.maxFeePerGas),
+    chainId: hex(tx.chainId),
+    type: "0x2",
+    accessList: [],
+    r: tx.r,
+    s: tx.s,
+    yParity: hex(tx.yParity),
+    v: hex(tx.yParity),
+    blockNumber: mined ? "0x1" : null,
+    blockHash: mined ? `0x${"11".repeat(32)}` : null,
+    transactionIndex: mined ? "0x0" : null,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // THE SAGA, WIRED THE WAY THE COMPOSITION ROOT WIRES IT

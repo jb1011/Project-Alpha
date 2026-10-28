@@ -82,6 +82,7 @@ function setup(
     stealAllowanceOnFund?: boolean;
     withholdReceipt?: "fund" | "submit";
     runSubmit?: boolean;
+    omitSubmittedLog?: boolean;
   } = {},
 ) {
   /** The clock in seconds, shared by the node and the job; a test moves it with `setClock`. */
@@ -92,6 +93,9 @@ function setup(
     budget: BUDGET,
     now: () => clock,
     runSubmit: o.runSubmit,
+    omitSubmittedLog: o.omitSubmittedLog,
+    // A submit is adopted from its transaction, so the node answers what it accepted.
+    answerTransactions: true,
     identityRegistry: REGISTRY,
     ownerOf: (id) => (o.owners ?? { [BUYER_AGENT]: BUYER, [SELLER_AGENT]: SELLER })[id.toString()],
     stealAllowanceOnFund: o.stealAllowanceOnFund,
@@ -390,6 +394,19 @@ test("a reverted submit leaves the row at funded with the hash in an event; resu
   expect(done.submitTxHash).toBe(node.sendsFrom(SELLER).at(-1)?.hash);
 });
 
+test("an error's em dash is persisted in the event detail as a colon", async () => {
+  const { cases, deps, chain } = setup();
+  const failedSubmit = `0x${"55".repeat(32)}` as Hex;
+  const error = new ChainTxRevertedError("submit", failedSubmit);
+  expect(error.message).toContain("\u2014");
+  vi.spyOn(chain.job, "submit").mockRejectedValueOnce(error);
+  await expect(createPilotJob(deps, input())).rejects.toBe(error);
+  const [row] = cases.list();
+  const detail = cases.events(row!.caseId).at(-1)?.detail ?? "";
+  expect(detail).not.toContain("\u2014");
+  expect(detail).toMatch(/reverted on chain \(.*\): the transaction was mined/);
+});
+
 test("an unconfirmed submit is recorded as unconfirmed with its hash, and the row stays at funded", async () => {
   const { cases, deps, chain } = setup();
   const sent = `0x${"52".repeat(32)}` as Hex;
@@ -518,6 +535,67 @@ test("adopting a submit refuses when the deliverable given does not hash to the 
   expect(cases.find(row!.caseId)?.status).toBe("funded");
 });
 
+test("a submit is adopted from its call and receipt when the contract emits no Submitted log", async () => {
+  const { node, cases, deps, chain } = setup({
+    runSubmit: true,
+    omitSubmittedLog: true,
+    withholdReceipt: "submit",
+  });
+  await expect(createPilotJob(deps, input())).rejects.toBeInstanceOf(ChainTxUnconfirmedError);
+  node.releaseWithheld();
+  const [row] = cases.list();
+  const submitHash = node.hashesOf("submit")[0]!;
+  expect((await chain.publicClient.getTransactionReceipt({ hash: submitHash })).logs).toEqual([]);
+
+  const sends = node.sends.length;
+  const done = await createPilotJob(deps, input(), row!.caseId);
+  expect(done.status).toBe("submitted");
+  expect(done.submitTxHash).toBe(submitHash);
+  expect(done.submittedBlockTime).toBe(NOW);
+  expect(done.deliverableHash).toBe(keccak256(DELIVERABLE));
+  expect(node.sends).toHaveLength(sends);
+});
+
+test("of a submit that landed and a later one that reverted, the resume adopts the one that landed", async () => {
+  const { node, cases, deps, chain } = setup({ runSubmit: true, withholdReceipt: "submit" });
+  await expect(createPilotJob(deps, input())).rejects.toBeInstanceOf(ChainTxUnconfirmedError);
+  const [row] = cases.list();
+  const landed = node.hashesOf("submit")[0]!;
+  // A second submit, sent while the first was unconfirmed, reverts on chain: the job is already
+  // Submitted. The case recorded it as sent, so it is the newest submit the resume reads.
+  const second = await chain.job
+    .submit(1n, keccak256(DELIVERABLE), chain.wallets.seller)
+    .catch((e) => e);
+  expect(second).toBeInstanceOf(ChainTxRevertedError);
+  cases.recordEvent(row!.caseId, "submit", "unconfirmed", second.txHash, null);
+  node.releaseWithheld();
+
+  const done = await createPilotJob(deps, input(), row!.caseId);
+  expect(done.status).toBe("submitted");
+  expect(done.submitTxHash).toBe(landed);
+  expect(node.hashesOf("submit")).toEqual([landed, second.txHash]);
+  expect(cases.events(row!.caseId).at(-1)).toMatchObject({
+    step: "submit",
+    status: "observed_on_chain",
+    ref: landed,
+  });
+});
+
+test("adopting a submit refuses a recorded transaction that the seller did not send, naming the sender", async () => {
+  const { node, cases, deps } = setup({ runSubmit: true, withholdReceipt: "submit" });
+  await expect(createPilotJob(deps, input())).rejects.toBeInstanceOf(ChainTxUnconfirmedError);
+  const [row] = cases.list();
+  // The withheld submit is never released; the newest recorded "submit" is the buyer's fund.
+  const fundHash = node.hashesOf("fund")[0]!;
+  cases.recordEvent(row!.caseId, "submit", "mined", fundHash, null);
+  const err = await createPilotJob(deps, input(), row!.caseId).catch((e) => e);
+  expect(err.message).toMatch(
+    new RegExp(`${fundHash} has sender ${BUYER}, not the seller ${SELLER}`),
+  );
+  expect(err.message).toMatch(/has a receipt that could not be read yet/);
+  expect(cases.find(row!.caseId)?.status).toBe("funded");
+});
+
 // ── The pre-flight on resume ────────────────────────────────────────────────────────────────────
 
 /** A row at created whose fund reverted, so the chain reads Open. */
@@ -564,6 +642,16 @@ test("a resume whose chain reads Open checks the balance and the time the job ha
   expect((await createPilotJob(deps, input(), row.caseId)).status).toBe("submitted");
 });
 
+test("a resume refuses a job with less time left than the minimum in words about the time left", async () => {
+  const { node, deps, setClock, row } = await createdAfterRevertedFund();
+  const sent = node.sends.length;
+  setClock(row.expiredAt - 86_399);
+  await expect(createPilotJob(deps, input(), row.caseId)).rejects.toThrow(
+    `refusing to resume pilot case ${row.caseId}: job 1 has 86399 seconds left, under the minimum of 86400 for testnet mode; it waits for expiry and a refund`,
+  );
+  expect(node.sends).toHaveLength(sent);
+});
+
 test("a resume whose chain reads Funded skips only the balance check", async () => {
   const { deps, chain, answers, row } = await fundedAfterRevertedSubmit();
   answers[BUYER_AGENT] = noBody;
@@ -585,14 +673,35 @@ test.each<
     (j) => {
       j.client = STRANGER;
     },
-    /client/,
+    /has client/,
   ],
   [
     "another evaluator",
     (j) => {
       j.evaluator = STRANGER;
     },
-    /evaluator/,
+    /has evaluator/,
+  ],
+  [
+    "another provider",
+    (j) => {
+      j.provider = STRANGER;
+    },
+    /has provider 0x0{38}aa, not the seller/i,
+  ],
+  [
+    "another expiry",
+    (j) => {
+      j.expiredAt += 1n;
+    },
+    /expires at \d+, not at the case's \d+/,
+  ],
+  [
+    "another description",
+    (j) => {
+      j.description = "another run's job";
+    },
+    /has another description than the case's/,
   ],
 ])("the resume refuses a job with %s, and sends nothing", async (_n, change, problem) => {
   const { node, deps, row } = await createdAfterRevertedFund();
@@ -606,7 +715,7 @@ test("the resume refuses a Funded job whose budget is not the case's", async () 
   const { node, deps, row } = await fundedAfterRevertedSubmit();
   node.chainJob(1n)!.budget = BUDGET + 1n;
   const sent = node.sends.length;
-  await expect(createPilotJob(deps, input(), row.caseId)).rejects.toThrow(/budget/);
+  await expect(createPilotJob(deps, input(), row.caseId)).rejects.toThrow(/holds a budget of/);
   expect(node.sends).toHaveLength(sent);
 });
 
