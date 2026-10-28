@@ -81,6 +81,9 @@ function isGasSeedAmount(value: string): boolean {
 const blankAsUnset = (v: unknown): unknown =>
   typeof v === "string" && v.trim() === "" ? undefined : v;
 
+/** A uint256 agent id in canonical decimal: no sign, no leading zero, at most 78 digits. */
+const AGENT_ID_DECIMAL = /^(?:0|[1-9][0-9]{0,77})$/;
+
 /** A URL with its trailing slashes removed, so a caller can append "/path" without doubling it. */
 const withoutTrailingSlash = (url: string): string => url.replace(/\/+$/, "");
 
@@ -542,6 +545,16 @@ const EnvSchema = z.object({
   PILOT_LIVE_CASES_CAP: z.preprocess(blankAsUnset, z.coerce.number().int().positive().default(5)),
   /** Where the two lookups are read. Unset: PUBLIC_API_URL, else METADATA_BASE_URL. */
   PILOT_LOOKUP_BASE: z.preprocess(blankAsUnset, z.string().url().optional()),
+  /** The pilot job's two test agents, as ERC-8004 agent ids in decimal. A command's
+   *  --buyer-agent and --seller-agent take precedence. */
+  PILOT_BUYER_AGENT_ID: z.preprocess(
+    blankAsUnset,
+    z.string().regex(AGENT_ID_DECIMAL, "must be an agent id in decimal").optional(),
+  ),
+  PILOT_SELLER_AGENT_ID: z.preprocess(
+    blankAsUnset,
+    z.string().regex(AGENT_ID_DECIMAL, "must be an agent id in decimal").optional(),
+  ),
   /** The Testnet key (arbitrum-sepolia-testnet). A secret: masked by redact(). Both keys are
    *  trimmed here, before any check, so "k" and "k " are refused as equal. */
   KLEROS_API_KEY_TESTNET: z.preprocess(blankAsUnset, z.string().trim().optional()),
@@ -631,6 +644,10 @@ export interface PilotConfig {
   liveCasesCap: number;
   /** PILOT_LOOKUP_BASE, default publicApiUrl, else metadataBaseUrl; no trailing slash. */
   lookupBase: string;
+  /** PILOT_BUYER_AGENT_ID: the buyer test agent's id, in decimal; unset when not given. */
+  buyerAgentId?: string;
+  /** PILOT_SELLER_AGENT_ID: the seller test agent's id, in decimal; unset when not given. */
+  sellerAgentId?: string;
 }
 
 /** The Kleros service settings. Present when at least one of the two keys is set. */
@@ -1166,6 +1183,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
             lookupBase: withoutTrailingSlash(
               e.PILOT_LOOKUP_BASE ?? e.PUBLIC_API_URL ?? e.METADATA_BASE_URL,
             ),
+            buyerAgentId: e.PILOT_BUYER_AGENT_ID,
+            sellerAgentId: e.PILOT_SELLER_AGENT_ID,
           }
         : undefined,
     kleros:

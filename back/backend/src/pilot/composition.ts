@@ -78,7 +78,7 @@ export interface KlerosStage {
 }
 
 /** The script a rehearsal runs when none is named. */
-const DEFAULT_SCRIPT: FakeScript = "pay";
+export const DEFAULT_SCRIPT: FakeScript = "pay";
 
 export function buildKlerosService(
   cfg: Config,

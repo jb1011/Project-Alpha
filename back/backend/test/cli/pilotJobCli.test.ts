@@ -1,0 +1,823 @@
+/**
+ * The pilot's case commands (`pilot:job`, `pilot:contest`, `pilot:case`) over a fake PilotContext
+ * whose case table is a real SQLite repository in memory: no chain, no network.
+ *
+ * The pre-flight and the job creation are stubbed through the commands' dependencies, so a test
+ * sees exactly what the command would have run. The wallets sit on a transport that refuses
+ * every request, so any request it records is a call the command should not have made.
+ */
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import Database from "better-sqlite3";
+import { Command } from "commander";
+import {
+  type Address,
+  type Hex,
+  type PublicClient,
+  type WalletClient,
+  createWalletClient,
+  custom,
+  keccak256,
+} from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { type MockInstance, describe, expect, test, vi } from "vitest";
+import { anvilChain } from "../../src/chains";
+import { type PilotCommandDeps, registerPilotCommands } from "../../src/cli/pilot";
+import type { Config } from "../../src/config/env";
+import { ChainTxRevertedError } from "../../src/errors";
+import { migrate } from "../../src/persistence/db";
+import { FileDocumentStore } from "../../src/persistence/documentStore";
+import { SqlitePilotCaseRepository, newCaseId } from "../../src/pilot/casesRepository";
+import type { PilotContext } from "../../src/pilot/context";
+import type { CreatePilotJobInput } from "../../src/pilot/job";
+import type { PilotCaseRecord, PilotMode, PilotStatus } from "../../src/pilot/types";
+
+// Anvil's well-known throwaway keys (accounts 1, 2, 3): never real.
+const KEYS = {
+  buyer: "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+  seller: "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
+  referee: "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6",
+} as const satisfies Record<string, Hex>;
+const ADDR = {
+  buyer: privateKeyToAccount(KEYS.buyer).address,
+  seller: privateKeyToAccount(KEYS.seller).address,
+  referee: privateKeyToAccount(KEYS.referee).address,
+};
+const JOB_CONTRACT: Address = "0x0000000000000000000000000000000000000b0b";
+/** 2026-10-28T00:00:00Z, in Unix seconds. */
+const NOW = 1_793_145_600;
+const FAKE_TX: Hex = `0x${"ab".repeat(32)}`;
+
+interface Fake {
+  ctx: PilotContext;
+  cases: SqlitePilotCaseRepository;
+  transportCalls: string[];
+  writes: MockInstance[];
+  preflight: ReturnType<typeof vi.fn>;
+  createJob: ReturnType<typeof vi.fn>;
+  deps: Partial<PilotCommandDeps>;
+  open: () => PilotContext;
+  opened: () => number;
+  closed: () => number;
+}
+
+function makeFake(
+  o: {
+    mode?: PilotMode;
+    agentIds?: { buyer?: string; seller?: string };
+    preflight?: unknown;
+  } = {},
+): Fake {
+  const transportCalls: string[] = [];
+  const transport = custom({
+    request: async ({ method }: { method: string }) => {
+      transportCalls.push(method);
+      throw new Error(`no network in this test: ${method}`);
+    },
+  });
+  const wallet = (key: Hex): WalletClient =>
+    createWalletClient({ account: privateKeyToAccount(key), chain: anvilChain, transport });
+  const wallets = {
+    buyer: wallet(KEYS.buyer),
+    seller: wallet(KEYS.seller),
+    referee: wallet(KEYS.referee),
+  };
+  const writes = Object.values(wallets).map((w) => vi.spyOn(w, "writeContract"));
+  const db = new Database(":memory:");
+  migrate(db);
+  const cases = new SqlitePilotCaseRepository(db);
+  const cfg = {
+    chainId: anvilChain.id,
+    jobContract: JOB_CONTRACT,
+    usdc: "0x3600000000000000000000000000000000000000",
+    identityRegistry: "0x8004A818BFB912233c491871b3d84c89A494BD9e",
+    arcExplorerUrl: "https://explorer.example.com",
+    maxJobBudget: 10_000_000n,
+    pilot: {
+      buyerPrivateKey: KEYS.buyer,
+      sellerPrivateKey: KEYS.seller,
+      refereePrivateKey: KEYS.referee,
+      mode: o.mode ?? "rehearsal",
+      testnetCasesCap: 10,
+      liveCasesCap: 5,
+      lookupBase: "https://api.example.com",
+      buyerAgentId: o.agentIds?.buyer,
+      sellerAgentId: o.agentIds?.seller,
+    },
+  } as unknown as Config;
+  const pub = { readContract: vi.fn(), getTransactionReceipt: vi.fn() };
+  let closes = 0;
+  const ctx = {
+    cfg,
+    db,
+    cases,
+    docStore: new FileDocumentStore(mkdtempSync(join(tmpdir(), "pilot-job-cli-docs-"))),
+    publicClient: pub as unknown as PublicClient,
+    sendClient: pub as unknown as PublicClient,
+    wallets,
+    addresses: ADDR,
+    close: () => {
+      closes++;
+    },
+  } as unknown as PilotContext;
+  let opens = 0;
+  const preflight = vi.fn(
+    async () =>
+      o.preflight ?? {
+        ok: true,
+        buyerBalance: 5_250_000n,
+        buyerName: "Buyer Test Agent LLC",
+        sellerName: "Seller Test Agent LLC",
+      },
+  );
+  const createJob = vi.fn(async (_d: unknown, input: CreatePilotJobInput) =>
+    insertCase(cases, { mode: input.mode, status: "submitted" }),
+  );
+  return {
+    ctx,
+    cases,
+    transportCalls,
+    writes,
+    preflight,
+    createJob,
+    deps: {
+      readConfig: () => cfg,
+      preflight: preflight as unknown as PilotCommandDeps["preflight"],
+      createJob: createJob as unknown as PilotCommandDeps["createJob"],
+      now: () => NOW,
+    },
+    open: () => {
+      opens++;
+      return ctx;
+    },
+    opened: () => opens,
+    closed: () => closes,
+  };
+}
+
+/** A case row at `status`, with whatever columns the test names. */
+function insertCase(
+  cases: SqlitePilotCaseRepository,
+  o: { mode?: PilotMode; status?: PilotStatus; patch?: Partial<PilotCaseRecord> } = {},
+): PilotCaseRecord {
+  const caseId = newCaseId();
+  cases.insert({
+    caseId,
+    label: "test case 1",
+    mode: o.mode ?? "rehearsal",
+    chainId: anvilChain.id,
+    jobContract: JOB_CONTRACT,
+    buyerAddress: ADDR.buyer,
+    buyerAgentId: "11",
+    sellerAddress: ADDR.seller,
+    sellerAgentId: "12",
+    refereeAddress: ADDR.referee,
+    budgetAtomic: "2000000",
+    description: "a test job",
+    expiredAt: NOW + 7 * 86_400,
+    deliverablePath: null,
+    deliverableHash: null,
+    deliverableExtension: null,
+  });
+  const status = o.status ?? "created";
+  if (status === "created") return o.patch ? cases.patch(caseId, o.patch) : cases.find(caseId)!;
+  return cases.advance(caseId, "created", status, o.patch) as PilotCaseRecord;
+}
+
+/** Runs one command line; returns what it printed. Throws what the command throws. */
+async function run(fake: Fake, argv: string[]): Promise<string> {
+  const program = new Command();
+  program.exitOverride();
+  program.configureOutput({ writeOut: () => {}, writeErr: () => {} });
+  registerPilotCommands(program, fake.open, fake.deps);
+  const logs: string[] = [];
+  const spy = vi.spyOn(console, "log").mockImplementation((m) => logs.push(String(m)));
+  try {
+    await program.parseAsync(["node", "cli", ...argv]);
+  } finally {
+    spy.mockRestore();
+  }
+  return logs.join("\n");
+}
+
+function expectNothingSent(fake: Fake): void {
+  for (const w of fake.writes) expect(w).not.toHaveBeenCalled();
+  expect(fake.transportCalls).toEqual([]);
+}
+
+function expectNoKey(output: string): void {
+  for (const key of Object.values(KEYS)) {
+    expect(output).not.toContain(key);
+    expect(output).not.toContain(key.slice(2));
+  }
+}
+
+function tempFile(name: string, content: string | Uint8Array): string {
+  const path = join(mkdtempSync(join(tmpdir(), "pilot-job-cli-")), name);
+  writeFileSync(path, content);
+  return path;
+}
+
+const DELIVERABLE = new TextEncoder().encode("the delivered summary\n");
+
+function jobArgs(extra: string[] = []): string[] {
+  return [
+    "pilot:job",
+    "--label",
+    "test case 1",
+    "--description-file",
+    tempFile("description.txt", "Summarize the attached report in 200 words.\n"),
+    "--deliverable",
+    tempFile("deliverable.md", DELIVERABLE),
+    "--buyer-agent",
+    "11",
+    "--seller-agent",
+    "12",
+    ...extra,
+  ];
+}
+
+const inputOf = (m: ReturnType<typeof vi.fn>, call = 0) =>
+  m.mock.calls[call]?.[1] as CreatePilotJobInput;
+
+describe("pilot:job: the dry run", () => {
+  test("prints the pre-flight (mode, script, names, balance, expiry, hash) and creates nothing", async () => {
+    const fake = makeFake();
+    const out = await run(fake, jobArgs());
+    const printed = JSON.parse(out);
+    expect(printed.dryRun).toBe(true);
+    expect(printed.mode).toBe("rehearsal");
+    expect(printed.klerosScript).toBe("pay");
+    expect(printed.buyer).toEqual({
+      agentId: "11",
+      address: ADDR.buyer,
+      legalName: "Buyer Test Agent LLC",
+    });
+    expect(printed.seller.legalName).toBe("Seller Test Agent LLC");
+    expect(printed.buyerBalanceAtomic).toBe("5250000");
+    expect(printed.budgetAtomic).toBe("2000000");
+    expect(printed.expirySeconds).toBe(7 * 86_400);
+    expect(printed.expiresAt).toBe("2026-11-04T00:00:00.000Z");
+    expect(printed.deliverable.hash).toBe(keccak256(DELIVERABLE));
+    expect(printed.deliverable.extension).toBe("md");
+    expect(out).toContain("Arc testnet");
+    expect(out).toContain("test data");
+    expect(fake.preflight).toHaveBeenCalledTimes(1);
+    expect(fake.createJob).not.toHaveBeenCalled();
+    expect(fake.cases.list()).toEqual([]);
+    expectNothingSent(fake);
+    expectNoKey(out);
+    expect(fake.opened()).toBe(1);
+    expect(fake.closed()).toBe(1);
+  });
+
+  test("the pre-flight gets the parsed input and the agent ids", async () => {
+    const fake = makeFake();
+    await run(fake, jobArgs());
+    const [deps, input] = fake.preflight.mock.calls[0] as [
+      { agentIds: unknown; maxBudgetAtomic: bigint },
+      CreatePilotJobInput,
+    ];
+    expect(deps.agentIds).toEqual({ buyer: "11", seller: "12" });
+    expect(deps.maxBudgetAtomic).toBe(10_000_000n);
+    expect(input.label).toBe("test case 1");
+    expect(input.description).toBe("Summarize the attached report in 200 words.\n");
+    expect(input.deliverable.extension).toBe("md");
+    expect(Array.from(input.deliverable.bytes)).toEqual(Array.from(DELIVERABLE));
+    expect(input.budgetAtomic).toBe(2_000_000n);
+    expect(input.expirySeconds).toBe(7 * 86_400);
+    expect(input.mode).toBe("rehearsal");
+  });
+
+  test("a failing pre-flight is refused with its problem, and nothing is created", async () => {
+    const fake = makeFake({
+      preflight: { ok: false, problem: "the seller's agent 12 has no legal body" },
+    });
+    await expect(run(fake, jobArgs())).rejects.toThrow(
+      /refusing: the seller's agent 12 has no legal body/,
+    );
+    expect(fake.createJob).not.toHaveBeenCalled();
+    expect(fake.closed()).toBe(1);
+  });
+
+  test("in testnet mode the output names the mode and no fake script", async () => {
+    const fake = makeFake({ mode: "testnet" });
+    const printed = JSON.parse(await run(fake, jobArgs()));
+    expect(printed.mode).toBe("testnet");
+    expect(printed.klerosScript).toBeNull();
+  });
+
+  test("--resume in the dry run reads the case and sends nothing", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { status: "created", patch: { jobId: "7" } });
+    const printed = JSON.parse(await run(fake, jobArgs(["--resume", row.caseId])));
+    expect(printed.dryRun).toBe(true);
+    expect(printed.resume).toEqual({ caseId: row.caseId, status: "created", jobId: "7" });
+    expect(fake.createJob).not.toHaveBeenCalled();
+    expect(fake.preflight).not.toHaveBeenCalled();
+    expectNothingSent(fake);
+  });
+
+  test("--resume of an unknown case is refused", async () => {
+    const fake = makeFake();
+    await expect(run(fake, jobArgs(["--resume", "pc_000000000000"]))).rejects.toThrow(
+      /refusing: no pilot case pc_000000000000/,
+    );
+  });
+});
+
+describe("pilot:job: options", () => {
+  test.each([
+    ["2", 2_000_000n],
+    ["2.00", 2_000_000n],
+    ["0.000001", 1n],
+    ["10", 10_000_000n],
+    ["1.5", 1_500_000n],
+  ])("--budget %s is %s atomic USDC", async (budget, atomic) => {
+    const fake = makeFake();
+    await run(fake, jobArgs(["--budget", budget]));
+    expect(inputOf(fake.preflight).budgetAtomic).toBe(atomic);
+  });
+
+  test("--expiry-days sets the expiry in whole days", async () => {
+    const fake = makeFake({ mode: "testnet" });
+    await run(fake, jobArgs(["--expiry-days", "3"]));
+    expect(inputOf(fake.preflight).expirySeconds).toBe(3 * 86_400);
+  });
+
+  test("--expiry-seconds is accepted in rehearsal", async () => {
+    const fake = makeFake();
+    const printed = JSON.parse(await run(fake, jobArgs(["--expiry-seconds", "300"])));
+    expect(inputOf(fake.preflight).expirySeconds).toBe(300);
+    expect(printed.expiresAt).toBe("2026-10-28T00:05:00.000Z");
+  });
+
+  test("the agent ids come from the config when the options are absent", async () => {
+    const fake = makeFake({ agentIds: { buyer: "21", seller: "22" } });
+    const args = jobArgs().slice(0, 7);
+    await run(fake, args);
+    expect((fake.preflight.mock.calls[0]?.[0] as { agentIds: unknown }).agentIds).toEqual({
+      buyer: "21",
+      seller: "22",
+    });
+  });
+
+  test("the options take precedence over the config's agent ids", async () => {
+    const fake = makeFake({ agentIds: { buyer: "21", seller: "22" } });
+    await run(fake, jobArgs());
+    expect((fake.preflight.mock.calls[0]?.[0] as { agentIds: unknown }).agentIds).toEqual({
+      buyer: "11",
+      seller: "12",
+    });
+  });
+
+  test.each([
+    [["--budget", "2.0000001"], /--budget/],
+    [["--budget", "1e3"], /--budget/],
+    [["--budget", "-1"], /--budget/],
+    [["--budget", "0"], /--budget must be above zero/],
+    [["--budget", ".5"], /--budget/],
+    [["--expiry-days", "0"], /--expiry-days/],
+    [["--expiry-days", "1.5"], /--expiry-days/],
+    [["--expiry-days", "2", "--expiry-seconds", "300"], /--expiry-days and --expiry-seconds/],
+    [["--expiry-seconds", "abc"], /--expiry-seconds/],
+    [["--buyer-agent", "0x0b"], /--buyer-agent/],
+    [["--seller-agent", "-2"], /--seller-agent/],
+    [["--resume", "not-a-case"], /--resume/],
+  ])("%j is refused before the context opens", async (extra, message) => {
+    const fake = makeFake();
+    await expect(run(fake, jobArgs(extra as string[]))).rejects.toThrow(message);
+    expect(fake.opened()).toBe(0);
+    expect(fake.preflight).not.toHaveBeenCalled();
+  });
+
+  test.each([["testnet"], ["live"]] as const)(
+    "--expiry-seconds is refused by name in %s mode, before the context opens",
+    async (mode) => {
+      const fake = makeFake({ mode });
+      await expect(run(fake, jobArgs(["--expiry-seconds", "300"]))).rejects.toThrow(
+        new RegExp(`refusing: --expiry-seconds is accepted in rehearsal mode only.*${mode}`),
+      );
+      expect(fake.opened()).toBe(0);
+    },
+  );
+
+  test("a missing agent id is refused by option and variable name, before the context opens", async () => {
+    const fake = makeFake({ agentIds: { seller: "22" } });
+    await expect(run(fake, jobArgs().slice(0, 7))).rejects.toThrow(
+      /--buyer-agent or PILOT_BUYER_AGENT_ID/,
+    );
+    expect(fake.opened()).toBe(0);
+  });
+
+  test("an unreadable description file is refused by path, before the context opens", async () => {
+    const fake = makeFake();
+    const args = jobArgs();
+    args[4] = "/nonexistent/description.txt";
+    await expect(run(fake, args)).rejects.toThrow(/--description-file \/nonexistent/);
+    expect(fake.opened()).toBe(0);
+  });
+
+  test("an empty description is refused before the context opens", async () => {
+    const fake = makeFake();
+    const args = jobArgs();
+    args[4] = tempFile("empty.txt", "  \n");
+    await expect(run(fake, args)).rejects.toThrow(/--description-file .* is empty/);
+    expect(fake.opened()).toBe(0);
+  });
+
+  test("a deliverable without an extension is refused before the context opens", async () => {
+    const fake = makeFake();
+    const args = jobArgs();
+    args[6] = tempFile("deliverable", DELIVERABLE);
+    await expect(run(fake, args)).rejects.toThrow(/--deliverable .* has no file extension/);
+    expect(fake.opened()).toBe(0);
+  });
+
+  test("an empty label is refused before the context opens", async () => {
+    const fake = makeFake();
+    const args = jobArgs();
+    args[2] = " ";
+    await expect(run(fake, args)).rejects.toThrow(/--label/);
+    expect(fake.opened()).toBe(0);
+  });
+});
+
+describe("pilot:job --yes", () => {
+  test("creates the job and prints the row with the mode and the script", async () => {
+    const fake = makeFake();
+    const printed = JSON.parse(await run(fake, jobArgs(["--yes"])));
+    expect(fake.createJob).toHaveBeenCalledTimes(1);
+    expect(fake.createJob.mock.calls[0]?.[2]).toBeUndefined();
+    expect(inputOf(fake.createJob).budgetAtomic).toBe(2_000_000n);
+    expect(printed.mode).toBe("rehearsal");
+    expect(printed.klerosScript).toBe("pay");
+    expect(printed.case.status).toBe("submitted");
+    expect(printed.note).toContain("Arc testnet");
+  });
+
+  test("--resume hands the case id to the job creation", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { status: "funded", patch: { jobId: "7" } });
+    await run(fake, jobArgs(["--yes", "--resume", row.caseId]));
+    expect(fake.createJob.mock.calls[0]?.[2]).toBe(row.caseId);
+  });
+
+  test("a reverted transaction prints its hash and still fails", async () => {
+    const fake = makeFake();
+    fake.createJob.mockRejectedValueOnce(new ChainTxRevertedError("createJob", FAKE_TX));
+    const logs: string[] = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((m) => logs.push(String(m)));
+    const program = new Command();
+    program.exitOverride();
+    registerPilotCommands(program, fake.open, fake.deps);
+    try {
+      await expect(program.parseAsync(["node", "cli", ...jobArgs(["--yes"])])).rejects.toThrow(
+        /createJob reverted/,
+      );
+    } finally {
+      spy.mockRestore();
+    }
+    const printed = JSON.parse(logs.join("\n"));
+    expect(printed.failed).toBe(true);
+    expect(printed.txHash).toBe(FAKE_TX);
+    expect(fake.closed()).toBe(1);
+  });
+});
+
+describe("pilot:contest", () => {
+  test("moves a submitted case to contested with both texts and the time, and records it", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { status: "submitted" });
+    const reason = tempFile("reason.txt", "The summary is 40 words, not 200.\n\tSee line 2.");
+    const reply = tempFile("reply.txt", "The job allowed a shorter summary.");
+    const printed = JSON.parse(
+      await run(fake, [
+        "pilot:contest",
+        "--case",
+        row.caseId,
+        "--reason-file",
+        reason,
+        "--reply-file",
+        reply,
+        "--yes",
+      ]),
+    );
+    const after = fake.cases.find(row.caseId);
+    expect(after?.status).toBe("contested");
+    expect(after?.contestReason).toBe("The summary is 40 words, not 200.\n\tSee line 2.");
+    expect(after?.contestReply).toBe("The job allowed a shorter summary.");
+    expect(after?.contestedAt).toBe(NOW);
+    expect(printed.case.status).toBe("contested");
+    expect(printed.contestedAt).toBe("2026-10-28T00:00:00.000Z");
+    expect(fake.cases.events(row.caseId).map((e) => [e.step, e.status])).toEqual([
+      ["contest", "ok"],
+    ]);
+  });
+
+  test("the reply is optional", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { status: "submitted" });
+    await run(fake, [
+      "pilot:contest",
+      "--case",
+      row.caseId,
+      "--reason-file",
+      tempFile("reason.txt", "late"),
+      "--yes",
+    ]);
+    expect(fake.cases.find(row.caseId)?.contestReply).toBeNull();
+  });
+
+  test("the dry run changes nothing", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { status: "submitted" });
+    const printed = JSON.parse(
+      await run(fake, [
+        "pilot:contest",
+        "--case",
+        row.caseId,
+        "--reason-file",
+        tempFile("reason.txt", "late"),
+      ]),
+    );
+    expect(printed.dryRun).toBe(true);
+    expect(fake.cases.find(row.caseId)?.status).toBe("submitted");
+    expect(fake.cases.events(row.caseId)).toEqual([]);
+  });
+
+  test.each([["funded"], ["contested"], ["filed"]] as const)(
+    "a case at %s is refused and left as it was",
+    async (status) => {
+      const fake = makeFake();
+      const row = insertCase(fake.cases, { status });
+      await expect(
+        run(fake, [
+          "pilot:contest",
+          "--case",
+          row.caseId,
+          "--reason-file",
+          tempFile("reason.txt", "late"),
+          "--yes",
+        ]),
+      ).rejects.toThrow(new RegExp(`refusing: pilot case ${row.caseId} is at ${status}`));
+      expect(fake.cases.find(row.caseId)?.status).toBe(status);
+      expect(fake.cases.events(row.caseId)).toEqual([]);
+    },
+  );
+
+  test("an unknown case is refused", async () => {
+    const fake = makeFake();
+    await expect(
+      run(fake, [
+        "pilot:contest",
+        "--case",
+        "pc_000000000000",
+        "--reason-file",
+        tempFile("reason.txt", "late"),
+        "--yes",
+      ]),
+    ).rejects.toThrow(/refusing: no pilot case pc_000000000000/);
+  });
+
+  test.each([
+    ["--reason-file", "x".repeat(4097), /over 4096 bytes/],
+    ["--reason-file", "a\u0000b", /control character/],
+    ["--reason-file", "a\rb", /control character/],
+    ["--reason-file", "", /empty/],
+    ["--reply-file", "a\u001bb", /--reply-file .* control character/],
+    ["--reply-file", "é".repeat(2049), /over 4096 bytes/],
+  ])("%s holding a bad text is refused before the context opens", async (which, text, message) => {
+    const fake = makeFake();
+    const good = tempFile("good.txt", "late");
+    const bad = tempFile("bad.txt", text);
+    const args = ["pilot:contest", "--case", "pc_000000000000", "--yes"];
+    args.push("--reason-file", which === "--reason-file" ? bad : good);
+    if (which === "--reply-file") args.push("--reply-file", bad);
+    await expect(run(fake, args)).rejects.toThrow(message);
+    expect(fake.opened()).toBe(0);
+  });
+
+  test("exactly 4096 bytes is accepted", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { status: "submitted" });
+    await run(fake, [
+      "pilot:contest",
+      "--case",
+      row.caseId,
+      "--reason-file",
+      tempFile("reason.txt", "x".repeat(4096)),
+      "--yes",
+    ]);
+    expect(fake.cases.find(row.caseId)?.status).toBe("contested");
+  });
+});
+
+const FILED_TESTNET = {
+  klerosChain: "arbitrum-sepolia-testnet",
+  coreDisputeId: "186",
+  localDisputeId: "4",
+} as const;
+const COURT_URL = "https://v2-testnet.kleros.builders/#/cases/186/overview";
+
+describe("pilot:case show and list", () => {
+  test("show prints the row, its events and the Court URL", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, {
+      mode: "testnet",
+      status: "filed",
+      patch: FILED_TESTNET,
+    });
+    fake.cases.recordEvent(row.caseId, "create", "mined", FAKE_TX, null);
+    const printed = JSON.parse(await run(fake, ["pilot:case", "show", row.caseId]));
+    expect(printed.case.caseId).toBe(row.caseId);
+    expect(printed.events.map((e: { step: string }) => e.step)).toEqual(["create"]);
+    expect(printed.courtUrl).toBe(COURT_URL);
+  });
+
+  test.each([
+    ["no ids", "submitted", {}],
+    ["the rehearsal's fake deployment", "filed", { klerosChain: "fake", coreDisputeId: "1" }],
+  ] as const)("show gives no Court URL for %s", async (_what, status, patch) => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { status, patch });
+    const printed = JSON.parse(await run(fake, ["pilot:case", "show", row.caseId]));
+    expect(printed.courtUrl).toBeNull();
+  });
+
+  test("show of an unknown case is refused", async () => {
+    const fake = makeFake();
+    await expect(run(fake, ["pilot:case", "show", "pc_000000000000"])).rejects.toThrow(
+      /refusing: no pilot case pc_000000000000/,
+    );
+  });
+
+  test("list prints every case, and --mode keeps one mode's", async () => {
+    const fake = makeFake();
+    const a = insertCase(fake.cases, { mode: "rehearsal" });
+    const b = insertCase(fake.cases, { mode: "testnet", status: "submitted" });
+    const all = JSON.parse(await run(fake, ["pilot:case", "list"]));
+    expect(all.cases.map((c: { caseId: string }) => c.caseId).sort()).toEqual(
+      [a.caseId, b.caseId].sort(),
+    );
+    const testnet = JSON.parse(await run(fake, ["pilot:case", "list", "--mode", "testnet"]));
+    expect(testnet.cases).toHaveLength(1);
+    expect(testnet.cases[0]).toMatchObject({
+      caseId: b.caseId,
+      mode: "testnet",
+      status: "submitted",
+    });
+  });
+
+  test("list --mode of another word is refused before the context opens", async () => {
+    const fake = makeFake();
+    await expect(run(fake, ["pilot:case", "list", "--mode", "staging"])).rejects.toThrow(
+      /--mode must be rehearsal, testnet or live/,
+    );
+    expect(fake.opened()).toBe(0);
+  });
+});
+
+describe("pilot:case seen-in-court", () => {
+  test("records the Court URL and the operator's name on a filed testnet case", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { mode: "testnet", status: "filed", patch: FILED_TESTNET });
+    const printed = JSON.parse(
+      await run(fake, ["pilot:case", "seen-in-court", row.caseId, "--by", "Alex", "--yes"]),
+    );
+    expect(printed.courtUrl).toBe(COURT_URL);
+    expect(fake.cases.events(row.caseId)).toMatchObject([
+      { step: "seen_in_court", status: "ok", ref: COURT_URL, detail: "by Alex" },
+    ]);
+    expect(fake.cases.countSeenInCourt("testnet")).toBe(1);
+  });
+
+  test("without --by it records an operator", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { mode: "testnet", status: "ruled", patch: FILED_TESTNET });
+    await run(fake, ["pilot:case", "seen-in-court", row.caseId, "--yes"]);
+    expect(fake.cases.events(row.caseId)[0]?.detail).toBe("by an operator");
+  });
+
+  test("without --yes it records nothing", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { mode: "testnet", status: "filed", patch: FILED_TESTNET });
+    const printed = JSON.parse(await run(fake, ["pilot:case", "seen-in-court", row.caseId]));
+    expect(printed.dryRun).toBe(true);
+    expect(printed.courtUrl).toBe(COURT_URL);
+    expect(fake.cases.events(row.caseId)).toEqual([]);
+  });
+
+  test.each([
+    [
+      "a rehearsal case",
+      "rehearsal",
+      "filed",
+      { klerosChain: "fake", coreDisputeId: "1" },
+      /rehearsal/,
+    ],
+    ["a case before filed", "testnet", "contested", {}, /is at contested/],
+    ["a case at filing", "testnet", "filing", {}, /is at filing/],
+    ["a filed case without ids", "testnet", "filed", {}, /no Kleros dispute id/],
+  ] as const)(
+    "%s is refused and no event is written",
+    async (_what, mode, status, patch, message) => {
+      const fake = makeFake();
+      const row = insertCase(fake.cases, { mode, status, patch });
+      await expect(run(fake, ["pilot:case", "seen-in-court", row.caseId, "--yes"])).rejects.toThrow(
+        message,
+      );
+      expect(fake.cases.events(row.caseId)).toEqual([]);
+    },
+  );
+
+  test("a control character in --by is refused before the context opens", async () => {
+    const fake = makeFake();
+    await expect(
+      run(fake, ["pilot:case", "seen-in-court", "pc_000000000000", "--by", "a\u0007", "--yes"]),
+    ).rejects.toThrow(/--by/);
+    expect(fake.opened()).toBe(0);
+  });
+});
+
+describe("pilot:case fail", () => {
+  test("moves a case to failed with the reason as an event", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { status: "funded" });
+    const printed = JSON.parse(
+      await run(fake, [
+        "pilot:case",
+        "fail",
+        row.caseId,
+        "--reason",
+        "the seller key was lost",
+        "--yes",
+      ]),
+    );
+    expect(printed.case.status).toBe("failed");
+    expect(fake.cases.find(row.caseId)?.error).toBe("the seller key was lost");
+    expect(fake.cases.events(row.caseId)).toMatchObject([
+      { step: "failed", status: "ok", detail: "the seller key was lost" },
+    ]);
+  });
+
+  test("without --yes it changes nothing", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { status: "funded" });
+    const printed = JSON.parse(
+      await run(fake, ["pilot:case", "fail", row.caseId, "--reason", "stuck"]),
+    );
+    expect(printed.dryRun).toBe(true);
+    expect(fake.cases.find(row.caseId)?.status).toBe("funded");
+    expect(fake.cases.events(row.caseId)).toEqual([]);
+  });
+
+  test.each([["settled"], ["failed"]] as const)("a %s case is refused", async (status) => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { status });
+    await expect(
+      run(fake, ["pilot:case", "fail", row.caseId, "--reason", "x", "--yes"]),
+    ).rejects.toThrow(new RegExp(`pilot case ${row.caseId} is ${status}`));
+    expect(fake.cases.events(row.caseId)).toEqual([]);
+  });
+
+  test.each([
+    ["testnet", "filed"],
+    ["testnet", "ruled"],
+    ["live", "filed"],
+  ] as const)(
+    "a %s case at %s is refused without --force, naming its Kleros ids",
+    async (mode, status) => {
+      const fake = makeFake();
+      const row = insertCase(fake.cases, { mode, status, patch: FILED_TESTNET });
+      await expect(
+        run(fake, ["pilot:case", "fail", row.caseId, "--reason", "x", "--yes"]),
+      ).rejects.toThrow(/--force.*arbitrum-sepolia-testnet.*186.*4|186.*4.*--force/);
+      expect(fake.cases.find(row.caseId)?.status).toBe(status);
+      expect(fake.cases.events(row.caseId)).toEqual([]);
+    },
+  );
+
+  test("--force fails a filed testnet case", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { mode: "testnet", status: "filed", patch: FILED_TESTNET });
+    await run(fake, ["pilot:case", "fail", row.caseId, "--reason", "x", "--force", "--yes"]);
+    expect(fake.cases.find(row.caseId)?.status).toBe("failed");
+  });
+
+  test("a filed rehearsal case needs no --force", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { status: "filed" });
+    await run(fake, ["pilot:case", "fail", row.caseId, "--reason", "x", "--yes"]);
+    expect(fake.cases.find(row.caseId)?.status).toBe("failed");
+  });
+
+  test("a reason with a control character is refused before the context opens", async () => {
+    const fake = makeFake();
+    await expect(
+      run(fake, ["pilot:case", "fail", "pc_000000000000", "--reason", "a\u0000", "--yes"]),
+    ).rejects.toThrow(/--reason/);
+    expect(fake.opened()).toBe(0);
+  });
+});
