@@ -15,19 +15,27 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { buildApiApp } from "../../src/api/app";
+import {
+  signStatement,
+  statementFromJson,
+  verifyPublicStatement,
+} from "../../src/legalBody/publicStatement";
 import { migrate } from "../../src/persistence/db";
 import { FileDocumentStore } from "../../src/persistence/documentStore";
 import { SqlitePilotCaseRepository } from "../../src/pilot/casesRepository";
 import type { PilotCaseRecord, PilotMode, PilotStatus } from "../../src/pilot/types";
 import { toPilotCaseView } from "../../src/pilot/views";
+import { TEST_ATTESTOR } from "../helpers/legalBodyStatementFixtures";
 import {
   BUYER_AGENT,
   BUYER_NAME,
+  CHAIN_ID,
   ERROR_SENTINEL,
   EVIDENCE_TEXT,
   LOCAL_DISPUTE_ID,
   SELLER_AGENT,
   SELLER_NAME,
+  STATEMENT_ISSUED_AT,
   answerFor,
   fullPatch,
   hash,
@@ -82,6 +90,23 @@ type Json = any;
 async function getJson(app: App, path: string) {
   const res = await app.request(path);
   return { res, body: (await res.json()) as Json };
+}
+
+/** The ops lines printed from now on: each line's fields, without `opslog` and `at`, by event. */
+function captureOps() {
+  const printed: string[] = [];
+  vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+    printed.push(args.map(String).join(" "));
+  });
+  return (event: string): Json[] =>
+    printed.flatMap((line) => {
+      try {
+        const { opslog, at: _at, ...fields } = JSON.parse(line) as Json;
+        return opslog === event ? [fields] : [];
+      } catch {
+        return [];
+      }
+    });
 }
 
 let seq = 0;
@@ -229,9 +254,126 @@ describe("GET /pilot/cases", () => {
     expect((await getJson(app, "/pilot/cases")).res.status).toBe(200);
     expect(spy).toHaveBeenCalledTimes(2);
   });
+
+  test("a row the view cannot show is skipped with one ops line; the others are served and memoised", async () => {
+    const opsOf = captureOps();
+    const a = fullCase("testnet");
+    // A budget that is not a decimal number: the view refuses to render it.
+    const bad = cases.insert(
+      newCase({ caseId: nextCaseId(), mode: "testnet", budgetAtomic: "2.00" }),
+    );
+    const c = freshCase("rehearsal");
+    const app = makeApp();
+    const { res, body } = await getJson(app, "/pilot/cases");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe(FRESH);
+    expect(body).toEqual({
+      environment: "testnet",
+      testData: true,
+      cases: [viewOf(c), viewOf(a, RECORDS)],
+    });
+    expect(opsOf("pilot_cases_row_skipped")).toEqual([{ caseId: bad.caseId, errorName: "Error" }]);
+    expect(opsOf("pilot_cases_read_failed")).toEqual([]);
+    // The filter that holds the row skips it too.
+    const testnet = await getJson(app, "/pilot/cases?mode=testnet");
+    expect(testnet.body.cases.map((v: Json) => v.caseId)).toEqual([a.caseId]);
+    expect(opsOf("pilot_cases_row_skipped")).toHaveLength(2);
+    // Memoised like any answer: a hit within the window reads and logs nothing.
+    const spy = vi.spyOn(cases, "list");
+    expect((await getJson(app, "/pilot/cases")).body.cases).toHaveLength(2);
+    expect(spy).not.toHaveBeenCalled();
+    expect(opsOf("pilot_cases_row_skipped")).toHaveLength(2);
+    // The case route for that one row stays the fixed 503.
+    const detail = await getJson(app, `/pilot/cases/${bad.caseId}`);
+    expect(detail.res.status).toBe(503);
+    expect(detail.res.headers.get("cache-control")).toBe(NO_STORE);
+    expect(detail.body).toEqual({
+      error: "unavailable",
+      message: "could not check right now; try again shortly",
+    });
+    expect(opsOf("pilot_cases_read_failed")).toEqual([{ errorName: "Error" }]);
+  });
+
+  test("a list whose rows can all be shown logs no skip", async () => {
+    const opsOf = captureOps();
+    fullCase("live");
+    freshCase("testnet");
+    expect((await getJson(makeApp(), "/pilot/cases")).body.cases).toHaveLength(2);
+    expect(opsOf("pilot_cases_row_skipped")).toEqual([]);
+  });
 });
 
 describe("GET /pilot/cases/:caseId", () => {
+  test("the stored answers are served rebuilt: no extra key reaches records, and the statement still verifies", async () => {
+    const extra = {
+      error: "fetch failed at https://lookup.example.test/?apiKey=EXTRAKEY",
+      path: `${dataDir}/documents/pilot-record.json`,
+      localDisputeId: LOCAL_DISPUTE_ID,
+      fetchedFrom: "https://lookup.example.test/internal",
+    };
+    // A statement signed for real by the test attestor, and an answer around it.
+    const base = answerFor(BUYER_AGENT, BUYER_NAME);
+    const signed = await signStatement(statementFromJson(base.statement.message), TEST_ATTESTOR);
+    const buyer = { ...base, statement: signed };
+    const seller = {
+      agentId: SELLER_AGENT,
+      legalBody: true,
+      standing: "unknown",
+      publicId: null,
+      network: "testnet",
+      links: { transparency: "https://www.example.test/transparency" },
+      checkedAt: "2026-10-28T09:30:00.000Z",
+      statement: null,
+    };
+    const storedBuyer = {
+      ...extra,
+      ...buyer,
+      links: { ...buyer.links, ...extra },
+      statement: {
+        ...extra,
+        ...signed,
+        domain: { ...signed.domain, ...extra },
+        message: { ...signed.message, ...extra },
+      },
+    };
+    const storedSeller = { ...extra, ...seller, links: { ...seller.links, ...extra } };
+    const verify = (statement: unknown) =>
+      verifyPublicStatement(statement, {
+        attestor: TEST_ATTESTOR.address,
+        expectedChainId: CHAIN_ID,
+        nowSeconds: STATEMENT_ISSUED_AT,
+      });
+    expect(await verify(signed)).toBe(true);
+    // As stored, the extras alone make the statement fail to verify.
+    expect(await verify(storedBuyer.statement)).toBe(false);
+
+    const row = fullCase("testnet");
+    const ids = storedIdsOf(row.caseId);
+    docStore.put(ids.buyerRecord, JSON.stringify(storedBuyer));
+    docStore.put(ids.sellerRecord, JSON.stringify(storedSeller));
+    const app = makeApp();
+    const { res, body } = await getJson(app, `/pilot/cases/${row.caseId}`);
+    expect(res.status).toBe(200);
+    // Every known field served, as stored; nothing else.
+    expect(body.records).toEqual({ buyer, seller });
+    expect(Object.keys(body.records.buyer)).toEqual(Object.keys(buyer));
+    expect(Object.keys(body.records.buyer.statement)).toEqual(Object.keys(signed));
+    expect(Object.keys(body.records.buyer.statement.message)).toEqual(Object.keys(signed.message));
+    expect(await verify(body.records.buyer.statement)).toBe(true);
+    expect(body.buyer.legalName).toBe(BUYER_NAME);
+    expect(body.buyer.standingAtFiling).toBe("active");
+    expect(body.seller).toMatchObject({ legalName: null, standingAtFiling: null });
+    const list = (await getJson(app, "/pilot/cases")).body;
+    for (const answer of [body, list]) {
+      const { keys } = walk(answer);
+      for (const k of Object.keys(extra))
+        expect(keys.map((key) => key.toLowerCase())).not.toContain(k.toLowerCase());
+      const text = JSON.stringify(answer);
+      for (const value of [...Object.values(extra), "EXTRAKEY", dataDir])
+        expect(text).not.toContain(value);
+    }
+  });
+
   test("a full row: the view, the stored evidence text and the two stored answers", async () => {
     const row = fullCase("testnet");
     const { res, body } = await getJson(makeApp(), `/pilot/cases/${row.caseId}`);
@@ -360,6 +502,18 @@ describe("both routes", () => {
       const res = await app.request(path, { headers: { Origin: "https://page.example" } });
       expect(res.status, path).toBe(200);
       expect(res.headers.get("access-control-allow-origin"), path).toBe("*");
+    }
+    // Only these two paths: a neighbour, the bare prefix and a protected route keep the web origin.
+    for (const path of ["/pilot/casesx", "/pilot/casesx/pc_0123456789ab", "/pilot", "/entities"]) {
+      for (const method of ["GET", "OPTIONS"]) {
+        const res = await app.request(path, {
+          method,
+          headers: { Origin: "https://page.example", "Access-Control-Request-Method": "GET" },
+        });
+        expect(res.headers.get("access-control-allow-origin"), `${method} ${path}`).toBe(
+          "https://www.example.test",
+        );
+      }
     }
   });
 

@@ -356,6 +356,106 @@ describe("parseStoredAnswer", () => {
     ])
       expect(parseStoredAnswer(text), text.slice(0, 60)).toBeNull();
   });
+
+  /** Keys no answer has, at whatever level they are written. */
+  const EXTRA = {
+    error: "fetch failed at https://lookup.example.test/?apiKey=EXTRAKEY",
+    path: "/srv/novi/data/documents/pilot-record.json",
+    localDisputeId: "918273645",
+    fetchedFrom: "https://lookup.example.test/internal",
+  };
+
+  test("an answer with a statement is rebuilt from its own keys only, the message from the signed fields", () => {
+    const answer = answerFor(BUYER_AGENT, BUYER_NAME);
+    const stored = {
+      ...EXTRA,
+      ...answer,
+      links: { ...answer.links, ...EXTRA },
+      statement: {
+        ...EXTRA,
+        ...answer.statement,
+        domain: { ...answer.statement.domain, ...EXTRA },
+        message: { ...answer.statement.message, ...EXTRA },
+      },
+    };
+    const read = parseStoredAnswer(JSON.stringify(stored));
+    expect(read).toEqual(answer);
+    expect(Object.keys(read ?? {})).toEqual(Object.keys(answer));
+    const text = JSON.stringify(read);
+    for (const value of Object.values(EXTRA)) expect(text).not.toContain(value);
+    for (const key of Object.keys(EXTRA)) expect(text).not.toContain(`"${key}"`);
+    // The message keeps every signed field, in the signed order, and nothing else.
+    expect(Object.keys((read as typeof answer).statement.message)).toEqual(
+      Object.keys(answer.statement.message),
+    );
+  });
+
+  test("the two answers without a statement are rebuilt from their own keys only", () => {
+    const unknown = {
+      agentId: "13",
+      legalBody: true,
+      standing: "unknown",
+      publicId: null,
+      network: "testnet",
+      links: { transparency: "https://www.example.test/transparency" },
+      checkedAt: "2026-10-28T09:30:00.000Z",
+      statement: null,
+    };
+    const none = { agentId: "7", legalBody: false, standing: null, checkedAt: "2026-10-28" };
+    for (const clean of [unknown, none]) {
+      const stored = {
+        ...EXTRA,
+        ...clean,
+        ...("links" in clean ? { links: { ...clean.links, ...EXTRA } } : {}),
+      };
+      const read = parseStoredAnswer(JSON.stringify(stored));
+      expect(read).toEqual(clean);
+      expect(Object.keys(read ?? {})).toEqual(Object.keys(clean));
+    }
+  });
+
+  test("an answer that fits none of the three kinds is absent", () => {
+    const answer = answerFor(BUYER_AGENT, BUYER_NAME);
+    const { legalName: _dropped, ...withoutName } = answer.statement.message;
+    const unknown = {
+      agentId: "13",
+      legalBody: true,
+      standing: "unknown",
+      publicId: null,
+      network: "testnet",
+      links: { transparency: "https://www.example.test/transparency" },
+      checkedAt: "2026-10-28T09:30:00.000Z",
+      statement: null,
+    };
+    for (const stored of [
+      // A signed field missing, or of the wrong type: the statement would not verify.
+      { ...answer, statement: { ...answer.statement, message: withoutName } },
+      {
+        ...answer,
+        statement: {
+          ...answer.statement,
+          message: { ...answer.statement.message, controlVerified: "true" },
+        },
+      },
+      { ...answer, statement: { ...answer.statement, primaryType: "Other" } },
+      { ...answer, statement: { ...answer.statement, domain: { name: "x", version: "2" } } },
+      { ...answer, statement: { ...answer.statement, signature: 1 } },
+      // The answer around the statement.
+      { ...answer, standing: "great" },
+      { ...answer, publicId: null },
+      { ...answer, network: "devnet" },
+      { ...answer, links: { transparency: "https://www.example.test/transparency" } },
+      { ...answer, statement: undefined },
+      { ...unknown, standing: "active" },
+      { ...unknown, publicId: "pub_13" },
+      { ...unknown, links: null },
+      { agentId: "7", legalBody: false, standing: "active", checkedAt: "2026-10-28" },
+    ])
+      expect(
+        parseStoredAnswer(JSON.stringify(stored)),
+        JSON.stringify(stored).slice(0, 80),
+      ).toBeNull();
+  });
 });
 
 describe("the two bases", () => {

@@ -52,7 +52,8 @@ export interface PilotCaseList {
 }
 
 /** What `GET /pilot/cases/:caseId` answers: the view, the stored evidence text beside the
- *  evidence's name and hash, and the two lookup answers as stored at filing. */
+ *  evidence's name and hash, and the two lookup answers stored at filing, rebuilt from their own
+ *  keys (`parseStoredAnswer`), so nothing else a stored file holds is served. */
 export type PilotCaseDetail = Omit<PilotCaseView, "evidence"> & {
   evidence: (NonNullable<PilotCaseView["evidence"]> & { description: string | null }) | null;
   records: { buyer: ByAgentAnswer | null; seller: ByAgentAnswer | null };
@@ -110,12 +111,27 @@ export function mountPilotCaseRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
       records: { buyer: records.buyer ?? undefined, seller: records.seller ?? undefined },
     });
 
+  /**
+   * A row's view for the list, or null for a row the view refuses to show (a budget that is not a
+   * decimal number): that one row is left out, with an ops line naming it (its id is public) and
+   * the error's name, and the rest of the list is served. Its own case route stays a 503.
+   */
+  const listedViewOf = async (row: PilotCaseRecord): Promise<PilotCaseView | null> => {
+    const records = await recordsOf(row);
+    try {
+      return viewOf(row, records);
+    } catch (e) {
+      opsLog("pilot_cases_row_skipped", { caseId: row.caseId, errorName: errorNameOf(e) });
+      return null;
+    }
+  };
+
   const refuse = (c: Context, body: object, status: 400 | 404) => {
     c.header("Cache-Control", NO_STORE);
     return c.json(body, status);
   };
-  /** The table could not be read (or a row could not be projected): the flat 503 of the public
-   *  routes, never memoised, with the error's name only in the ops line. */
+  /** The table could not be read (or the one case asked for could not be shown): the flat 503 of
+   *  the public routes, never memoised, with the error's name only in the ops line. */
   const unavailable = (c: Context, e: unknown) => {
     opsLog("pilot_cases_read_failed", { errorName: errorNameOf(e) });
     c.header("Cache-Control", NO_STORE);
@@ -141,8 +157,12 @@ export function mountPilotCaseRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
         0,
         CASES_LISTED,
       );
-      const views = await Promise.all(rows.map(async (row) => viewOf(row, await recordsOf(row))));
-      answer = { environment: pc.environment, testData: true, cases: views };
+      const views = await Promise.all(rows.map(listedViewOf));
+      answer = {
+        environment: pc.environment,
+        testData: true,
+        cases: views.filter((v): v is PilotCaseView => v !== null),
+      };
     } catch (e) {
       return unavailable(c, e);
     }

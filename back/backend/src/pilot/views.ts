@@ -2,6 +2,12 @@ import { KLEROS_DEPLOYMENTS, klerosCaseUrl } from "../adapters/kleros/deployment
 import type { ByAgentAnswer } from "../api/routes/legalBodyStatements";
 import { arcTestnet } from "../chains";
 import type { Config } from "../config/env";
+import {
+  LEGAL_BODY_STATEMENT_TYPES,
+  type LegalBodyStatementJson,
+  type SignedStatementJson,
+} from "../legalBody/publicStatement";
+import { STANDINGS, type Standing } from "../legalBody/standing";
 import type { Address, Hex } from "../types";
 import type { KlerosChainOnRow, PilotCaseRecord, PilotMode, PilotStatus } from "./types";
 
@@ -138,10 +144,55 @@ function caseUrlOf(chain: KlerosChainOnRow, coreDisputeId: string | null): strin
 const isObject = (v: unknown): v is Record<string, unknown> =>
   typeof v === "object" && v !== null && !Array.isArray(v);
 
+const isStanding = (v: unknown): v is Standing =>
+  typeof v === "string" && (STANDINGS as readonly string[]).includes(v);
+const isNetwork = (v: unknown): v is "testnet" | "mainnet" => v === "testnet" || v === "mainnet";
+
+/** A string property of an object, own and present, or undefined. */
+const ownString = (o: Record<string, unknown>, key: string): string | undefined => {
+  const v = Object.hasOwn(o, key) ? o[key] : undefined;
+  return typeof v === "string" ? v : undefined;
+};
+
 /**
- * A lookup answer by agent as the pilot stored it at filing, read back; null for anything that is
- * not one (not JSON, not an object, or without the fields the view reads), so a damaged file is
- * served as absent rather than as an error.
+ * A signed statement rebuilt from its own keys only: the domain's three, the primary type, the
+ * attestor, the signature, and a message of exactly the signed fields, in the signed order. That
+ * is all a signature covers, and all a verifier accepts (it refuses any other key at any of these
+ * levels), so a key the stored file carries beside them is never served. A missing signed field,
+ * or one of the wrong JSON type, makes the statement absent: it would not verify.
+ */
+function signedStatementOf(v: unknown): SignedStatementJson | null {
+  if (!isObject(v) || !isObject(v.domain) || !isObject(v.message)) return null;
+  const { domain, message } = v;
+  const name = ownString(domain, "name");
+  const version = ownString(domain, "version");
+  const chainId = Object.hasOwn(domain, "chainId") ? domain.chainId : undefined;
+  const attestor = ownString(v, "attestor");
+  const signature = ownString(v, "signature");
+  if (name === undefined || version === undefined || typeof chainId !== "number") return null;
+  if (v.primaryType !== "LegalBodyStatement" || attestor === undefined || signature === undefined)
+    return null;
+  const signed: Record<string, unknown> = {};
+  for (const field of LEGAL_BODY_STATEMENT_TYPES.LegalBodyStatement) {
+    const value = Object.hasOwn(message, field.name) ? message[field.name] : undefined;
+    if (field.type === "bool" ? typeof value !== "boolean" : typeof value !== "string") return null;
+    signed[field.name] = value;
+  }
+  return {
+    domain: { name, version, chainId },
+    primaryType: "LegalBodyStatement",
+    message: signed as LegalBodyStatementJson,
+    attestor: attestor as Address,
+    signature: signature as Hex,
+  };
+}
+
+/**
+ * A lookup answer by agent as the pilot stored it at filing, REBUILT from the keys of its kind
+ * only (the three kinds of `ByAgentAnswer`): no legal body; a legal body whose standing could not
+ * be read (no statement); a legal body with its signed statement. Whatever else the file carries,
+ * at any level, is never served. Anything that is not JSON, or fits none of the three kinds, is
+ * null, so a damaged file is served as absent rather than as an error.
  */
 export function parseStoredAnswer(text: string): ByAgentAnswer | null {
   let parsed: unknown;
@@ -151,19 +202,44 @@ export function parseStoredAnswer(text: string): ByAgentAnswer | null {
     return null;
   }
   if (!isObject(parsed)) return null;
-  if (
-    typeof parsed.agentId !== "string" ||
-    typeof parsed.legalBody !== "boolean" ||
-    typeof parsed.checkedAt !== "string"
-  )
-    return null;
-  const statement = parsed.statement;
-  if (statement !== undefined && statement !== null) {
-    if (!isObject(statement) || !isObject(statement.message)) return null;
-    const { legalName, standing } = statement.message;
-    if (typeof legalName !== "string" || typeof standing !== "string") return null;
+  const agentId = ownString(parsed, "agentId");
+  const checkedAt = ownString(parsed, "checkedAt");
+  if (agentId === undefined || checkedAt === undefined) return null;
+  const { legalBody, standing, publicId, network, links, statement } = parsed;
+
+  if (legalBody === false)
+    return standing === null ? { agentId, legalBody: false, standing: null, checkedAt } : null;
+  if (legalBody !== true || !isNetwork(network) || !isObject(links)) return null;
+  const transparency = ownString(links, "transparency");
+  if (transparency === undefined) return null;
+
+  if (statement === null) {
+    if (standing !== "unknown" || publicId !== null) return null;
+    return {
+      agentId,
+      legalBody: true,
+      standing: "unknown",
+      publicId: null,
+      network,
+      links: { transparency },
+      checkedAt,
+      statement: null,
+    };
   }
-  return parsed as ByAgentAnswer;
+  const signed = signedStatementOf(statement);
+  const statementLink = ownString(links, "statement");
+  if (!signed || !isStanding(standing) || typeof publicId !== "string" || !statementLink)
+    return null;
+  return {
+    agentId,
+    legalBody: true,
+    standing,
+    publicId,
+    network,
+    links: { transparency, statement: statementLink },
+    checkedAt,
+    statement: signed,
+  };
 }
 
 /** The signed statement's message of an answer, when it carries one. */

@@ -4,7 +4,9 @@
  * byte, every name an invention. The row's `error` and `localDisputeId` carry sentinels a test can
  * look for in what the route serves.
  */
+import { getAddress } from "viem";
 import type { ByAgentAnswer } from "../../src/api/routes/legalBodyStatements";
+import { PUBLIC_STATEMENT_TTL_SECONDS } from "../../src/legalBody/publicStatement";
 import type { Standing } from "../../src/legalBody/standing";
 import type {
   KlerosChainOnRow,
@@ -194,10 +196,17 @@ export function fullRecord(mode: PilotMode, over: Partial<PilotCaseRecord> = {})
   });
 }
 
+/** When the fixture statements were issued (unix seconds); they expire one TTL later. */
+export const STATEMENT_ISSUED_AT = 1_790_000_000;
+
 /** The answer by agent that carries a signed statement. */
 export type SignedAnswer = Extract<ByAgentAnswer, { publicId: string }>;
 
-/** A lookup answer by agent with a signed statement, as the pilot stores it at filing. */
+/**
+ * A lookup answer by agent with a statement, as the pilot stores it at filing. The message is a
+ * well-formed statement (EIP-55 addresses, one TTL between issue and expiry), so a test can sign
+ * it for real; the signature here is a placeholder.
+ */
 export function answerFor(
   agentId: string,
   legalName: string,
@@ -219,12 +228,12 @@ export function answerFor(
       primaryType: "LegalBodyStatement",
       message: {
         chainId: String(CHAIN_ID),
-        identityRegistry: "0x00000000000000000000000000000000000000e1",
-        factory: "0x00000000000000000000000000000000000000e2",
-        legalBody: "0x00000000000000000000000000000000000000e3",
+        identityRegistry: getAddress("0x00000000000000000000000000000000000000e1"),
+        factory: getAddress("0x00000000000000000000000000000000000000e2"),
+        legalBody: getAddress("0x00000000000000000000000000000000000000e3"),
         agentId,
-        agentWallet: "0x00000000000000000000000000000000000000e4",
-        identityOwnerAtCreation: "0x00000000000000000000000000000000000000e5",
+        agentWallet: getAddress("0x00000000000000000000000000000000000000e4"),
+        identityOwnerAtCreation: getAddress("0x00000000000000000000000000000000000000e5"),
         bindingState: "linked",
         identityOwnerIsContract: false,
         agentWalletIsContract: false,
@@ -249,10 +258,10 @@ export function answerFor(
         oaManifestVersion: "1",
         guardianHumanVerified: true,
         observedAtBlock: "1000",
-        issuedAt: "1790000000",
-        expiresAt: "1790000900",
+        issuedAt: String(STATEMENT_ISSUED_AT),
+        expiresAt: String(STATEMENT_ISSUED_AT + PUBLIC_STATEMENT_TTL_SECONDS),
       },
-      attestor: "0x00000000000000000000000000000000000000e6",
+      attestor: getAddress("0x00000000000000000000000000000000000000e6"),
       signature: `0x${"ab".repeat(65)}`,
     },
   };
