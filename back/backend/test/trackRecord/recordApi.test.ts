@@ -8,6 +8,10 @@ import {
 } from "../../src/trackRecord/recordApi";
 import { LOCKING_WALLET, PROVIDER_HOST, fixtureText } from "./helpers";
 
+/** The provider's own test wallets, the subjects of the two graded fixtures (public record API). */
+const WALLET_ONE = "0x3692f08070352D08E2281112CCC8a700C4d89256" as const;
+const WALLET_OTHER = "0xbc2C6f49C34ae735a5A85cBC637b83B875d352e5" as const;
+
 function reason(fn: () => unknown): string | undefined {
   try {
     fn();
@@ -28,31 +32,43 @@ function answer(over: Record<string, unknown> = {}) {
 
 describe("parseRecordAnswer", () => {
   test("the real answer of 28 October: two running calls, nothing graded, the link kept", () => {
-    expect(parseRecordAnswer(fixtureText("record-running-2026-10-28.json"), PROVIDER_HOST)).toEqual(
-      {
-        graded: 0,
-        correct: 0,
-        wrong: 0,
-        worstMoveBps: null,
-        recordUrl: `https://${PROVIDER_HOST}/check/${LOCKING_WALLET}`,
-      },
-    );
+    expect(
+      parseRecordAnswer(
+        fixtureText("record-running-2026-10-28.json"),
+        PROVIDER_HOST,
+        LOCKING_WALLET,
+      ),
+    ).toEqual({
+      graded: 0,
+      correct: 0,
+      wrong: 0,
+      worstMoveBps: null,
+      recordUrl: `https://${PROVIDER_HOST}/check/${LOCKING_WALLET}`,
+    });
   });
 
   test("a real graded answer: one wrong call at -216 bps", () => {
-    const parsed = parseRecordAnswer(fixtureText("record-graded-one-wrong.json"), PROVIDER_HOST);
+    const parsed = parseRecordAnswer(
+      fixtureText("record-graded-one-wrong.json"),
+      PROVIDER_HOST,
+      WALLET_ONE,
+    );
     expect(parsed).toMatchObject({ graded: 1, correct: 0, wrong: 1, worstMoveBps: -216 });
   });
 
   test("a real answer with one graded and one running call: worst is the graded one", () => {
-    const parsed = parseRecordAnswer(fixtureText("record-graded-other.json"), PROVIDER_HOST);
+    const parsed = parseRecordAnswer(
+      fixtureText("record-graded-other.json"),
+      PROVIDER_HOST,
+      WALLET_OTHER,
+    );
     expect(parsed).toMatchObject({ graded: 1, wrong: 1, worstMoveBps: -314 });
   });
 
   test("worst is the most negative move", () => {
     const items = [{ marketCall: { moveBps: -314 } }, { marketCall: { moveBps: 120 } }, {}];
     const text = answer({ summary: { marketCalls: { correct: 1, wrong: 1, void: 0 } }, items });
-    expect(parseRecordAnswer(text, PROVIDER_HOST)).toMatchObject({
+    expect(parseRecordAnswer(text, PROVIDER_HOST, LOCKING_WALLET)).toMatchObject({
       graded: 2,
       correct: 1,
       wrong: 1,
@@ -60,9 +76,19 @@ describe("parseRecordAnswer", () => {
     });
   });
 
+  test("a record about another wallet is malformed", () => {
+    const text = fixtureText("record-graded-one-wrong.json");
+    expect(reason(() => parseRecordAnswer(text, PROVIDER_HOST, LOCKING_WALLET))).toBe("malformed");
+  });
+
+  test("the wallet is compared without regard to case", () => {
+    const text = answer({ address: LOCKING_WALLET.toLowerCase() });
+    expect(parseRecordAnswer(text, PROVIDER_HOST, LOCKING_WALLET).graded).toBe(0);
+  });
+
   test("void calls are not graded", () => {
     const text = answer({ summary: { marketCalls: { correct: 1, wrong: 0, void: 3 } } });
-    expect(parseRecordAnswer(text, PROVIDER_HOST).graded).toBe(1);
+    expect(parseRecordAnswer(text, PROVIDER_HOST, LOCKING_WALLET).graded).toBe(1);
   });
 
   test.each([
@@ -74,7 +100,7 @@ describe("parseRecordAnswer", () => {
     ["a fractional move", answer({ items: [{ marketCall: { moveBps: 3.5 } }] })],
     ["an oversized asset", answer({ items: [{ marketCall: { asset: "x".repeat(65) } }] })],
   ])("refuses %s as malformed", (_label, text) => {
-    expect(reason(() => parseRecordAnswer(text, PROVIDER_HOST))).toBe("malformed");
+    expect(reason(() => parseRecordAnswer(text, PROVIDER_HOST, LOCKING_WALLET))).toBe("malformed");
   });
 });
 
@@ -170,6 +196,28 @@ describe("fetchRecordText", () => {
         headers: { "content-length": String(1024 * 1024) },
       })) as typeof fetch;
     expect(await fetchReason(stub)).toBe("too_large");
+  });
+
+  test("an abort stops a trickling body and cancels the stream", async () => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        timer = setInterval(() => controller.enqueue(new TextEncoder().encode("x")), 10);
+      },
+      cancel() {
+        cancelled = true;
+        clearInterval(timer);
+      },
+    });
+    const stub = (async () => new Response(body, { status: 200 })) as typeof fetch;
+    const ctrl = new AbortController();
+    setTimeout(() => ctrl.abort(), 50);
+    await expect(fetchRecordText(stub, BASE, LOCKING_WALLET, ctrl.signal)).rejects.toMatchObject({
+      reason: "timeout",
+    });
+    expect(cancelled).toBe(true);
+    clearInterval(timer);
   });
 
   test("refuses a non-https base", async () => {

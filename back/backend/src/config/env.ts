@@ -84,9 +84,24 @@ const blankAsUnset = (v: unknown): unknown =>
 /** A URL with its trailing slashes removed, so a caller can append "/path" without doubling it. */
 const withoutTrailingSlash = (url: string): string => url.replace(/\/+$/, "");
 
+/** An https URL. False (never a throw) for anything `URL` cannot parse: zod 3 runs a refine even
+ *  after `.url()` failed, and a throw here would crash boot without naming the variable. */
+function isHttpsUrl(raw: string): boolean {
+  try {
+    return new URL(raw).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 /** An https origin and nothing else: no path, query, fragment, port or userinfo. */
 function isHttpsOrigin(raw: string): boolean {
-  const u = new URL(raw);
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return false;
+  }
   return (
     u.protocol === "https:" &&
     u.port === "" &&
@@ -630,7 +645,7 @@ const EnvSchema = z.object({
     z
       .string()
       .url()
-      .refine((u) => new URL(u).protocol === "https:", { message: "must be an https URL" })
+      .refine(isHttpsUrl, { message: "must be an https URL" })
       .default("https://explorer.testnet.arc.io/api"),
   ),
   /** The first block the explorer is asked about: any block before the provider's first post. */

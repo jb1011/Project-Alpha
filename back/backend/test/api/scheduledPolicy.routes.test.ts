@@ -207,6 +207,24 @@ describe("the schedule record", () => {
     expect((await entityView(app, token, id)).scheduledPolicy).toBeNull();
   });
 
+  test("a failed record write after the transaction still answers the schedule", async () => {
+    const app = makeApp();
+    const token = await login(app);
+    const id = seed();
+    const spy = vi.spyOn(repo, "setScheduledPolicy").mockImplementationOnce(() => {
+      throw new Error("SQLITE_BUSY");
+    });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const res = await schedule(app, token, id);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ txHash: TX });
+    expect(
+      log.mock.calls.some(([line]) => String(line).includes("policy_schedule_record_failed")),
+    ).toBe(true);
+    spy.mockRestore();
+    log.mockRestore();
+  });
+
   test("an execute of the same id clears it", async () => {
     const app = makeApp();
     const token = await login(app);

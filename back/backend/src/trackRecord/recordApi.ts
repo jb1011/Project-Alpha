@@ -1,7 +1,7 @@
 import type { Address } from "viem";
 import { z } from "zod";
 import { SsrfError, safeFetch } from "../payments/ssrfGuard";
-import { readCappedText } from "../util/readStreamCapped";
+import { CappedReadAbortedError, readCappedText } from "../util/readStreamCapped";
 
 /** The record body is a few kilobytes; anything near this is not the answer we asked for. */
 export const RECORD_BODY_CAP_BYTES = 256 * 1024;
@@ -52,6 +52,8 @@ const Item = z.object({
  * stripped, including the provider's `score` block, which is not agreed content.
  */
 const RecordAnswer = z.object({
+  /** The wallet the record is about, when the provider says: it must be the one asked for. */
+  address: z.string().max(64).optional(),
   summary: z.object({
     total: count.optional(),
     verified: count.optional(),
@@ -92,8 +94,16 @@ export function safeRecordUrl(raw: string | null | undefined, providerHost: stri
   return u.toString();
 }
 
-/** Parse the provider's body. Throws `RecordSourceError("malformed")` on anything unexpected. */
-export function parseRecordAnswer(text: string, providerHost: string): ParsedRecord {
+/**
+ * Parse the provider's body. Throws `RecordSourceError("malformed")` on anything unexpected,
+ * including a record about another wallet than `wallet` (a cache keyed without the query string,
+ * or a provider bug, would otherwise serve someone else's record as this agent's).
+ */
+export function parseRecordAnswer(
+  text: string,
+  providerHost: string,
+  wallet: Address,
+): ParsedRecord {
   let json: unknown;
   try {
     json = JSON.parse(text);
@@ -102,7 +112,9 @@ export function parseRecordAnswer(text: string, providerHost: string): ParsedRec
   }
   const parsed = RecordAnswer.safeParse(json);
   if (!parsed.success) throw new RecordSourceError("malformed", "record answer has another shape");
-  const { summary, items, recordUrl } = parsed.data;
+  const { address, summary, items, recordUrl } = parsed.data;
+  if (address !== undefined && address.toLowerCase() !== wallet.toLowerCase())
+    throw new RecordSourceError("malformed", "record answer is about another wallet");
 
   let worst: number | null = null;
   for (const item of items) {
@@ -136,7 +148,8 @@ function isAbort(e: unknown): boolean {
  * `RecordSourceError` naming one reason.
  *
  * `signal` covers the body read: `safeFetch` installs its own timer for the request and clears it
- * once the headers arrive, so a body that trickles is cancelled through this signal instead.
+ * once the headers arrive, so a body that trickles is cancelled through this signal instead (the
+ * capped reader holds the stream's lock, so the signal goes to it).
  */
 export async function fetchRecordText(
   fetchImpl: typeof fetch,
@@ -161,10 +174,6 @@ export async function fetchRecordText(
     await res.body?.cancel().catch(() => undefined);
     throw new RecordSourceError("http", `record answered ${res.status}`);
   }
-  const onAbort = () => {
-    res.body?.cancel().catch(() => undefined);
-  };
-  signal?.addEventListener("abort", onAbort, { once: true });
   try {
     return await readCappedText(
       {
@@ -177,13 +186,12 @@ export async function fetchRecordText(
         declared: () => new RecordSourceError("too_large", "record answer declared too large"),
         streamed: () => new RecordSourceError("too_large", "record answer too large"),
       },
+      signal,
     );
   } catch (e) {
     if (e instanceof RecordSourceError) throw e;
-    if (signal?.aborted || isAbort(e))
+    if (e instanceof CappedReadAbortedError || signal?.aborted || isAbort(e))
       throw new RecordSourceError("timeout", "record body timed out");
     throw new RecordSourceError("http", "record body could not be read");
-  } finally {
-    signal?.removeEventListener("abort", onAbort);
   }
 }

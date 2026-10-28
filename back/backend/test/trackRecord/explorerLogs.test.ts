@@ -75,6 +75,12 @@ describe("lastGradedAtFromLogs", () => {
     expect(lastGradedAtFromLogs(answer, QUERY)).toBeNull();
   });
 
+  test("a timestamp beyond what a date can hold drops that log only", () => {
+    const answer = realAnswer();
+    answer.result.push({ ...answer.result[0], timeStamp: "0xffffffffffff" });
+    expect(lastGradedAtFromLogs(answer, QUERY)).toBe("2026-10-21T16:16:25.000Z");
+  });
+
   test("an empty list is no post, not a failure", () => {
     expect(lastGradedAtFromLogs({ message: "No logs found", result: [] }, QUERY)).toBeNull();
   });

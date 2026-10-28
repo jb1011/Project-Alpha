@@ -104,6 +104,15 @@ describe("cfg.externalRecord", () => {
     ).toMatch(/EXTERNAL_RECORD_API_BASE/);
   });
 
+  test("a value that is not a URL is refused naming its variable, never a bare TypeError", () => {
+    expect(
+      thrownBy(() => loadConfig({ ...BASE, ...RECORD, EXTERNAL_RECORD_API_BASE: "not a url" })),
+    ).toMatch(/EXTERNAL_RECORD_API_BASE/);
+    expect(thrownBy(() => loadConfig({ ...BASE, EXTERNAL_RECORD_EXPLORER_API: "nope" }))).toMatch(
+      /EXTERNAL_RECORD_EXPLORER_API/,
+    );
+  });
+
   test("refuses a poster that is not an address", () => {
     expect(
       thrownBy(() => loadConfig({ ...BASE, ...RECORD, EXTERNAL_RECORD_POSTER: "0x1234" })),

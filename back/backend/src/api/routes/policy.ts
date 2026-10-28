@@ -2,6 +2,7 @@ import type { Hono } from "hono";
 import { getAddress } from "viem";
 import { z } from "zod";
 import type { AuthVars } from "../../auth/middleware";
+import { opsLog } from "../../observability/opsLog";
 import { computePolicyId } from "../../policy/policyId";
 import { usdToUnits } from "../../policy/units";
 import type { Address } from "../../types";
@@ -50,20 +51,31 @@ export function mountPolicyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
     // Checksummed first: viem refuses a mixed-case address with a wrong checksum, and a throw here,
     // after the transaction, would answer an error for a change that is scheduled.
     const payout = getAddress(change.newPayout);
-    deps.repo.setScheduledPolicy(id, {
-      policyId: computePolicyId({
-        cap: change.newCap,
-        period: change.newPeriod,
+    // The change is scheduled on chain whatever happens here: a failed write is logged, never
+    // answered as a failed schedule. The page then shows the change until it is reloaded.
+    try {
+      deps.repo.setScheduledPolicy(id, {
+        policyId: computePolicyId({
+          cap: change.newCap,
+          period: change.newPeriod,
+          allowlistOn: change.allowlistOn,
+          payout,
+        }),
+        cap: change.newCap.toString(),
+        period: change.newPeriod.toString(),
         allowlistOn: change.allowlistOn,
         payout,
-      }),
-      cap: change.newCap.toString(),
-      period: change.newPeriod.toString(),
-      allowlistOn: change.allowlistOn,
-      payout,
-      txHash,
-      scheduledAt: new Date((deps.now ?? Date.now)()).toISOString(),
-    });
+        txHash,
+        scheduledAt: new Date((deps.now ?? Date.now)()).toISOString(),
+      });
+    } catch (e) {
+      opsLog("policy_schedule_record_failed", {
+        level: "warn",
+        entityId: id,
+        txHash,
+        message: e instanceof Error ? e.message : String(e),
+      });
+    }
     return c.json({ txHash });
   });
 
@@ -76,9 +88,19 @@ export function mountPolicyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
     const txHash = await deps.arc.executePolicyUpdate(treasury, policyId as `0x${string}`, manager);
     // The executed change is no longer pending. Only the matching record is cleared: executing
     // some other id leaves the record of this backend's own schedule for the chain to judge.
-    const scheduled = deps.repo.findByIdempotencyKey(id)?.scheduledPolicy;
-    if (scheduled && scheduled.policyId.toLowerCase() === policyId.toLowerCase())
-      deps.repo.setScheduledPolicy(id, null);
+    try {
+      const scheduled = deps.repo.findByIdempotencyKey(id)?.scheduledPolicy;
+      if (scheduled && scheduled.policyId.toLowerCase() === policyId.toLowerCase())
+        deps.repo.setScheduledPolicy(id, null);
+    } catch (e) {
+      // Executed on chain all the same; a stale record is harmless (the page checks the chain).
+      opsLog("policy_schedule_record_failed", {
+        level: "warn",
+        entityId: id,
+        txHash,
+        message: e instanceof Error ? e.message : String(e),
+      });
+    }
     return c.json({ txHash });
   });
 }

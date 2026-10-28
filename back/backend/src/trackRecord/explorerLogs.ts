@@ -54,6 +54,8 @@ export function explorerLogsUrl(q: ExplorerLogsQuery): string {
 }
 
 const HEX_QUANTITY = /^0x[0-9a-fA-F]{1,16}$/;
+/** The last second a JavaScript `Date` can represent (8.64e15 ms). */
+const MAX_DATE_SECONDS = 8_640_000_000_000;
 const TX_HASH = /^0x[0-9a-fA-F]{64}$/;
 
 /**
@@ -95,7 +97,8 @@ export function lastGradedAtFromLogs(answer: unknown, q: ExplorerLogsQuery): str
     if (typeof l.timeStamp !== "string" || !HEX_QUANTITY.test(l.timeStamp)) continue;
     if (typeof l.transactionHash !== "string" || !TX_HASH.test(l.transactionHash)) continue;
     const seconds = Number.parseInt(l.timeStamp, 16);
-    if (!Number.isSafeInteger(seconds)) continue;
+    // Beyond what a `Date` can hold, `toISOString` would throw and lose every other log's date.
+    if (!Number.isSafeInteger(seconds) || seconds > MAX_DATE_SECONDS) continue;
     if (latest === null || seconds > latest) latest = seconds;
   }
   return latest === null ? null : new Date(latest * 1000).toISOString();
@@ -130,10 +133,6 @@ export async function fetchExplorerJson(
     await res.body?.cancel().catch(() => undefined);
     throw new ExplorerAnswerError(`explorer answered ${res.status}`);
   }
-  const onAbort = () => {
-    res.body?.cancel().catch(() => undefined);
-  };
-  signal?.addEventListener("abort", onAbort, { once: true });
   try {
     const text = await readCappedText(
       {
@@ -146,12 +145,11 @@ export async function fetchExplorerJson(
         declared: () => new ExplorerAnswerError("explorer answer declared too large"),
         streamed: () => new ExplorerAnswerError("explorer answer too large"),
       },
+      signal,
     );
     return JSON.parse(text) as unknown;
   } catch (e) {
     if (e instanceof ExplorerAnswerError) throw e;
     throw new ExplorerAnswerError("explorer answer could not be read");
-  } finally {
-    signal?.removeEventListener("abort", onAbort);
   }
 }

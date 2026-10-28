@@ -115,7 +115,7 @@ async function readRecordHalf(deps: ExternalRecordReadDeps, agentId: bigint): Pr
     return { half: { status: "unavailable", reason, lockingWallet }, recordUrl: null };
   }
   try {
-    const parsed = parseRecordAnswer(text, new URL(deps.config.apiBase).host);
+    const parsed = parseRecordAnswer(text, new URL(deps.config.apiBase).host, lockingWallet);
     return {
       half: {
         status: "ok",

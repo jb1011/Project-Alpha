@@ -38,16 +38,31 @@ export interface CappedErrors {
   streamed: (soFar: number) => Error;
 }
 
+/** Thrown when the caller's signal aborts the read: the bytes so far are not the body. */
+export class CappedReadAbortedError extends Error {
+  constructor() {
+    super("body read aborted");
+    this.name = "CappedReadAbortedError";
+  }
+}
+
 /**
  * Read a body under a running byte cap. Returns the bytes, or throws one of the caller's errors.
+ *
+ * `signal` (optional) bounds the read in time as well as in size: on abort the reader this
+ * function holds is cancelled, which frees the socket, and the read throws
+ * `CappedReadAbortedError`. Cancelling the body from outside cannot do that once `getReader()`
+ * has locked the stream, so the signal has to reach the reader here.
  */
 export async function readCappedStream(
   source: CappedSource,
   max: number,
   errors: CappedErrors,
+  signal?: AbortSignal,
 ): Promise<Buffer> {
   const declared = Number(source.contentLength ?? Number.NaN);
   if (Number.isFinite(declared) && declared > max) throw errors.declared(declared);
+  if (signal?.aborted) throw new CappedReadAbortedError();
 
   const body = source.body;
   if (!body || typeof body.getReader !== "function") {
@@ -58,20 +73,32 @@ export async function readCappedStream(
   }
 
   const reader = body.getReader();
+  const onAbort = () => {
+    reader.cancel().catch(() => {
+      // the throw after the loop is the real signal
+    });
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
   const chunks: Buffer[] = [];
   let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (!value) continue;
-    total += value.byteLength;
-    if (total > max) {
-      await reader.cancel().catch(() => {
-        // the throw below is the real signal; a failed cancel must not mask it
-      });
-      throw errors.streamed(total);
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      // A cancelled reader ends as if the body had: never hand back a truncated body.
+      if (signal?.aborted) throw new CappedReadAbortedError();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > max) {
+        await reader.cancel().catch(() => {
+          // the throw below is the real signal; a failed cancel must not mask it
+        });
+        throw errors.streamed(total);
+      }
+      chunks.push(Buffer.from(value));
     }
-    chunks.push(Buffer.from(value));
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
   }
   return Buffer.concat(chunks);
 }
@@ -81,6 +108,7 @@ export async function readCappedText(
   source: CappedSource,
   max: number,
   errors: CappedErrors,
+  signal?: AbortSignal,
 ): Promise<string> {
-  return (await readCappedStream(source, max, errors)).toString("utf8");
+  return (await readCappedStream(source, max, errors, signal)).toString("utf8");
 }
