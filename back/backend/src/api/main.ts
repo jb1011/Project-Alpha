@@ -106,6 +106,7 @@ import {
 } from "../persistence/tier0";
 import { SqliteWorldStore } from "../persistence/worldStore";
 import { usdToUnits } from "../policy/units";
+import { externalRecordDeps } from "../trackRecord/sources";
 import type { Address } from "../types";
 import { TaskTracker } from "../util/taskTracker";
 import { reconcileAgentBook } from "../workflow/agentBookReconcile";
@@ -1169,6 +1170,16 @@ async function main() {
     // drops the x402 headers and CORS; unset, the quote keeps the request's own URL, as before.
     publicApiUrl: cfg.publicApiUrl,
     linkCodes: new SqliteLinkCodeStore(db),
+    // The external track record (design 2026-10-23), where a provider is configured: the same
+    // read client and the same identity read the rest of the box uses.
+    externalRecord: cfg.externalRecord
+      ? externalRecordDeps({
+          config: cfg.externalRecord,
+          publicClient,
+          registry: cfg.reputationRegistry,
+          readMetadata: (agentId, key) => arc.getAgentMetadata(agentId, key),
+        })
+      : undefined,
     payments,
     pocketFunding,
     x402Demo,

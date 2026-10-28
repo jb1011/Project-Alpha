@@ -1,6 +1,8 @@
 import type { Hono } from "hono";
+import { getAddress } from "viem";
 import { z } from "zod";
 import type { AuthVars } from "../../auth/middleware";
+import { computePolicyId } from "../../policy/policyId";
 import { usdToUnits } from "../../policy/units";
 import type { Address } from "../../types";
 import type { ApiDeps } from "../app";
@@ -31,27 +33,52 @@ export function mountPolicyRoutes(app: Hono<{ Variables: AuthVars }>, deps: ApiD
   }
 
   app.post("/entities/:id/policy", async (c) => {
-    const { treasury, manager } = ownedTreasury(c.req.param("id"), c.get("tenantId"));
+    const id = c.req.param("id");
+    const { treasury, manager } = ownedTreasury(id, c.get("tenantId"));
     const b = ScheduleBody.parse(await c.req.json());
-    const txHash = await deps.arc.schedulePolicyUpdate(
-      treasury,
-      {
-        newCap: usdToUnits(b.capUsdc),
-        newPeriod: BigInt(b.periodSeconds),
-        allowlistOn: b.allowlistOn,
-        newPayout: b.payoutAddress as Address,
-      },
-      manager,
-    );
+    const change = {
+      newCap: usdToUnits(b.capUsdc),
+      newPeriod: BigInt(b.periodSeconds),
+      allowlistOn: b.allowlistOn,
+      newPayout: b.payoutAddress as Address,
+    };
+    // Confirmed on chain when it returns (`sendManagerCallConfirmed`).
+    const txHash = await deps.arc.schedulePolicyUpdate(treasury, change, manager);
+    // Remember what was scheduled, so the pending change survives a page reload (design
+    // 2026-10-23, section 4.5). The id is the treasury's own, computed from the same tuple; the
+    // interface shows the record only after the treasury confirms it is still pending.
+    // Checksummed first: viem refuses a mixed-case address with a wrong checksum, and a throw here,
+    // after the transaction, would answer an error for a change that is scheduled.
+    const payout = getAddress(change.newPayout);
+    deps.repo.setScheduledPolicy(id, {
+      policyId: computePolicyId({
+        cap: change.newCap,
+        period: change.newPeriod,
+        allowlistOn: change.allowlistOn,
+        payout,
+      }),
+      cap: change.newCap.toString(),
+      period: change.newPeriod.toString(),
+      allowlistOn: change.allowlistOn,
+      payout,
+      txHash,
+      scheduledAt: new Date((deps.now ?? Date.now)()).toISOString(),
+    });
     return c.json({ txHash });
   });
 
   app.post("/entities/:id/policy/execute", async (c) => {
-    const { treasury, manager } = ownedTreasury(c.req.param("id"), c.get("tenantId"));
+    const id = c.req.param("id");
+    const { treasury, manager } = ownedTreasury(id, c.get("tenantId"));
     const { policyId } = z
       .object({ policyId: z.string().regex(/^0x[0-9a-fA-F]{64}$/) })
       .parse(await c.req.json());
     const txHash = await deps.arc.executePolicyUpdate(treasury, policyId as `0x${string}`, manager);
+    // The executed change is no longer pending. Only the matching record is cleared: executing
+    // some other id leaves the record of this backend's own schedule for the chain to judge.
+    const scheduled = deps.repo.findByIdempotencyKey(id)?.scheduledPolicy;
+    if (scheduled && scheduled.policyId.toLowerCase() === policyId.toLowerCase())
+      deps.repo.setScheduledPolicy(id, null);
     return c.json({ txHash });
   });
 }

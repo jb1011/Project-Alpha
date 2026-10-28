@@ -1,0 +1,48 @@
+{
+  "address": "0x33F283b1d6e9a12b0F79289C75617E6c0f56Aff8",
+  "summary": {
+    "total": 2,
+    "verified": 0,
+    "running": 2,
+    "abandoned": 0,
+    "marketCalls": {
+      "correct": 0,
+      "wrong": 0,
+      "void": 0
+    }
+  },
+  "score": {
+    "version": "aevum-score-v1",
+    "counted": 0,
+    "correct": 0,
+    "wrong": 0,
+    "abandoned": 0,
+    "minCalls": 5,
+    "hitRate": null,
+    "avgMoveBps": null,
+    "value": null,
+    "status": "too_few",
+    "label": "Too few calls to judge (0 of 5)"
+  },
+  "items": [
+    {
+      "id": 12,
+      "lockedAt": "2026-10-26T15:13:47.000Z",
+      "windowEnd": "2026-11-02T15:13:47.000Z",
+      "status": "running",
+      "result": null,
+      "certificateId": null
+    },
+    {
+      "id": 11,
+      "lockedAt": "2026-10-26T15:10:11.000Z",
+      "windowEnd": "2026-11-02T15:10:11.000Z",
+      "status": "running",
+      "result": null,
+      "certificateId": null
+    }
+  ],
+  "recordUrl": "https://app.aevumprotocol.io/check/0x33F283b1d6e9a12b0F79289C75617E6c0f56Aff8",
+  "badgeUrl": "https://app.aevumprotocol.io/api/record?address=0x33F283b1d6e9a12b0F79289C75617E6c0f56Aff8&format=svg",
+  "source": "Aevum VBO v2, Ethereum mainnet 0xEd3309a515CA607c4687f096D6E60E639e03D793"
+}

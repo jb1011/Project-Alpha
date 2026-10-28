@@ -24,6 +24,7 @@ import { mountCustomerCompanyRoutes } from "./routes/customerCompanies";
 import { mountDocumentRoutes } from "./routes/documents";
 import { type DoolaWebhookDeps, mountDoolaWebhookRoutes } from "./routes/doolaWebhook";
 import { mountEnsGatewayRoutes } from "./routes/ensGateway";
+import { type ExternalRecordDeps, mountExternalRecordRoutes } from "./routes/externalRecord";
 import { mountFormationRulesRoutes } from "./routes/formationRules";
 import { mountJobRoutes } from "./routes/jobs";
 import { mountLegalBodyRoutes } from "./routes/legalBodies";
@@ -304,6 +305,12 @@ export interface ApiDeps extends EntityViewDeps {
    * and refusing, which would still advertise a capability this deployment does not have.
    */
   hedera?: import("../hedera/policy").HederaDeps;
+  /**
+   * The external track record on the guardian's settings screen (design 2026-10-23). Present only
+   * where `cfg.externalRecord` is configured (testnet only); absent, the route is not mounted
+   * (404) and `/config.externalRecord.available` is false, so the card never renders.
+   */
+  externalRecord?: ExternalRecordDeps;
   /** S2 standing-float-ceiling reads for GET /entities/:id/treasury (dashboard). `read` is the same
    *  wiring as entityPayment.status()'s `standing` (payments/standingExposure.ts#buildReadExposure);
    *  `ceilingAtomic` is the configured MAX_POCKET_FLOAT_USDC, atomic USDC string. Optional for the
@@ -458,6 +465,13 @@ export function buildApiApp(deps: ApiDeps) {
       // client learns the chain, the registry, the factory and the link window from here rather
       // than from its own build. See `legalBodyConfigOf`.
       legalBodies: legalBodyConfigOf(deps),
+      // Whether the settings screen shows the external track record, and the provider's one word
+      // for it. A boolean and a public name, within this route's rule: the poster, the tags and
+      // the record API stay on the box.
+      externalRecord: {
+        available: Boolean(deps.externalRecord),
+        providerName: deps.externalRecord?.providerName ?? null,
+      },
     }),
   );
   mountSchemaRoutes(app);
@@ -542,6 +556,9 @@ export function buildApiApp(deps: ApiDeps) {
   mountRunsRoutes(app, deps);
   mountJobRoutes(app, deps);
   mountReputationRoutes(app, deps);
+  // Under the `/entities/*` auth above, and only where the deployment configures a provider.
+  if (deps.externalRecord)
+    mountExternalRecordRoutes(app, { ...deps, externalRecord: deps.externalRecord });
   mountMcpRoute(app, deps);
   return app;
 }

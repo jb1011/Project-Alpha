@@ -126,4 +126,27 @@ export interface EntityRecord {
   hederaRegisterTx?: string | null;
   /** The UAID computed for this entity's Hedera identity (design D10). */
   uaid?: string | null;
+  /**
+   * The treasury policy change this backend last scheduled and has not seen executed
+   * (design 2026-10-23, section 4.5). A record of what was SENT, never the chain's state: a
+   * guardian veto leaves it standing, so a reader confirms `pendingPolicy(policyId).exists` on the
+   * treasury before showing it. Written only by `setScheduledPolicy`; `upsert` never touches it.
+   */
+  scheduledPolicy?: ScheduledPolicyRecord | null;
+}
+
+/** A scheduled treasury policy change, as the schedule route sent it. */
+export interface ScheduledPolicyRecord {
+  /** `AgentTreasury._policyId` of the tuple below. */
+  policyId: Hex;
+  /** Atomic USDC (6 decimals), decimal string. */
+  cap: string;
+  /** Seconds, decimal string. */
+  period: string;
+  allowlistOn: boolean;
+  payout: Address;
+  /** The confirmed schedule transaction. */
+  txHash: Hex;
+  /** ISO 8601, when the schedule was confirmed. */
+  scheduledAt: string;
 }

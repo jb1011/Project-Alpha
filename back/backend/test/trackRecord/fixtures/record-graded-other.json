@@ -1,0 +1,58 @@
+{
+  "address": "0xbc2C6f49C34ae735a5A85cBC637b83B875d352e5",
+  "summary": {
+    "total": 2,
+    "verified": 1,
+    "running": 1,
+    "abandoned": 0,
+    "marketCalls": {
+      "correct": 0,
+      "wrong": 1,
+      "void": 0
+    }
+  },
+  "score": {
+    "version": "aevum-score-v1",
+    "counted": 1,
+    "correct": 0,
+    "wrong": 1,
+    "abandoned": 0,
+    "minCalls": 5,
+    "hitRate": 0,
+    "avgMoveBps": -314,
+    "value": null,
+    "status": "too_few",
+    "label": "Too few calls to judge (1 of 5)"
+  },
+  "items": [
+    {
+      "id": 8,
+      "lockedAt": "2026-10-21T06:35:35.000Z",
+      "windowEnd": "2026-11-04T06:35:35.000Z",
+      "status": "running",
+      "result": null,
+      "certificateId": null
+    },
+    {
+      "id": 5,
+      "lockedAt": "2026-10-06T03:02:35.000Z",
+      "windowEnd": "2026-10-13T03:02:35.000Z",
+      "status": "verified",
+      "result": "wrong",
+      "certificateId": 1,
+      "marketCall": {
+        "asset": "BTC/USD",
+        "direction": "up",
+        "priceAtLock": 85532.63,
+        "priceAtClose": 82839.1,
+        "target": null,
+        "priceChangeBps": -314,
+        "moveBps": -314,
+        "gradedBy": "atlas-oracle"
+      }
+    }
+  ],
+  "recordUrl": "https://app.aevumprotocol.io/check/0xbc2C6f49C34ae735a5A85cBC637b83B875d352e5",
+  "badgeUrl": "https://app.aevumprotocol.io/api/record?address=0xbc2C6f49C34ae735a5A85cBC637b83B875d352e5&format=svg",
+  "source": "Aevum VBO v2, Ethereum mainnet 0xEd3309a515CA607c4687f096D6E60E639e03D793"
+}

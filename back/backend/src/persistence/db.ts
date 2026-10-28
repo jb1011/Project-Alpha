@@ -1912,6 +1912,10 @@ export function migrate(db: Database.Database): void {
     ["hedera_agent_id", "TEXT"],
     ["hedera_register_tx", "TEXT"],
     ["uaid", "TEXT"],
+    // The policy change this backend scheduled and has not seen executed (design 2026-10-23,
+    // section 4.5): JSON, written only by `setScheduledPolicy`, so a pending change survives a
+    // page reload. NULL on every existing row, which reads as nothing scheduled.
+    ["scheduled_policy_json", "TEXT"],
   ] as const)
     if (!cols.includes(col)) db.exec(`ALTER TABLE entities ADD COLUMN ${col} ${type}`);
 

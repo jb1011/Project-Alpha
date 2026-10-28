@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { redactPii } from "../formation/pii";
-import type { Address, EntityRecord, Hex, TreasuryConfig } from "../types";
+import type { Address, EntityRecord, Hex, ScheduledPolicyRecord, TreasuryConfig } from "../types";
 
 export interface EventRow {
   step: string;
@@ -86,6 +86,12 @@ export interface EntityRepository {
   ): void;
   /** Record the Hedera identity registration for an entity (`hedera-register-identity.mts`). */
   setHederaIdentity(key: string, id: { agentId: string; registerTx: string; uaid: string }): void;
+  /**
+   * Record (or clear, with null) the policy change this backend scheduled for an entity
+   * (design 2026-10-23, section 4.5). The ONLY writer of `scheduled_policy_json`: `upsert` leaves
+   * the column out of its column list, so no ordinary record write can erase a pending schedule.
+   */
+  setScheduledPolicy(key: string, policy: ScheduledPolicyRecord | null): void;
   /** Run fn inside a single SQLite transaction (atomic; rolls back if fn throws). */
   transaction<T>(fn: () => T): T;
   /**
@@ -224,6 +230,7 @@ interface Row {
   hedera_agent_id: string | null;
   hedera_register_tx: string | null;
   uaid: string | null;
+  scheduled_policy_json: string | null;
 }
 
 function serializeTreasury(tc: TreasuryConfig | null): string | null {
@@ -301,7 +308,32 @@ function toRecord(r: Row): EntityRecord {
     hederaAgentId: r.hedera_agent_id ?? null,
     hederaRegisterTx: r.hedera_register_tx ?? null,
     uaid: r.uaid ?? null,
+    scheduledPolicy: parseScheduledPolicy(r.scheduled_policy_json),
   };
+}
+
+/**
+ * The stored schedule record, or null. A row that does not parse reads as nothing scheduled: the
+ * record is a convenience the chain confirms, and a broken one must not take the entity down.
+ */
+function parseScheduledPolicy(raw: string | null | undefined): ScheduledPolicyRecord | null {
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw) as Partial<ScheduledPolicyRecord>;
+    if (
+      typeof v.policyId !== "string" ||
+      typeof v.cap !== "string" ||
+      typeof v.period !== "string" ||
+      typeof v.allowlistOn !== "boolean" ||
+      typeof v.payout !== "string" ||
+      typeof v.txHash !== "string" ||
+      typeof v.scheduledAt !== "string"
+    )
+      return null;
+    return v as ScheduledPolicyRecord;
+  } catch {
+    return null;
+  }
 }
 
 export class SqliteEntityRepository implements EntityRepository {
@@ -570,6 +602,14 @@ export class SqliteEntityRepository implements EntityRepository {
         "UPDATE entities SET hedera_agent_id=?, hedera_register_tx=?, uaid=?, updated_at=CURRENT_TIMESTAMP WHERE idempotency_key=?",
       )
       .run(id.agentId, id.registerTx, id.uaid, key);
+  }
+
+  setScheduledPolicy(key: string, policy: ScheduledPolicyRecord | null): void {
+    this.db
+      .prepare(
+        "UPDATE entities SET scheduled_policy_json=?, updated_at=CURRENT_TIMESTAMP WHERE idempotency_key=?",
+      )
+      .run(policy ? JSON.stringify(policy) : null, key);
   }
 
   /** Run fn inside a single SQLite transaction (atomic; rolls back if fn throws). */

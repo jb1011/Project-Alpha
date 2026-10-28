@@ -76,6 +76,10 @@ const AGENTBOOK_OFF = { agentBookRegistrationAvailable: false };
  *  fixture in this file is such a deployment. */
 const LEGAL_BODIES_OFF = { legalBodies: { available: false } };
 
+/** What a deployment with no track-record provider advertises: no card. Every fixture in this
+ *  file is such a deployment. */
+const EXTERNAL_RECORD_OFF = { externalRecord: { available: false, providerName: null } };
+
 let db: Database.Database;
 let repo: SqliteEntityRepository;
 beforeEach(() => {
@@ -264,6 +268,7 @@ test("GET /config is public and reports this deployment's custody capabilities",
     ...FORMATION_OFF,
     ...AGENTBOOK_OFF,
     ...LEGAL_BODIES_OFF,
+    ...EXTERNAL_RECORD_OFF,
   });
 
   // A turnkey-only deployment (the pre-Tier-0 shape: Turnkey creds, no Circle creds) must
@@ -276,6 +281,7 @@ test("GET /config is public and reports this deployment's custody capabilities",
     ...FORMATION_OFF,
     ...AGENTBOOK_OFF,
     ...LEGAL_BODIES_OFF,
+    ...EXTERNAL_RECORD_OFF,
   });
 
   // A genuinely bare deployment (no creds at all — the dev/CI shape that still boots) advertises
@@ -289,6 +295,7 @@ test("GET /config is public and reports this deployment's custody capabilities",
     ...FORMATION_OFF,
     ...AGENTBOOK_OFF,
     ...LEGAL_BODIES_OFF,
+    ...EXTERNAL_RECORD_OFF,
   });
 
   // The mainnet shape: circle-only, so the wizard hides the turnkey card instead of offering
@@ -301,6 +308,7 @@ test("GET /config is public and reports this deployment's custody capabilities",
     ...FORMATION_OFF,
     ...AGENTBOOK_OFF,
     ...LEGAL_BODIES_OFF,
+    ...EXTERNAL_RECORD_OFF,
   });
 });
 
@@ -329,6 +337,7 @@ test("GET /config reports formation availability and its ENVIRONMENT (honesty in
     formationCopy: FORMATION_COPY,
     ...AGENTBOOK_OFF,
     ...LEGAL_BODIES_OFF,
+    ...EXTERNAL_RECORD_OFF,
   });
 
   // Production formation is a DIFFERENT advertised value, never a missing one: the environment is

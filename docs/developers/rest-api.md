@@ -33,13 +33,14 @@ This is a map, not an OpenAPI dump. Field level schemas live in the backend and 
 | `GET` | `/entities/:id` | Poll until `bound` |
 | `POST` | `/entities/:id/fund` | Platform fund (provision class) |
 | `GET` | `/entities/:id/reputation` | ERC-8004 reputation view |
+| `GET` | `/entities/:id/external-record` | Graded record from the configured track-record provider (testnet; only where `EXTERNAL_RECORD_*` is set) |
 | `GET` | `/entities/:id/agentbook` | Human backing lookup (**pocket** address) |
 
 ## Policy, treasury, trust
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/entities/:id/policy` | Manager schedules an on chain policy update |
+| `POST` | `/entities/:id/policy` | Manager schedules an on chain policy update; `GET /entities/:id` then carries it as `scheduledPolicy` until executed |
 | `GET` / `POST` | `/entities/:id/per-tx-cap` | Software per transaction cap |
 | `GET` / `POST` | trust policy routes | Seller / buyer dials where exposed |
 | treasury routes | status, pause related reads | Dashboard |

@@ -30,7 +30,7 @@ import {
 } from "../persistence/documentIndexRepository";
 import { parseDetail } from "../persistence/formationRepository";
 import type { FormationRequestRecord } from "../persistence/formationRepository";
-import type { EntityRecord } from "../types";
+import type { EntityRecord, ScheduledPolicyRecord } from "../types";
 import { parseSqliteUtc } from "../util/sqliteTime";
 import { usesManifestScheme } from "../workflow/onboarding";
 
@@ -366,6 +366,13 @@ export interface EntityView {
   /** Tier-0 custody provider; null = legacy pre-Tier-0 row (behaves as "turnkey"). */
   walletProvider: "turnkey" | "circle" | null;
   /**
+   * The treasury policy change this backend scheduled and has not seen executed (design
+   * 2026-10-23, section 4.5), or null. What was SENT, not the chain's state: a veto leaves it
+   * standing, so the settings screen shows it only after `pendingPolicy(policyId).exists` on the
+   * treasury, and takes `executableAt` from the chain.
+   */
+  scheduledPolicy: ScheduledPolicyRecord | null;
+  /**
    * What `oaHash` COMMITS to — as a discriminated union, not a version number a surface has to
    * interpret.
    *
@@ -517,6 +524,7 @@ export function toEntityView(r: EntityRecord, deps: EntityViewDeps = {}): Entity
     rootPasskeyId: r.rootPasskeyId ?? null,
     // Tier-0 custody badge: null (legacy pre-Tier-0 rows) reads as "turnkey" downstream.
     walletProvider: r.walletProvider ?? null,
+    scheduledPolicy: r.scheduledPolicy ?? null,
     // ONE predicate, imported from the saga that derives the anchor: a surface that decided the
     // scheme for itself could describe an entity differently from the code that anchored it.
     oaAnchor: usesManifestScheme(r)
