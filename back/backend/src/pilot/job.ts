@@ -192,13 +192,36 @@ function timeLeftProblemOf(
   return expiryProblemOf(mode, secondsLeft);
 }
 
+/**
+ * The case an error belongs to, once a row exists: `createPilotJob` sets it on whatever it
+ * rethrows after the insert, and on every failure of a resume, so the caller can name the case
+ * to resume. The error itself is the original, with its class and its hash.
+ */
+export function pilotCaseIdOf(e: unknown): string | undefined {
+  const id = (e as { pilotCaseId?: unknown } | null)?.pilotCaseId;
+  return typeof id === "string" ? id : undefined;
+}
+
+/** Marks `e` as a failure of pilot case `caseId` (see `pilotCaseIdOf`) and returns it. */
+export function withPilotCaseId<E>(e: E, caseId: string): E {
+  if (typeof e === "object" && e !== null && Object.isExtensible(e))
+    Object.defineProperty(e, "pilotCaseId", { value: caseId, enumerable: false });
+  return e;
+}
+
 /** Pre-flight, then create, budget and fund, submit; resumable from created and funded. */
 export async function createPilotJob(
   d: PilotJobDeps,
   input: CreatePilotJobInput,
   resumeCaseId?: string,
 ): Promise<PilotCaseRecord> {
-  if (resumeCaseId !== undefined) return resume(d, input, resumable(d, input, resumeCaseId));
+  if (resumeCaseId !== undefined) {
+    try {
+      return await resume(d, input, resumable(d, input, resumeCaseId));
+    } catch (e) {
+      throw withPilotCaseId(e, resumeCaseId);
+    }
+  }
 
   const pre = await preflightPilotJob(d, input);
   if (!pre.ok) throw new Error(`refusing to create the pilot job: ${pre.problem}`);
@@ -238,8 +261,12 @@ export async function createPilotJob(
     d.cases.patch(caseId, { jobId: jobId.toString(), createTxHash: txHash });
     d.cases.recordEvent(caseId, "create", "mined", txHash, null);
   });
-  const row = d.cases.patch(caseId, { createdBlockTime: await blockTimeOf(chain, txHash) });
-  return continueCase(d, input, row);
+  try {
+    const row = d.cases.patch(caseId, { createdBlockTime: await blockTimeOf(chain, txHash) });
+    return await continueCase(d, input, row);
+  } catch (e) {
+    throw withPilotCaseId(e, caseId);
+  }
 }
 
 /** The row to resume, or a refusal: it must exist, be at created or funded, and be this mode's. */

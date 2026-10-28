@@ -25,7 +25,12 @@ import { type MockInstance, afterEach, describe, expect, test, vi } from "vitest
 import { anvilChain } from "../../src/chains";
 import { type PilotCommandDeps, registerPilotCommands } from "../../src/cli/pilot";
 import type { Config } from "../../src/config/env";
-import { ChainTxRevertedError, JobFundUnconfirmedError } from "../../src/errors";
+import {
+  ChainTxRevertedError,
+  ChainTxUnconfirmedError,
+  JobFundRevertedError,
+  JobFundUnconfirmedError,
+} from "../../src/errors";
 import { migrate } from "../../src/persistence/db";
 import { FileDocumentStore } from "../../src/persistence/documentStore";
 import {
@@ -34,7 +39,7 @@ import {
   newCaseId,
 } from "../../src/pilot/casesRepository";
 import type { PilotContext } from "../../src/pilot/context";
-import type { CreatePilotJobInput } from "../../src/pilot/job";
+import { type CreatePilotJobInput, withPilotCaseId } from "../../src/pilot/job";
 import type { PilotCaseRecord, PilotMode, PilotStatus } from "../../src/pilot/types";
 
 // Anvil's well-known throwaway keys (accounts 1, 2, 3): never real.
@@ -779,7 +784,7 @@ describe("pilot:case fail", () => {
     expect(printed.case.status).toBe("failed");
     expect(fake.cases.find(row.caseId)?.error).toBe("the seller key was lost");
     expect(fake.cases.events(row.caseId)).toMatchObject([
-      { step: "failed", status: "ok", detail: "the seller key was lost" },
+      { step: "failed", status: "ok", detail: expect.stringMatching(/^the seller key was lost; /) },
     ]);
   });
 
@@ -900,7 +905,7 @@ describe("pilot:case fail: the cap's statuses need --force to fail", () => {
       await run(fake, ["pilot:case", "fail", row.caseId, "--reason", "x", "--yes"]),
     );
     expect(fake.cases.find(row.caseId)?.status).toBe("failed");
-    expect(fake.cases.events(row.caseId).at(-1)?.detail).toBe("x");
+    expect(fake.cases.events(row.caseId).at(-1)?.detail).toMatch(/^x; the job still holds/);
     expect(printed.note).not.toContain("forced");
   });
 });
@@ -1041,5 +1046,182 @@ describe("pilot:job: the default pre-flight wiring", () => {
     expect(printed.buyerBalanceAtomic).toBe("5250000");
     expect(fake.createJob).not.toHaveBeenCalled();
     expectNothingSent(fake);
+  });
+});
+
+/** Runs a `pilot:job --yes` that fails; returns the parsed print and the thrown error. */
+async function failingJob(
+  fake: Fake,
+  error: Error,
+  argv: string[] = jobArgs(["--yes"]),
+): Promise<{ printed: Record<string, unknown>; thrown: unknown }> {
+  fake.createJob.mockRejectedValueOnce(error);
+  const logs: string[] = [];
+  const spy = vi.spyOn(console, "log").mockImplementation((m) => logs.push(String(m)));
+  const program = new Command();
+  program.exitOverride();
+  registerPilotCommands(program, fake.open, fake.deps);
+  let thrown: unknown;
+  try {
+    await program.parseAsync(["node", "cli", ...argv]);
+  } catch (e) {
+    thrown = e;
+  } finally {
+    spy.mockRestore();
+  }
+  return { printed: JSON.parse(logs.join("\n")), thrown };
+}
+
+describe("pilot:job --yes: a failure after the case exists names the case to resume", () => {
+  test("a reverted fund prints the case id, its status, the hash and the resume line", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { status: "created", patch: { jobId: "7" } });
+    const error = withPilotCaseId(new JobFundRevertedError("fund", FAKE_TX, 7n), row.caseId);
+    const { printed, thrown } = await failingJob(fake, error);
+    expect(thrown).toBe(error);
+    expect(printed).toMatchObject({
+      failed: true,
+      caseId: row.caseId,
+      status: "created",
+      txHash: FAKE_TX,
+      next: `wait until the transaction is mined or dropped, then run the same command with --resume ${row.caseId} --yes`,
+    });
+    expect(String(printed.error)).toContain("failed at the fund step");
+  });
+
+  test("an unconfirmed submit prints the case id, the hash and the resume line, with no em dash", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { status: "funded", patch: { jobId: "7" } });
+    const error = withPilotCaseId(new ChainTxUnconfirmedError("submit", FAKE_TX), row.caseId);
+    expect(error.message).toContain("—");
+    const { printed } = await failingJob(fake, error);
+    expect(printed).toMatchObject({
+      failed: true,
+      caseId: row.caseId,
+      status: "funded",
+      txHash: FAKE_TX,
+    });
+    expect(String(printed.next)).toContain(`--resume ${row.caseId} --yes`);
+    expect(String(printed.error)).not.toContain("—");
+    expect(String(printed.error)).toContain("could not confirm it in time: it may still be mined");
+  });
+
+  test("a failure with no hash still prints the case id and the resume line", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { status: "funded", patch: { jobId: "7" } });
+    const error = withPilotCaseId(new Error("the block read failed"), row.caseId);
+    const { printed } = await failingJob(fake, error);
+    expect(printed.caseId).toBe(row.caseId);
+    expect(printed.txHash).toBeUndefined();
+    expect(String(printed.next)).toContain(`--resume ${row.caseId} --yes`);
+  });
+
+  test("a failed createJob leaves no case: it prints the hash and says no case was recorded", async () => {
+    const fake = makeFake();
+    const { printed } = await failingJob(fake, new ChainTxRevertedError("createJob", FAKE_TX));
+    expect(printed).toMatchObject({ failed: true, caseId: null, txHash: FAKE_TX });
+    expect(String(printed.next)).toMatch(/^no case was recorded/);
+    expect(String(printed.next)).not.toContain("--resume");
+    expect(fake.cases.list()).toEqual([]);
+  });
+});
+
+describe("pilot:case fail: a funded job keeps its escrow", () => {
+  test.each([["funded"], ["submitted"], ["contested"]] as const)(
+    "failing a %s case prints and records that the escrow waits for a claimRefund after expiry",
+    async (status) => {
+      const fake = makeFake();
+      const row = insertCase(fake.cases, { mode: "testnet", status, patch: { jobId: "7" } });
+      const printed = JSON.parse(
+        await run(fake, ["pilot:case", "fail", row.caseId, "--reason", "stuck", "--yes"]),
+      );
+      const escrow =
+        "job 7 still holds the budget in escrow on chain until a claimRefund after its expiry at 2026-11-04T00:00:00.000Z";
+      expect(printed.escrow).toBe(escrow);
+      expect(fake.cases.events(row.caseId).at(-1)?.detail).toBe(`stuck; ${escrow}`);
+      expect(fake.cases.find(row.caseId)?.error).toBe("stuck");
+    },
+  );
+
+  test("failing a created case says nothing of an escrow", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { mode: "testnet", status: "created" });
+    const printed = JSON.parse(
+      await run(fake, ["pilot:case", "fail", row.caseId, "--reason", "stuck", "--yes"]),
+    );
+    expect(printed.escrow).toBeUndefined();
+    expect(fake.cases.events(row.caseId).at(-1)?.detail).toBe("stuck");
+  });
+
+  test("the fail help text says every case the cap counts needs --force", () => {
+    const program = new Command();
+    registerPilotCommands(program, makeFake().open, {});
+    const fail = program.commands
+      .find((c) => c.name() === "pilot:case")
+      ?.commands.find((c) => c.name() === "fail");
+    expect(fail?.description()).toBe(
+      "mark a case failed, with the reason; every testnet or live case the mode's cap counts needs --force",
+    );
+  });
+});
+
+describe("free texts refuse invisible format characters, naming the code point", () => {
+  const FORMAT_CHARACTERS = [
+    0x200b, 0x200c, 0x200d, 0x200e, 0x200f, 0x2028, 0x2029, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e,
+    0x2060, 0x2061, 0x2062, 0x2063, 0x2064, 0xfeff,
+  ];
+  const named = (c: number) => `U+${c.toString(16).toUpperCase().padStart(4, "0")}`;
+
+  test.each(FORMAT_CHARACTERS.map((c) => [named(c), c] as const))(
+    "%s in --label is refused before the context opens",
+    async (name, c) => {
+      const fake = makeFake();
+      const args = jobArgs();
+      args[2] = `test${String.fromCodePoint(c)}case`;
+      await expect(run(fake, args)).rejects.toThrow(
+        `refusing: --label holds the invisible format character ${name}`,
+      );
+      expect(fake.opened()).toBe(0);
+    },
+  );
+
+  const RLO = "‮";
+
+  test("in the description file", async () => {
+    const fake = makeFake();
+    const args = jobArgs();
+    args[4] = tempFile("description.txt", `pay ${RLO}gnp.exe\n`);
+    await expect(run(fake, args)).rejects.toThrow(/--description-file .* U\+202E/);
+    expect(fake.opened()).toBe(0);
+  });
+
+  test.each([["--reason-file"], ["--reply-file"]])("in the contest's %s", async (option) => {
+    const fake = makeFake();
+    const good = tempFile("good.txt", "a plain text\n");
+    const bad = tempFile("bad.txt", `a text${RLO}\n`);
+    const files =
+      option === "--reason-file"
+        ? ["--reason-file", bad, "--reply-file", good]
+        : ["--reason-file", good, "--reply-file", bad];
+    await expect(
+      run(fake, ["pilot:contest", "--case", "pc_000000000000", ...files, "--yes"]),
+    ).rejects.toThrow(new RegExp(`${option} .* U\\+202E`));
+    expect(fake.opened()).toBe(0);
+  });
+
+  test("in --by", async () => {
+    const fake = makeFake();
+    await expect(
+      run(fake, ["pilot:case", "seen-in-court", "pc_000000000000", "--by", `M${RLO}a`, "--yes"]),
+    ).rejects.toThrow("refusing: --by holds the invisible format character U+202E");
+    expect(fake.opened()).toBe(0);
+  });
+
+  test("in the fail reason", async () => {
+    const fake = makeFake();
+    await expect(
+      run(fake, ["pilot:case", "fail", "pc_000000000000", "--reason", "x​y", "--yes"]),
+    ).rejects.toThrow("refusing: --reason holds the invisible format character U+200B");
+    expect(fake.opened()).toBe(0);
   });
 });

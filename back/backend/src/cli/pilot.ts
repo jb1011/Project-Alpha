@@ -40,7 +40,9 @@ import {
   type CreatePilotJobInput,
   type PilotJobDeps,
   createPilotJob,
+  pilotCaseIdOf,
   preflightPilotJob,
+  withoutEmDash,
 } from "../pilot/job";
 import { httpLookupClient } from "../pilot/lookup";
 import {
@@ -408,6 +410,28 @@ function hasControl(text: string, singleLine: boolean): boolean {
   return false;
 }
 
+/**
+ * The first invisible format character in `text`, as `U+XXXX`: zero-width characters and
+ * marks, the line and paragraph separators, the bidirectional embeddings and overrides, the
+ * invisible operators and the byte order mark. The description goes on chain for good and the
+ * texts are served publicly, where a right-to-left override would reorder what a reader sees.
+ */
+function formatCharacterOf(text: string): string | undefined {
+  for (const ch of text) {
+    const c = ch.codePointAt(0) as number;
+    if (
+      (c >= 0x200b && c <= 0x200f) ||
+      c === 0x2028 ||
+      c === 0x2029 ||
+      (c >= 0x202a && c <= 0x202e) ||
+      (c >= 0x2060 && c <= 0x2064) ||
+      c === 0xfeff
+    )
+      return `U+${c.toString(16).toUpperCase().padStart(4, "0")}`;
+  }
+  return undefined;
+}
+
 /** Filed or later: a dispute exists on Kleros. The repository's list, so this gate and
  *  `countSeenInCourt` read the same statuses. */
 const FILED_OR_LATER: ReadonlySet<PilotStatus> = new Set(PILOT_FILED_OR_LATER_STATUSES);
@@ -431,6 +455,8 @@ function checkText(what: string, raw: string, o: { singleLine?: boolean } = {}):
     refuse(
       `${what} holds a control character${o.singleLine ? "" : " other than a newline or a tab"}`,
     );
+  const format = formatCharacterOf(text);
+  if (format !== undefined) refuse(`${what} holds the invisible format character ${format}`);
   return text;
 }
 
@@ -665,9 +691,36 @@ async function job(
     row = await deps.createJob(jobDeps, p.input, p.resume);
   } catch (e) {
     const txHash = sentHashOf(e);
-    // A failed createJob leaves no row, so its hash is printed here or nowhere.
-    if (txHash !== undefined)
-      print({ failed: true, ...stage, txHash, error: publicErrorMessage(e), note: PILOT_NOTE });
+    const caseId = pilotCaseIdOf(e);
+    const error = withoutEmDash(publicErrorMessage(e));
+    if (caseId !== undefined) {
+      // A row exists: running the command again without --resume would create and fund a
+      // second job, so the case to resume is printed with the step that resumes it.
+      const resume = `run the same command with --resume ${caseId} --yes`;
+      print({
+        failed: true,
+        ...stage,
+        caseId,
+        status: ctx.cases.find(caseId)?.status ?? null,
+        ...(txHash === undefined ? {} : { txHash }),
+        error,
+        next:
+          txHash === undefined
+            ? `the case is recorded; once the cause is fixed, ${resume}`
+            : `wait until the transaction is mined or dropped, then ${resume}`,
+        note: PILOT_NOTE,
+      });
+    } else if (txHash !== undefined)
+      // A failed createJob leaves no row, so its hash is printed here or nowhere.
+      print({
+        failed: true,
+        ...stage,
+        caseId: null,
+        txHash,
+        error,
+        next: "no case was recorded: look the hash up on the explorer before running the command again, since the job may exist on chain",
+        note: PILOT_NOTE,
+      });
     throw e;
   }
   return { ...stage, case: row, note: PILOT_NOTE };
@@ -810,16 +863,28 @@ function failCase(
       reason,
       next: "nothing was changed: run the same command with --yes to mark the case failed",
     };
+  // A funded job keeps its budget whatever the row says: no pilot command reclaims it.
+  const escrow = ESCROWED.has(row.status)
+    ? `${row.jobId === null ? "the job" : `job ${row.jobId}`} still holds the budget in escrow on chain until a claimRefund after its expiry at ${isoOf(row.expiredAt)}`
+    : null;
   // A forced fail leaves a trace: the event says the guard was overridden and what it cost.
-  const detail = guarded ? `forced: ${reason} (the case leaves the ${row.mode} cap count)` : reason;
+  const stated = escrow === null ? reason : `${reason}; ${escrow}`;
+  const detail = guarded ? `forced: ${stated} (the case leaves the ${row.mode} cap count)` : stated;
   const next = ctx.cases.transaction(() => {
     const moved = ctx.cases.advance(caseId, row.status, "failed", { error: reason });
     if (!moved) refuse(`pilot case ${caseId} moved from ${row.status} while this command ran`);
     ctx.cases.recordEvent(caseId, "failed", "ok", null, detail);
     return moved;
   });
-  return { case: next, note: guarded ? `${detail}. ${PILOT_NOTE}` : PILOT_NOTE };
+  return {
+    case: next,
+    ...(escrow === null ? {} : { escrow }),
+    note: guarded ? `${detail}. ${PILOT_NOTE}` : PILOT_NOTE,
+  };
 }
+
+/** The statuses of a funded job before any dispute: the budget sits in the job's escrow. */
+const ESCROWED: ReadonlySet<PilotStatus> = new Set(["funded", "submitted", "contested"]);
 
 /** What the row knows of its Kleros dispute, for a refusal: each id that is set. */
 function klerosIdsOf(row: PilotCaseRecord): string {
@@ -994,7 +1059,7 @@ export function registerPilotCommands(
   cases
     .command("fail <caseId>")
     .description(
-      "mark a case failed, with the reason; a testnet or live case at filed or ruled needs --force",
+      "mark a case failed, with the reason; every testnet or live case the mode's cap counts needs --force",
     )
     .requiredOption("--reason <text>", "why the case failed")
     .option("--force", "mark a case failed although its dispute exists on Kleros")

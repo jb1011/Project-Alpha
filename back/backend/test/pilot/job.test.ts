@@ -32,6 +32,7 @@ import {
   type CreatePilotJobInput,
   type PilotJobDeps,
   createPilotJob,
+  pilotCaseIdOf,
   preflightPilotJob,
 } from "../../src/pilot/job";
 import type { LookupClient } from "../../src/pilot/lookup";
@@ -809,4 +810,30 @@ test("a resume with the case's own agents and addresses, in another letter case,
     },
   };
   expect((await createPilotJob(lower, input(), row.caseId)).status).toBe("submitted");
+});
+
+test("a failure after the row exists carries the case id; a failed createJob carries none", async () => {
+  const reverted = setup({ stealAllowanceOnFund: true });
+  const fundErr = await createPilotJob(reverted.deps, input()).catch((e) => e);
+  expect(fundErr).toBeInstanceOf(JobFundRevertedError);
+  expect(pilotCaseIdOf(fundErr)).toBe(reverted.cases.list()[0]?.caseId);
+
+  const unconfirmed = setup({ runSubmit: true, withholdReceipt: "submit" });
+  const submitErr = await createPilotJob(unconfirmed.deps, input()).catch((e) => e);
+  expect(submitErr).toBeInstanceOf(ChainTxUnconfirmedError);
+  const [row] = unconfirmed.cases.list();
+  expect(pilotCaseIdOf(submitErr)).toBe(row?.caseId);
+  // A resume that fails carries it too.
+  const resumeErr = await createPilotJob(unconfirmed.deps, input(), row!.caseId).catch((e) => e);
+  expect(resumeErr.message).toMatch(/receipt/);
+  expect(pilotCaseIdOf(resumeErr)).toBe(row?.caseId);
+
+  const failedCreate = setup();
+  vi.spyOn(failedCreate.chain.job, "createJob").mockRejectedValueOnce(
+    new ChainTxRevertedError("createJob", `0x${"56".repeat(32)}` as Hex),
+  );
+  const createErr = await createPilotJob(failedCreate.deps, input()).catch((e) => e);
+  expect(createErr).toBeInstanceOf(ChainTxRevertedError);
+  expect(pilotCaseIdOf(createErr)).toBeUndefined();
+  expect(failedCreate.cases.list()).toEqual([]);
 });
