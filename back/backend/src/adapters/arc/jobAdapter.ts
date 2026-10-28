@@ -459,9 +459,18 @@ export class JobAdapter {
    * client. Permissionless on chain, and the refund goes to the job's CLIENT whoever sends it, so
    * we send it as the client: the key that paid the escrow is the one that gets it back, and no
    * other key of ours gains anything by paying that gas.
+   *
+   * The Kleros pilot passes `wallet`: its referee settles a case whose client is the pilot's
+   * buyer, a key this adapter may not hold as its client, and the refund still lands with the
+   * job's client whichever local key pays the gas. Named in a refusal as `reject` names it.
    */
-  async claimRefund(jobId: bigint): Promise<Hex> {
-    const h = await this.sendAsLocalKey(this.d.clientWallet, JOB_CLIENT, {
+  async claimRefund(jobId: bigint, wallet: WalletClient = this.d.clientWallet): Promise<Hex> {
+    const who =
+      wallet.account?.address?.toLowerCase() ===
+      this.d.evaluatorWallet?.account?.address?.toLowerCase()
+        ? JOB_EVALUATOR
+        : JOB_CLIENT;
+    const h = await this.sendAsLocalKey(wallet, who, {
       to: this.d.jobContract,
       data: encodeFunctionData({
         abi: iErc8183JobAbi,

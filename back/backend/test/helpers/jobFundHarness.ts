@@ -33,7 +33,7 @@ import {
   recoverTransactionAddress,
 } from "viem";
 import { type PrivateKeyAccount, privateKeyToAccount } from "viem/accounts";
-import { iErc8183JobAbi } from "../../src/abis/generated";
+import { iErc8183JobAbi, iIdentityRegistryAbi } from "../../src/abis/generated";
 import { JobAdapter } from "../../src/adapters/arc/jobAdapter";
 import type { ReputationAdapter } from "../../src/adapters/arc/reputationAdapter";
 import { ChainTxRevertedError, ChainTxUnconfirmedError } from "../../src/errors";
@@ -157,6 +157,13 @@ export interface UsdcJobNodeOptions {
   rejectPreflightFails?: boolean;
   /** Mine every `complete` as REVERTED — the second way a funded job dies after its money moved. */
   revertComplete?: boolean;
+  /**
+   * An identity registry at this address, answering `ownerOf` from {ownerOf}. Off by default: a
+   * node without it answers `0x` to every call outside the USDC and job contracts, as before.
+   */
+  identityRegistry?: Address;
+  /** The owner of an agent id, or undefined for an id that was never minted (the call reverts). */
+  ownerOf?: (agentId: bigint) => Address | undefined;
 }
 
 export function usdcJobNode(opts: UsdcJobNodeOptions) {
@@ -220,6 +227,18 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
       if (decoded?.functionName === "balanceOf") {
         const [owner] = decoded.args as [Address];
         return word(balanceOf(owner));
+      }
+    }
+    if (opts.identityRegistry && target === opts.identityRegistry.toLowerCase() && data) {
+      const asked = decodeFunctionData({ abi: iIdentityRegistryAbi, data });
+      if (asked.functionName === "ownerOf") {
+        const owner = opts.ownerOf?.(asked.args[0]);
+        if (!owner) throw new Error("execution reverted: ERC721NonexistentToken");
+        return encodeFunctionResult({
+          abi: iIdentityRegistryAbi,
+          functionName: "ownerOf",
+          result: owner,
+        });
       }
     }
     if (target === opts.jobContract.toLowerCase()) {
