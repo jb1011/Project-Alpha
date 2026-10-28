@@ -1049,6 +1049,9 @@ describe("pilot:job: the default pre-flight wiring", () => {
   });
 });
 
+/** Built from its code point, so the character never appears in the source. */
+const EM_DASH = String.fromCodePoint(0x2014);
+
 /** Runs a `pilot:job --yes` that fails; returns the parsed print and the thrown error. */
 async function failingJob(
   fake: Fake,
@@ -1093,7 +1096,7 @@ describe("pilot:job --yes: a failure after the case exists names the case to res
     const fake = makeFake();
     const row = insertCase(fake.cases, { status: "funded", patch: { jobId: "7" } });
     const error = withPilotCaseId(new ChainTxUnconfirmedError("submit", FAKE_TX), row.caseId);
-    expect(error.message).toContain("—");
+    expect(error.message).toContain(EM_DASH);
     const { printed } = await failingJob(fake, error);
     expect(printed).toMatchObject({
       failed: true,
@@ -1102,7 +1105,7 @@ describe("pilot:job --yes: a failure after the case exists names the case to res
       txHash: FAKE_TX,
     });
     expect(String(printed.next)).toContain(`--resume ${row.caseId} --yes`);
-    expect(String(printed.error)).not.toContain("—");
+    expect(String(printed.error)).not.toContain(EM_DASH);
     expect(String(printed.error)).toContain("could not confirm it in time: it may still be mined");
   });
 
