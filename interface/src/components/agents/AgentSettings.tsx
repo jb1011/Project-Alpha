@@ -35,6 +35,9 @@ import { formatUsdc, isAddress, shortAddress } from "@/components/onboarding/typ
  *  hours long; a second is close enough, and is what the other clocks in this interface tick at. */
 const TIMELOCK_TICK_MS = 1_000;
 
+/** How long to wait before asking the treasury again when restoring a scheduled change failed. */
+const RESTORE_RETRY_MS = 5_000;
+
 type PendingPolicy = {
   policyId: `0x${string}`;
   cap: bigint;
@@ -65,9 +68,13 @@ export function AgentSettings({ entityId }: { entityId: string }) {
   const [busy, setBusy] = useState(false);
   const [pending, setPending] = useState<PendingPolicy | null>(null);
   const [formInitialized, setFormInitialized] = useState(false);
-  /** The scheduled policy id the chain has already been asked about, so the record the backend
-   *  keeps is checked once per id rather than on every refetch. */
-  const [checkedScheduleId, setCheckedScheduleId] = useState<string | null>(null);
+  /** The schedule record the chain has already been asked about, keyed by its transaction (a
+   *  policy id repeats when the same tuple is scheduled again), so each record is checked once
+   *  rather than on every refetch. Also set when this tab vetoes or executes the change, so a
+   *  node a block behind cannot bring it back. */
+  const [checkedScheduleKey, setCheckedScheduleKey] = useState<string | null>(null);
+  /** Bumped after a failed check, to ask the chain again a little later. */
+  const [restoreAttempt, setRestoreAttempt] = useState(0);
   /** The clock the timelock is read against, ticking only while a scheduled change waits. */
   const [now, setNow] = useState(() => Date.now());
 
@@ -138,11 +145,14 @@ export function AgentSettings({ entityId }: { entityId: string }) {
   // 2026-10-23, section 4.5) but not to this page's state. It is shown only once the treasury says
   // it is still pending, with every figure read from the chain: the backend's record is what was
   // sent, and a veto leaves it standing.
-  const scheduledId = entity?.scheduledPolicy?.policyId ?? null;
+  const scheduled = entity?.scheduledPolicy ?? null;
+  const scheduledId = scheduled?.policyId ?? null;
+  const scheduledKey = scheduled ? `${scheduled.policyId}:${scheduled.txHash}` : null;
   useEffect(() => {
-    if (!scheduledId || pending || !treasury || !publicClient) return;
-    if (checkedScheduleId === scheduledId) return;
+    if (!scheduledId || !scheduledKey || pending || !treasury || !publicClient) return;
+    if (checkedScheduleKey === scheduledKey) return;
     let cancelled = false;
+    let retry: ReturnType<typeof setTimeout> | undefined;
     void (async () => {
       try {
         const pp = await publicClient.readContract({
@@ -152,7 +162,7 @@ export function AgentSettings({ entityId }: { entityId: string }) {
           args: [scheduledId],
         });
         if (cancelled) return;
-        setCheckedScheduleId(scheduledId);
+        setCheckedScheduleKey(scheduledKey);
         if (pp[5])
           setPending({
             policyId: scheduledId,
@@ -163,13 +173,22 @@ export function AgentSettings({ entityId }: { entityId: string }) {
             executableAt: pp[4],
           });
       } catch {
-        /* unchecked: the next render with the record asks again */
+        // Unchecked: ask again shortly, or a blip at load would hide the change (and its Veto
+        // button) until a full reload.
+        if (!cancelled) retry = setTimeout(() => setRestoreAttempt((n) => n + 1), RESTORE_RETRY_MS);
       }
     })();
     return () => {
       cancelled = true;
+      if (retry) clearTimeout(retry);
     };
-  }, [scheduledId, pending, treasury, publicClient, checkedScheduleId]);
+  }, [scheduledId, scheduledKey, pending, treasury, publicClient, checkedScheduleKey, restoreAttempt]);
+
+  /** This tab just settled the change: its record must not be restored from a lagging read. */
+  function markScheduleSettled(policyId: `0x${string}`) {
+    if (scheduled && scheduled.policyId.toLowerCase() === policyId.toLowerCase())
+      setCheckedScheduleKey(`${scheduled.policyId}:${scheduled.txHash}`);
+  }
 
   async function runTx(
     fn: () => Promise<void>,
@@ -245,6 +264,7 @@ export function AgentSettings({ entityId }: { entityId: string }) {
     if (!pending) return;
     await runTx(async () => {
       await executePolicyUpdate.mutateAsync(pending.policyId);
+      markScheduleSettled(pending.policyId);
       setPending(null);
     }, "Failed to execute policy update.");
   }
@@ -260,6 +280,7 @@ export function AgentSettings({ entityId }: { entityId: string }) {
         chainId: arcTestnet.id,
       });
       await publicClient.waitForTransactionReceipt({ hash });
+      markScheduleSettled(pending.policyId);
       setPending(null);
     });
   }

@@ -19,8 +19,9 @@ export function ExternalRecordCard({ entityId, agentId }: { entityId: string; ag
 
   if (!available || !providerName) return null;
 
+  // A failed refetch keeps the previous answer in `data`: it is still shown, and said to be old.
   const input: CardInput = query.data
-    ? { phase: "ready", view: query.data }
+    ? { phase: "ready", view: query.data, refreshFailed: query.isError }
     : query.isError
       ? { phase: "failed" }
       : { phase: "loading" };

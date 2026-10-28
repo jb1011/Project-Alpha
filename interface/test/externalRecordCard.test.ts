@@ -314,6 +314,13 @@ describe("the card", () => {
     expect(one.notices).toEqual(["1 entry in a format this card does not read."]);
   });
 
+  test("a failed refresh keeps the previous figures, says they may be old, and offers a retry", () => {
+    const m = model({ phase: "ready", view: view(), refreshFailed: true });
+    expect(m.figures[0]?.value).toBe("2");
+    expect(m.notices).toEqual(["Could not refresh just now; these figures may be out of date."]);
+    expect(m.retry).toBe(true);
+  });
+
   test.each([
     ["http", "http://app.aevumprotocol.io/check/x"],
     ["javascript", "javascript:alert(1)"],
@@ -352,6 +359,27 @@ describe("the copy", () => {
       }),
     },
   ];
+  const ZERO = {
+    status: "ok" as const,
+    graded: 0,
+    correct: 0,
+    wrong: 0,
+    unrecognised: 0,
+    lastGradedAt: null,
+  };
+  STATES.push(
+    { phase: "ready", view: view({ chain: ZERO }) },
+    { phase: "ready", view: view({ chain: { ...ZERO, graded: 2, correct: 1, wrong: 1, unrecognised: 2 } }) },
+    {
+      phase: "ready",
+      view: view({
+        chain: ZERO,
+        record: { status: "unavailable", reason: "timeout", lockingWallet: WALLET },
+        agreement: "unknown",
+      }),
+    },
+    { phase: "ready", view: view(), refreshFailed: true },
+  );
   const ALL = STATES.flatMap((s) => {
     const m = model(s);
     return [
@@ -372,8 +400,13 @@ describe("the copy", () => {
     },
   );
 
-  test("'advice' appears only in the fixed sentence", () => {
-    for (const s of ALL.filter((x) => /advice/i.test(x))) expect(s).toContain(NOT_ADVICE);
+  test("'advice' appears only in the fixed sentence, and once", () => {
+    const saying = ALL.filter((x) => /advice/i.test(x));
+    expect(saying.length).toBeGreaterThan(0);
+    for (const s of saying) {
+      expect(s).toContain(NOT_ADVICE);
+      expect(s.match(/advice/gi)).toHaveLength(1);
+    }
   });
 
   test("no sentence carries an em dash", () => {

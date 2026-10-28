@@ -58,7 +58,8 @@ function plural(n: number, one: string, many: string): string {
 export type CardInput =
   | { phase: "loading" }
   | { phase: "failed" }
-  | { phase: "ready"; view: ExternalRecordView };
+  /** `refreshFailed`: the last refetch failed and `view` is the previous answer. */
+  | { phase: "ready"; view: ExternalRecordView; refreshFailed?: boolean };
 
 /**
  * The card for one read.
@@ -178,6 +179,11 @@ export function externalRecordCardModel(
     notices.push(
       `${providerName}'s record lists ${record.graded} ${plural(record.graded, "graded call", "graded calls")}; ${chain.graded} ${plural(chain.graded, "is", "are")} posted on Arc for this agent.`,
     );
+
+  if (input.refreshFailed) {
+    notices.push("Could not refresh just now; these figures may be out of date.");
+    retry = true;
+  }
 
   return { ...base, state: "ready", status, figures, notices, link, retry };
 }

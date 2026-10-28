@@ -11,8 +11,8 @@ test("matches the vector computed with cast (and the backend's own test)", () =>
   //   0x000000000000000000000000000000000000000A), computed 2026-10-28.
   expect(
     computePolicyId({
-      newCap: 10_000_000n,
-      newPeriod: 86_400n,
+      newCap: BigInt(10_000_000),
+      newPeriod: BigInt(86_400),
       allowlistOn: false,
       newPayout: "0x000000000000000000000000000000000000000A",
     }),
