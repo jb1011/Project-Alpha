@@ -460,9 +460,11 @@ export class JobAdapter {
    * we send it as the client: the key that paid the escrow is the one that gets it back, and no
    * other key of ours gains anything by paying that gas.
    *
-   * The Kleros pilot passes `wallet`: its referee settles a case whose client is the pilot's
-   * buyer, a key this adapter may not hold as its client, and the refund still lands with the
-   * job's client whichever local key pays the gas. Named in a refusal as `reject` names it.
+   * `wallet` is the local key that sends the call and pays its gas; the refund lands with the
+   * job's client whichever key that is. The default stays the client, for the reason above and so
+   * every existing caller is unchanged. A caller that settles on another party's behalf, such as
+   * the Kleros pilot's referee, passes its own wallet and pays that gas itself. Named in a refusal
+   * as `reject` names it.
    */
   async claimRefund(jobId: bigint, wallet: WalletClient = this.d.clientWallet): Promise<Hex> {
     const who =

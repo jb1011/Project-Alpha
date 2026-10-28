@@ -27,6 +27,8 @@ import {
   custom,
   decodeFunctionData,
   defineChain,
+  encodeAbiParameters,
+  encodeEventTopics,
   encodeFunctionResult,
   keccak256,
   parseTransaction,
@@ -92,7 +94,15 @@ const word = (v: bigint): Hex => `0x${v.toString(16).padStart(64, "0")}`;
 
 /** One state-changing call the node executed, in the order it executed them. */
 export interface NodeAction {
-  call: "approve" | "fund" | "createJob" | "complete" | "reject" | "claimRefund" | "other";
+  call:
+    | "approve"
+    | "fund"
+    | "createJob"
+    | "complete"
+    | "reject"
+    | "claimRefund"
+    | "submit"
+    | "other";
   from: Address;
   status: "success" | "reverted";
 }
@@ -138,7 +148,7 @@ export interface UsdcJobNodeOptions {
    * Accept the first `approve` (or `fund`) and then never produce its receipt — the transaction is
    * on the chain and we cannot read what it did. Withheld ONCE, so a later job still gets answers.
    */
-  withholdReceipt?: "approve" | "fund";
+  withholdReceipt?: "approve" | "fund" | "submit";
   /**
    * The chain's clock, in SECONDS — what the node answers as the block timestamp and what
    * `claimRefund` measures `expiredAt` against. A function, so a test can warp past an expiry
@@ -164,7 +174,25 @@ export interface UsdcJobNodeOptions {
   identityRegistry?: Address;
   /** The owner of an agent id, or undefined for an id that was never minted (the call reverts). */
   ownerOf?: (agentId: bigint) => Address | undefined;
+  /**
+   * Run `submit` as the contract does: a Funded job moves to Submitted and the receipt carries a
+   * `Submitted(jobId, deliverable)` log; any other status reverts. Off by default, where a submit
+   * is mined as `other` and changes nothing, as before.
+   */
+  runSubmit?: boolean;
 }
+
+/** The `Submitted` event as the mock job contract emits it. */
+const submittedEvent = [
+  {
+    type: "event",
+    name: "Submitted",
+    inputs: [
+      { name: "jobId", type: "uint256", indexed: true },
+      { name: "deliverable", type: "bytes32", indexed: false },
+    ],
+  },
+] as const;
 
 export function usdcJobNode(opts: UsdcJobNodeOptions) {
   const allowances = new Map<string, bigint>();
@@ -179,6 +207,12 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
   /** `${address}:${nonce}` — a repeat is the collision the send lock exists to prevent. */
   const claimed = new Set<string>();
   const receipts = new Map<string, "0x1" | "0x0">();
+  /** A withheld receipt's status, published only by `releaseWithheld`. */
+  const withheldReceipts = new Map<string, "0x1" | "0x0">();
+  /** The logs a receipt carries, by transaction hash; only an opted-in `submit` writes one. */
+  const logsOf = new Map<string, { jobId: bigint; deliverable: Hex }>();
+  /** The `Submitted` log of the transaction being executed, picked up when it is accepted. */
+  let pendingLog: { jobId: bigint; deliverable: Hex } | undefined;
   const actions: NodeAction[] = [];
   const sends: { hash: Hex; from: Address; nonce: number; to: Address }[] = [];
   let jobCounter = 0n;
@@ -333,6 +367,15 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
       }
       return { call: "complete", from, status: "success" };
     }
+    if (opts.runSubmit && decoded?.functionName === "submit") {
+      const [jobId, deliverable] = decoded.args as [bigint, Hex, Hex];
+      const j = jobOf(jobId);
+      if (!j || j.status !== 1 || from.toLowerCase() !== j.provider.toLowerCase())
+        return { call: "submit", from, status: "reverted" };
+      j.status = 2; // Submitted
+      pendingLog = { jobId, deliverable };
+      return { call: "submit", from, status: "success" };
+    }
     // ── The two refunds, with the contract's own rules (see `test/mocks/MockERC8183Job.sol`) ──
     if (decoded?.functionName === "reject") {
       if (opts.revertReject && !rejectReverted) {
@@ -413,8 +456,12 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
         const action = execute(from, tx.to as Address, tx.data);
         actions.push(action);
         const hash = keccak256(raw);
-        if (opts.withholdReceipt === action.call && !withheld) withheld = true;
-        else receipts.set(hash, action.status === "success" ? "0x1" : "0x0");
+        if (pendingLog) logsOf.set(hash, pendingLog);
+        pendingLog = undefined;
+        if (opts.withholdReceipt === action.call && !withheld) {
+          withheld = true;
+          withheldReceipts.set(hash, action.status === "success" ? "0x1" : "0x0");
+        } else receipts.set(hash, action.status === "success" ? "0x1" : "0x0");
         sends.push({ hash, from, nonce, to: tx.to as Address });
         return hash;
       }
@@ -437,7 +484,27 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
           to: opts.jobContract,
           cumulativeGasUsed: "0x1",
           gasUsed: "0x1",
-          logs: [],
+          logs: (() => {
+            const l = logsOf.get(hash);
+            if (!l) return [];
+            return [
+              {
+                address: opts.jobContract,
+                topics: encodeEventTopics({
+                  abi: submittedEvent,
+                  eventName: "Submitted",
+                  args: { jobId: l.jobId },
+                }),
+                data: encodeAbiParameters([{ type: "bytes32" }], [l.deliverable]),
+                blockNumber: "0x1",
+                blockHash: `0x${"11".repeat(32)}`,
+                transactionHash: hash,
+                transactionIndex: "0x0",
+                logIndex: "0x0",
+                removed: false,
+              },
+            ];
+          })(),
           logsBloom: `0x${"0".repeat(512)}`,
           type: "0x2",
           effectiveGasPrice: "0x1",
@@ -495,6 +562,11 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
         escrow.set(j.id.toString(), (escrow.get(j.id.toString()) ?? 0n) + j.budget);
         debit(j.client, j.budget);
       }
+    },
+    /** Publish the receipt `withholdReceipt` held back: the transaction has landed after all. */
+    releaseWithheld: () => {
+      for (const [hash, status] of withheldReceipts) receipts.set(hash, status);
+      withheldReceipts.clear();
     },
     /** What the provider's remote-signed `submit` does to the chain, without signing anything. */
     markSubmitted: (jobId: bigint) => {

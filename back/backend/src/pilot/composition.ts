@@ -129,10 +129,14 @@ function httpParts(
   const variable = name === "testnet" ? "KLEROS_API_KEY_TESTNET" : "KLEROS_API_KEY_LIVE";
   const kleros = cfg.kleros;
   if (!kleros)
-    throw new Error(`refusing: the ${name} Kleros stage needs ${variable}, which is not set`);
+    throw new Error(
+      `refusing: the Kleros stage of ${name} mode needs ${variable}, which is not set`,
+    );
   const apiKey = name === "testnet" ? kleros.apiKeyTestnet : kleros.apiKeyLive;
   if (!apiKey)
-    throw new Error(`refusing: the ${name} Kleros stage needs ${variable}, which is not set`);
+    throw new Error(
+      `refusing: the Kleros stage of ${name} mode needs ${variable}, which is not set`,
+    );
   const courtId = name === "testnet" ? kleros.courtIdTestnet : kleros.courtIdLive;
   return { apiUrl: kleros.apiUrl, apiKey, deployment: deploymentFor(name, courtId) };
 }

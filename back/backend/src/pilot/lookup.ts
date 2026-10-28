@@ -47,6 +47,7 @@ export function httpLookupClient(base: string, fetchImpl: typeof fetch = fetch):
 export function activeLegalName(
   a: ByAgentAnswer,
 ): { legalName: string; standing: string } | undefined {
-  if (!a.legalBody || a.statement === null) return undefined;
+  // `== null`: the body is JSON cast unchecked, so an absent statement must not throw here.
+  if (!a.legalBody || a.statement == null) return undefined;
   return { legalName: a.statement.message.legalName, standing: a.standing };
 }

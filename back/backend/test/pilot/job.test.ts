@@ -80,14 +80,18 @@ function setup(
     owners?: Record<string, Address>;
     buyerBalance?: bigint;
     stealAllowanceOnFund?: boolean;
-    withholdReceipt?: "fund";
+    withholdReceipt?: "fund" | "submit";
+    runSubmit?: boolean;
   } = {},
 ) {
+  /** The clock in seconds, shared by the node and the job; a test moves it with `setClock`. */
+  let clock = NOW;
   const node = usdcJobNode({
     usdc: USDC,
     jobContract: JOB_CONTRACT,
     budget: BUDGET,
-    now: () => NOW,
+    now: () => clock,
+    runSubmit: o.runSubmit,
     identityRegistry: REGISTRY,
     ownerOf: (id) => (o.owners ?? { [BUYER_AGENT]: BUYER, [SELLER_AGENT]: SELLER })[id.toString()],
     stealAllowanceOnFund: o.stealAllowanceOnFund,
@@ -145,10 +149,13 @@ function setup(
     docStore,
     lookup,
     agentIds: { buyer: BUYER_AGENT, seller: SELLER_AGENT },
-    now: () => NOW,
+    now: () => clock,
     maxBudgetAtomic: 2_000_000n,
   };
-  return { node, cases, deps, chain };
+  const setClock = (t: number) => {
+    clock = t;
+  };
+  return { node, cases, deps, chain, answers, setClock };
 }
 
 const input = (over: Partial<CreatePilotJobInput> = {}): CreatePilotJobInput => ({
@@ -435,4 +442,213 @@ test("resuming refuses a row that is not at created or funded, an unknown case a
     /testnet/,
   );
   expect(node2.sends).toHaveLength(before);
+});
+
+// ── A submit that landed while the row stayed at funded ─────────────────────────────────────────
+
+test("an unconfirmed submit that landed: the resume reads the Submitted log, checks the hash and adopts it", async () => {
+  const { node, cases, deps } = setup({ runSubmit: true, withholdReceipt: "submit" });
+  await expect(createPilotJob(deps, input())).rejects.toBeInstanceOf(ChainTxUnconfirmedError);
+  const [row] = cases.list();
+  expect(row?.status).toBe("funded");
+  const submitHash = node.hashesOf("submit")[0];
+  expect(cases.events(row!.caseId).at(-1)).toMatchObject({
+    step: "submit",
+    status: "unconfirmed",
+    ref: submitHash,
+  });
+  expect(node.chainJob(1n)?.status).toBe(2);
+
+  // Still no receipt: the resume refuses and the row stays where it is.
+  await expect(createPilotJob(deps, input(), row!.caseId)).rejects.toThrow(/receipt/);
+  expect(cases.find(row!.caseId)?.status).toBe("funded");
+
+  node.releaseWithheld();
+  const sends = node.sends.length;
+  const done = await createPilotJob(deps, input(), row!.caseId);
+  expect(done.status).toBe("submitted");
+  expect(done.submitTxHash).toBe(submitHash);
+  expect(done.submittedBlockTime).toBe(NOW);
+  expect(done.deliverableHash).toBe(keccak256(DELIVERABLE));
+  expect(new Uint8Array(readFileSync(done.deliverablePath!))).toEqual(DELIVERABLE);
+  expect(node.sends).toHaveLength(sends);
+  expect(cases.events(row!.caseId).at(-1)).toMatchObject({
+    step: "submit",
+    status: "observed_on_chain",
+    ref: submitHash,
+  });
+});
+
+test("a mined submit whose block read failed once is adopted on resume, with no second submit", async () => {
+  const { node, cases, deps, chain } = setup({ runSubmit: true });
+  const getBlock = chain.publicClient.getBlock.bind(chain.publicClient);
+  let reads = 0;
+  vi.spyOn(chain.publicClient, "getBlock").mockImplementation(async (args) => {
+    reads += 1;
+    // The create's and the fund's block reads pass; the submit's fails.
+    if (reads === 3) throw new Error("the block read failed");
+    return getBlock(args as never);
+  });
+  await expect(createPilotJob(deps, input())).rejects.toThrow(/block read failed/);
+  const [row] = cases.list();
+  expect(row?.status).toBe("funded");
+  const submitHash = node.hashesOf("submit")[0];
+  expect(cases.events(row!.caseId).at(-1)).toMatchObject({
+    step: "submit",
+    status: "mined",
+    ref: submitHash,
+  });
+
+  const done = await createPilotJob(deps, input(), row!.caseId);
+  expect(done.status).toBe("submitted");
+  expect(done.submitTxHash).toBe(submitHash);
+  expect(done.submittedBlockTime).toBe(NOW);
+  expect(node.hashesOf("submit")).toHaveLength(1);
+});
+
+test("adopting a submit refuses when the deliverable given does not hash to the one on chain", async () => {
+  const { node, cases, deps } = setup({ runSubmit: true, withholdReceipt: "submit" });
+  await expect(createPilotJob(deps, input())).rejects.toBeInstanceOf(ChainTxUnconfirmedError);
+  node.releaseWithheld();
+  const [row] = cases.list();
+  const other = new TextEncoder().encode("another file\n");
+  await expect(
+    createPilotJob(deps, input({ deliverable: { bytes: other, extension: "csv" } }), row!.caseId),
+  ).rejects.toThrow(new RegExp(`${keccak256(DELIVERABLE)}.*${keccak256(other)}`));
+  expect(cases.find(row!.caseId)?.status).toBe("funded");
+});
+
+// ── The pre-flight on resume ────────────────────────────────────────────────────────────────────
+
+/** A row at created whose fund reverted, so the chain reads Open. */
+async function createdAfterRevertedFund(o: Parameters<typeof setup>[0] = {}) {
+  const h = setup({ ...o, stealAllowanceOnFund: true });
+  await expect(createPilotJob(h.deps, input())).rejects.toBeInstanceOf(JobFundRevertedError);
+  const [row] = h.cases.list();
+  expect(row?.status).toBe("created");
+  return { ...h, row: row! };
+}
+
+/** A row at funded whose submit reverted, so the chain reads Funded. */
+async function fundedAfterRevertedSubmit() {
+  const h = setup();
+  vi.spyOn(h.chain.job, "submit").mockRejectedValueOnce(
+    new ChainTxRevertedError("submit", `0x${"54".repeat(32)}` as Hex),
+  );
+  await expect(createPilotJob(h.deps, input())).rejects.toBeInstanceOf(ChainTxRevertedError);
+  const [row] = h.cases.list();
+  expect(row?.status).toBe("funded");
+  return { ...h, row: row! };
+}
+
+test("a resume whose chain reads Open refuses when the seller's standing is no longer active, and sends nothing", async () => {
+  const { node, deps, answers, row } = await createdAfterRevertedFund();
+  answers[SELLER_AGENT] = pending as ByAgentAnswer;
+  const sent = node.sends.length;
+  await expect(createPilotJob(deps, input(), row.caseId)).rejects.toThrow(/seller.*pending/);
+  expect(node.sends).toHaveLength(sent);
+});
+
+test("a resume whose chain reads Open checks the balance and the time the job has left", async () => {
+  const { node, deps, chain, setClock, row } = await createdAfterRevertedFund();
+  const sent = node.sends.length;
+
+  vi.spyOn(chain.job, "usdcBalanceOf").mockResolvedValueOnce(BUDGET + 499_999n);
+  await expect(createPilotJob(deps, input(), row.caseId)).rejects.toThrow(/balance/);
+
+  setClock(row.expiredAt - 86_399);
+  await expect(createPilotJob(deps, input(), row.caseId)).rejects.toThrow(/expiry/);
+  expect(node.sends).toHaveLength(sent);
+
+  setClock(row.expiredAt - 86_400);
+  expect((await createPilotJob(deps, input(), row.caseId)).status).toBe("submitted");
+});
+
+test("a resume whose chain reads Funded skips only the balance check", async () => {
+  const { deps, chain, answers, row } = await fundedAfterRevertedSubmit();
+  answers[BUYER_AGENT] = noBody;
+  await expect(createPilotJob(deps, input(), row.caseId)).rejects.toThrow(/buyer.*no legal body/);
+
+  answers[BUYER_AGENT] = activeAnswer(BUYER_AGENT, "Buyer Agent LLC");
+  const balance = vi.spyOn(chain.job, "usdcBalanceOf").mockResolvedValue(0n);
+  expect((await createPilotJob(deps, input(), row.caseId)).status).toBe("submitted");
+  expect(balance).not.toHaveBeenCalled();
+});
+
+// ── The job on chain must be this case's ────────────────────────────────────────────────────────
+
+test.each<
+  [string, (j: NonNullable<ReturnType<ReturnType<typeof usdcJobNode>["chainJob"]>>) => void, RegExp]
+>([
+  [
+    "another client",
+    (j) => {
+      j.client = STRANGER;
+    },
+    /client/,
+  ],
+  [
+    "another evaluator",
+    (j) => {
+      j.evaluator = STRANGER;
+    },
+    /evaluator/,
+  ],
+])("the resume refuses a job with %s, and sends nothing", async (_n, change, problem) => {
+  const { node, deps, row } = await createdAfterRevertedFund();
+  change(node.chainJob(1n)!);
+  const sent = node.sends.length;
+  await expect(createPilotJob(deps, input(), row.caseId)).rejects.toThrow(problem);
+  expect(node.sends).toHaveLength(sent);
+});
+
+test("the resume refuses a Funded job whose budget is not the case's", async () => {
+  const { node, deps, row } = await fundedAfterRevertedSubmit();
+  node.chainJob(1n)!.budget = BUDGET + 1n;
+  const sent = node.sends.length;
+  await expect(createPilotJob(deps, input(), row.caseId)).rejects.toThrow(/budget/);
+  expect(node.sends).toHaveLength(sent);
+});
+
+test("adopting a fund ignores a reverted fund's hash", async () => {
+  const { node, cases, deps, row } = await createdAfterRevertedFund();
+  const reverted = node.hashesOf("fund")[0];
+  // The job reads Funded although this case's only fund reverted: the hash must not be adopted.
+  node.chainJob(1n)!.status = 1;
+  const done = await createPilotJob(deps, input(), row.caseId);
+  expect(done.fundTxHash).toBeNull();
+  expect(done.fundTxHash).not.toBe(reverted);
+  expect(cases.events(row.caseId).find((e) => e.status === "observed_on_chain")).toMatchObject({
+    step: "fund",
+    ref: null,
+  });
+});
+
+// ── Pre-flight errors and boundaries ────────────────────────────────────────────────────────────
+
+test("pre-flight returns a problem, not a throw, for a balance read that fails and an answer without a statement", async () => {
+  const { chain, deps } = setup();
+  vi.spyOn(chain.job, "usdcBalanceOf").mockRejectedValueOnce(new Error("rpc down"));
+  const pre = await preflightPilotJob(deps, input());
+  expect(pre.ok === false && pre.problem).toMatch(/balance could not be read/);
+
+  const malformed = { ...activeAnswer(SELLER_AGENT, "S"), statement: undefined };
+  const { deps: deps2 } = setup({
+    answers: {
+      [BUYER_AGENT]: activeAnswer(BUYER_AGENT, "B"),
+      [SELLER_AGENT]: malformed as unknown as ByAgentAnswer,
+    },
+  });
+  const pre2 = await preflightPilotJob(deps2, input());
+  expect(pre2.ok === false && pre2.problem).toMatch(/seller.*no signed statement/);
+});
+
+test("pre-flight boundaries: the budget at the maximum, the balance at budget plus 0.5 USDC, live at thirty days", async () => {
+  const { deps } = setup({ buyerBalance: 2_000_000n + 500_000n });
+  expect((await preflightPilotJob(deps, input({ budgetAtomic: 2_000_000n }))).ok).toBe(true);
+  const { deps: exact } = setup({ buyerBalance: BUDGET + 500_000n });
+  expect((await preflightPilotJob(exact, input())).ok).toBe(true);
+  expect(
+    (await preflightPilotJob(exact, input({ mode: "live", expirySeconds: 2_592_000 }))).ok,
+  ).toBe(true);
 });

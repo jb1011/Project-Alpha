@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { type Hex, keccak256 } from "viem";
+import { type Hex, keccak256, parseEventLogs } from "viem";
 import { iIdentityRegistryAbi } from "../abis/generated";
 import {
   ChainTxRevertedError,
@@ -55,6 +55,23 @@ const MIN_REHEARSAL_EXPIRY_SECONDS = 120;
 /** The job contract's status numbers. */
 const OPEN = 0;
 const FUNDED = 1;
+const SUBMITTED = 2;
+
+/**
+ * The job contract's `Submitted` event, as the mock contract and the backend's earlier plans
+ * declare it: the backend's interface ABI carries no events. A log of another shape is simply not
+ * found, and the case refuses rather than guessing.
+ */
+const submittedEventAbi = [
+  {
+    type: "event",
+    name: "Submitted",
+    inputs: [
+      { name: "jobId", type: "uint256", indexed: true },
+      { name: "deliverable", type: "bytes32", indexed: false },
+    ],
+  },
+] as const;
 
 const unixNow = () => Math.floor(Date.now() / 1000);
 
@@ -63,6 +80,22 @@ export async function preflightPilotJob(
   input: CreatePilotJobInput,
 ): Promise<
   | { ok: true; buyerBalance: bigint; buyerName: string; sellerName: string }
+  | { ok: false; problem: string }
+> {
+  const r = await checks(d, input, { balance: true });
+  return r.ok ? { ...r, buyerBalance: r.buyerBalance as bigint } : r;
+}
+
+/**
+ * The pre-flight's checks. A fresh job and a resume whose chain reads Open run all of them; a
+ * resume whose chain reads Funded skips the balance, which the escrow has already taken.
+ */
+async function checks(
+  d: PilotJobDeps,
+  input: Pick<CreatePilotJobInput, "budgetAtomic" | "expirySeconds" | "mode" | "deliverable">,
+  o: { balance: boolean },
+): Promise<
+  | { ok: true; buyerBalance: bigint | null; buyerName: string; sellerName: string }
   | { ok: false; problem: string }
 > {
   const refuse = (problem: string) => ({ ok: false as const, problem });
@@ -116,7 +149,14 @@ export async function preflightPilotJob(
       );
   }
 
-  const buyerBalance = await d.chain.job.usdcBalanceOf(d.chain.usdc, d.chain.addresses.buyer);
+  if (!o.balance)
+    return { ok: true, buyerBalance: null, buyerName: names.buyer, sellerName: names.seller };
+  let buyerBalance: bigint;
+  try {
+    buyerBalance = await d.chain.job.usdcBalanceOf(d.chain.usdc, d.chain.addresses.buyer);
+  } catch (e) {
+    return refuse(`the buyer's USDC balance could not be read: ${publicErrorMessage(e)}`);
+  }
   const needed = input.budgetAtomic + BALANCE_MARGIN_ATOMIC;
   if (buyerBalance < needed)
     return refuse(
@@ -142,7 +182,7 @@ export async function createPilotJob(
   input: CreatePilotJobInput,
   resumeCaseId?: string,
 ): Promise<PilotCaseRecord> {
-  if (resumeCaseId !== undefined) return continueCase(d, input, resumable(d, input, resumeCaseId));
+  if (resumeCaseId !== undefined) return resume(d, input, resumable(d, input, resumeCaseId));
 
   const pre = await preflightPilotJob(d, input);
   if (!pre.ok) throw new Error(`refusing to create the pilot job: ${pre.problem}`);
@@ -203,6 +243,55 @@ function resumable(d: PilotJobDeps, input: CreatePilotJobInput, caseId: string):
   return row;
 }
 
+/**
+ * A resume runs the pre-flight again before anything is sent: in full while the chain reads Open
+ * (nothing is escrowed, so the money gate stands), without the balance while it reads Funded. The
+ * budget is the row's and the expiry is the time the job has left. A job already at Submitted is
+ * only adopted, which sends nothing, so no check runs for it.
+ */
+async function resume(
+  d: PilotJobDeps,
+  input: CreatePilotJobInput,
+  row: PilotCaseRecord,
+): Promise<PilotCaseRecord> {
+  const onChain = await chainStatusOf(d, row);
+  if (onChain === OPEN || onChain === FUNDED) {
+    const pre = await checks(
+      d,
+      {
+        budgetAtomic: BigInt(row.budgetAtomic),
+        expirySeconds: row.expiredAt - (d.now ?? unixNow)(),
+        mode: row.mode,
+        deliverable: input.deliverable,
+      },
+      { balance: onChain === OPEN },
+    );
+    if (!pre.ok) throw new Error(`refusing to resume pilot case ${row.caseId}: ${pre.problem}`);
+  }
+  return continueCase(d, input, row);
+}
+
+/**
+ * The job's status on chain, once the job is shown to be this case's: its client is the buyer
+ * and its evaluator the referee, and once funded its budget is the row's. A job id taken from a
+ * simulate can name another job, and adopting that job would make the row lie.
+ */
+async function chainStatusOf(d: PilotJobDeps, row: PilotCaseRecord): Promise<number> {
+  const jobId = BigInt(row.jobId as string);
+  const s = await d.chain.job.escrowState(jobId);
+  const refuse = (what: string) =>
+    new Error(`refusing to continue pilot case ${row.caseId}: job ${jobId} ${what}`);
+  if (!sameAddress(s.client, row.buyerAddress))
+    throw refuse(`has client ${s.client}, not the buyer ${row.buyerAddress}`);
+  if (!sameAddress(s.evaluator, row.refereeAddress))
+    throw refuse(`has evaluator ${s.evaluator}, not the referee ${row.refereeAddress}`);
+  if ((s.status === FUNDED || s.status === SUBMITTED) && s.budget.toString() !== row.budgetAtomic)
+    throw refuse(`holds a budget of ${s.budget}, not the case's ${row.budgetAtomic}`);
+  return s.status;
+}
+
+const sameAddress = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+
 /** From the row's status and the chain's, one step at a time until the row is at submitted. */
 async function continueCase(
   d: PilotJobDeps,
@@ -212,11 +301,13 @@ async function continueCase(
   let row = start;
   const jobId = BigInt(row.jobId as string);
   while (row.status !== "submitted") {
-    const onChain = (await d.chain.job.escrowState(jobId)).status;
+    const onChain = await chainStatusOf(d, row);
     if (row.status === "created" && onChain === OPEN) row = await budgetAndFund(d, row, jobId);
     else if (row.status === "created" && onChain === FUNDED) row = adoptFund(d, row);
     else if (row.status === "funded" && onChain === FUNDED)
       row = await submitDeliverable(d, input, row, jobId);
+    else if (row.status === "funded" && onChain === SUBMITTED)
+      row = await adoptSubmit(d, input, row, jobId);
     else
       throw new Error(
         `refusing to continue pilot case ${row.caseId}: the row is at ${row.status} and job ${jobId} is at chain status ${onChain}`,
@@ -253,11 +344,69 @@ function adoptFund(d: PilotJobDeps, row: PilotCaseRecord): PilotCaseRecord {
   const sent =
     d.cases
       .events(row.caseId)
-      .filter((e) => e.step === "fund" && e.ref !== null)
+      .filter((e) => e.step === "fund" && e.ref !== null && SENT_STATUSES.has(e.status))
       .at(-1)?.ref ?? null;
   return d.cases.transaction(() => {
     d.cases.recordEvent(row.caseId, "fund", "observed_on_chain", sent, null);
     return moved(d, row, "funded", { fundTxHash: sent });
+  });
+}
+
+/** Event statuses whose hash names a transaction that may be on chain; a revert is not one. */
+const SENT_STATUSES: ReadonlySet<string> = new Set(["mined", "unconfirmed"]);
+
+/**
+ * The row says funded and the chain says Submitted: a submit this process sent landed after the
+ * run stopped (unconfirmed in time, or mined and the block read after it failed). The row is
+ * moved only when the last submit event's transaction mined a `Submitted` log for this job whose
+ * deliverable is the hash of the bytes given now; the hash and block time come from its receipt.
+ */
+async function adoptSubmit(
+  d: PilotJobDeps,
+  input: CreatePilotJobInput,
+  row: PilotCaseRecord,
+  jobId: bigint,
+): Promise<PilotCaseRecord> {
+  const { chain, cases } = d;
+  const refuse = (what: string) =>
+    new Error(`refusing to adopt the submit of pilot case ${row.caseId}: ${what}`);
+  const sent = cases
+    .events(row.caseId)
+    .filter((e) => e.step === "submit" && e.ref !== null && SENT_STATUSES.has(e.status))
+    .at(-1)?.ref as Hex | undefined;
+  if (!sent)
+    throw refuse(`job ${jobId} is Submitted on chain but this case recorded no submit transaction`);
+  let receipt: Awaited<ReturnType<typeof chain.publicClient.getTransactionReceipt>>;
+  try {
+    receipt = await chain.publicClient.getTransactionReceipt({ hash: sent });
+  } catch {
+    throw refuse(`the receipt of ${sent} could not be read yet; resume again once it is mined`);
+  }
+  if (receipt.status !== "success") throw refuse(`${sent} reverted on chain`);
+  const log = parseEventLogs({ abi: submittedEventAbi, logs: receipt.logs }).find(
+    (l) => sameAddress(l.address, chain.jobContract) && l.args.jobId === jobId,
+  );
+  if (!log) throw refuse(`${sent} carries no Submitted log for job ${jobId}`);
+  const { bytes, extension } = input.deliverable;
+  const deliverableHash = keccak256(bytes);
+  if (log.args.deliverable.toLowerCase() !== deliverableHash.toLowerCase())
+    throw refuse(
+      `the chain holds deliverable hash ${log.args.deliverable}, and the deliverable given hashes to ${deliverableHash}`,
+    );
+  const block = await chain.publicClient.getBlock({ blockNumber: receipt.blockNumber });
+  const stored = d.docStore.putBytes(
+    `pilot-${row.caseId}-deliverable.${extension}`,
+    Buffer.from(bytes),
+  );
+  return cases.transaction(() => {
+    cases.recordEvent(row.caseId, "submit", "observed_on_chain", sent, null);
+    return moved(d, row, "submitted", {
+      deliverablePath: stored.path,
+      deliverableHash,
+      deliverableExtension: extension,
+      submitTxHash: sent,
+      submittedBlockTime: Number(block.timestamp),
+    });
   });
 }
 
