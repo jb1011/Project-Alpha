@@ -1188,7 +1188,7 @@ describe("free texts refuse invisible format characters, naming the code point",
     },
   );
 
-  const RLO = "‮";
+  const RLO = String.fromCodePoint(0x202e);
 
   test("in the description file", async () => {
     const fake = makeFake();
@@ -1223,7 +1223,14 @@ describe("free texts refuse invisible format characters, naming the code point",
   test("in the fail reason", async () => {
     const fake = makeFake();
     await expect(
-      run(fake, ["pilot:case", "fail", "pc_000000000000", "--reason", "x​y", "--yes"]),
+      run(fake, [
+        "pilot:case",
+        "fail",
+        "pc_000000000000",
+        "--reason",
+        `x${String.fromCodePoint(0x200b)}y`,
+        "--yes",
+      ]),
     ).rejects.toThrow("refusing: --reason holds the invisible format character U+200B");
     expect(fake.opened()).toBe(0);
   });
