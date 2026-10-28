@@ -47,6 +47,7 @@ import { type JobWorker, TrivialWorker } from "../../src/jobs/worker";
 import { withKeyedLock } from "../../src/payments/keyedMutex";
 import { migrate } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
+import { jobSubmittedEventAbi } from "../../src/pilot/jobEvents";
 import { FAKE_PROVIDER_ADDRESS, makeFakeDocStore, seedBoundEntity } from "./runJobDeps";
 
 /** The two ERC-20 entry points this node implements, as `jobAdapter.ts` calls them. */
@@ -175,16 +176,22 @@ export interface UsdcJobNodeOptions {
   /** The owner of an agent id, or undefined for an id that was never minted (the call reverts). */
   ownerOf?: (agentId: bigint) => Address | undefined;
   /**
-   * Run `submit` as the contract does: a Funded job moves to Submitted and the receipt carries a
-   * `Submitted(jobId, deliverable)` log; any other status reverts. Off by default, where a submit
-   * is mined as `other` and changes nothing, as before.
+   * Run `submit` as the deployed contract does: a Funded job moves to Submitted and the receipt
+   * carries a `JobSubmitted(jobId, provider, deliverable)` log, the provider being the sender; any
+   * other status reverts. Off by default, where a submit is mined as `other` and changes nothing,
+   * as before.
    */
   runSubmit?: boolean;
   /**
-   * With {runSubmit}, mine a successful `submit` without its `Submitted` log: a deployment whose
-   * contract emits no such event. Off by default, where the log is written as before.
+   * With {runSubmit}, mine a successful `submit` without its `JobSubmitted` log: a contract that
+   * emits another shape or none. Off by default, where the log is written as before.
    */
   omitSubmittedLog?: boolean;
+  /**
+   * With {runSubmit}, write the `JobSubmitted` log with these values instead of the call's: a log
+   * that disagrees with the submit it came from. Off by default, where the log repeats the call.
+   */
+  skewJobSubmittedLog?: { deliverable?: Hex; provider?: Address };
   /**
    * Answer `eth_getTransactionByHash` with the transaction the node accepted under that hash
    * (pending, with no block, while its receipt is withheld). Off by default, where the node
@@ -192,18 +199,6 @@ export interface UsdcJobNodeOptions {
    */
   answerTransactions?: boolean;
 }
-
-/** The `Submitted` event as the mock job contract emits it. */
-const submittedEvent = [
-  {
-    type: "event",
-    name: "Submitted",
-    inputs: [
-      { name: "jobId", type: "uint256", indexed: true },
-      { name: "deliverable", type: "bytes32", indexed: false },
-    ],
-  },
-] as const;
 
 export function usdcJobNode(opts: UsdcJobNodeOptions) {
   const allowances = new Map<string, bigint>();
@@ -221,9 +216,9 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
   /** A withheld receipt's status, published only by `releaseWithheld`. */
   const withheldReceipts = new Map<string, "0x1" | "0x0">();
   /** The logs a receipt carries, by transaction hash; only an opted-in `submit` writes one. */
-  const logsOf = new Map<string, { jobId: bigint; deliverable: Hex }>();
-  /** The `Submitted` log of the transaction being executed, picked up when it is accepted. */
-  let pendingLog: { jobId: bigint; deliverable: Hex } | undefined;
+  const logsOf = new Map<string, { jobId: bigint; provider: Address; deliverable: Hex }>();
+  /** The `JobSubmitted` log of the transaction being executed, picked up when it is accepted. */
+  let pendingLog: { jobId: bigint; provider: Address; deliverable: Hex } | undefined;
   /** The raw signed transaction accepted under each hash, for {answerTransactions}. */
   const rawOf = new Map<string, Hex>();
   const actions: NodeAction[] = [];
@@ -386,7 +381,12 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
       if (!j || j.status !== 1 || from.toLowerCase() !== j.provider.toLowerCase())
         return { call: "submit", from, status: "reverted" };
       j.status = 2; // Submitted
-      if (!opts.omitSubmittedLog) pendingLog = { jobId, deliverable };
+      if (!opts.omitSubmittedLog)
+        pendingLog = {
+          jobId,
+          provider: opts.skewJobSubmittedLog?.provider ?? from,
+          deliverable: opts.skewJobSubmittedLog?.deliverable ?? deliverable,
+        };
       return { call: "submit", from, status: "success" };
     }
     // ── The two refunds, with the contract's own rules (see `test/mocks/MockERC8183Job.sol`) ──
@@ -509,9 +509,9 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
               {
                 address: opts.jobContract,
                 topics: encodeEventTopics({
-                  abi: submittedEvent,
-                  eventName: "Submitted",
-                  args: { jobId: l.jobId },
+                  abi: jobSubmittedEventAbi,
+                  eventName: "JobSubmitted",
+                  args: { jobId: l.jobId, provider: l.provider },
                 }),
                 data: encodeAbiParameters([{ type: "bytes32" }], [l.deliverable]),
                 blockNumber: "0x1",

@@ -10,7 +10,7 @@
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type Address, type Hex, keccak256 } from "viem";
+import { type Address, type Hex, keccak256, parseEventLogs } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { beforeEach, expect, test, vi } from "vitest";
 import { JobAdapter } from "../../src/adapters/arc/jobAdapter";
@@ -35,6 +35,7 @@ import {
   pilotCaseIdOf,
   preflightPilotJob,
 } from "../../src/pilot/job";
+import { jobSubmittedEventAbi } from "../../src/pilot/jobEvents";
 import type { LookupClient } from "../../src/pilot/lookup";
 import {
   JOB_CONTRACT,
@@ -84,6 +85,7 @@ function setup(
     withholdReceipt?: "fund" | "submit";
     runSubmit?: boolean;
     omitSubmittedLog?: boolean;
+    skewJobSubmittedLog?: { deliverable?: Hex; provider?: Address };
   } = {},
 ) {
   /** The clock in seconds, shared by the node and the job; a test moves it with `setClock`. */
@@ -95,6 +97,7 @@ function setup(
     now: () => clock,
     runSubmit: o.runSubmit,
     omitSubmittedLog: o.omitSubmittedLog,
+    skewJobSubmittedLog: o.skewJobSubmittedLog,
     // A submit is adopted from its transaction, so the node answers what it accepted.
     answerTransactions: true,
     identityRegistry: REGISTRY,
@@ -464,8 +467,8 @@ test("resuming refuses a row that is not at created or funded, an unknown case a
 
 // ── A submit that landed while the row stayed at funded ─────────────────────────────────────────
 
-test("an unconfirmed submit that landed: the resume reads the Submitted log, checks the hash and adopts it", async () => {
-  const { node, cases, deps } = setup({ runSubmit: true, withholdReceipt: "submit" });
+test("an unconfirmed submit that landed: the resume reads the JobSubmitted log, checks the hash and adopts it", async () => {
+  const { node, cases, deps, chain } = setup({ runSubmit: true, withholdReceipt: "submit" });
   await expect(createPilotJob(deps, input())).rejects.toBeInstanceOf(ChainTxUnconfirmedError);
   const [row] = cases.list();
   expect(row?.status).toBe("funded");
@@ -482,6 +485,16 @@ test("an unconfirmed submit that landed: the resume reads the Submitted log, che
   expect(cases.find(row!.caseId)?.status).toBe("funded");
 
   node.releaseWithheld();
+  // The receipt carries the deployed contract's log: this job, the seller, the deliverable.
+  const [logged] = parseEventLogs({
+    abi: jobSubmittedEventAbi,
+    logs: (await chain.publicClient.getTransactionReceipt({ hash: submitHash! })).logs,
+  });
+  expect(logged?.args).toEqual({
+    jobId: 1n,
+    provider: SELLER,
+    deliverable: keccak256(DELIVERABLE),
+  });
   const sends = node.sends.length;
   const done = await createPilotJob(deps, input(), row!.caseId);
   expect(done.status).toBe("submitted");
@@ -536,7 +549,7 @@ test("adopting a submit refuses when the deliverable given does not hash to the 
   expect(cases.find(row!.caseId)?.status).toBe("funded");
 });
 
-test("a submit is adopted from its call and receipt when the contract emits no Submitted log", async () => {
+test("a submit is adopted from its call and receipt when the contract emits no JobSubmitted log", async () => {
   const { node, cases, deps, chain } = setup({
     runSubmit: true,
     omitSubmittedLog: true,
@@ -556,6 +569,43 @@ test("a submit is adopted from its call and receipt when the contract emits no S
   expect(done.deliverableHash).toBe(keccak256(DELIVERABLE));
   expect(node.sends).toHaveLength(sends);
 });
+
+test.each<[string, { deliverable?: Hex; provider?: Address }, (h: Hex) => RegExp]>([
+  [
+    "another deliverable hash",
+    { deliverable: `0x${"ab".repeat(32)}` as Hex },
+    (h) =>
+      new RegExp(
+        `${h} has a JobSubmitted log for job 1 with deliverable hash 0x(ab){32}, and the deliverable given hashes to ${keccak256(DELIVERABLE)}`,
+      ),
+  ],
+  [
+    "another provider",
+    { provider: STRANGER },
+    (h) =>
+      new RegExp(
+        `${h} has a JobSubmitted log for job 1 naming provider ${STRANGER}, not the seller ${SELLER}`,
+        "i",
+      ),
+  ],
+])(
+  "a JobSubmitted log naming %s than the submit call refuses the adoption",
+  async (_n, skew, problem) => {
+    const { node, cases, deps } = setup({
+      runSubmit: true,
+      withholdReceipt: "submit",
+      skewJobSubmittedLog: skew,
+    });
+    await expect(createPilotJob(deps, input())).rejects.toBeInstanceOf(ChainTxUnconfirmedError);
+    node.releaseWithheld();
+    const [row] = cases.list();
+    const submitHash = node.hashesOf("submit")[0]!;
+    const sends = node.sends.length;
+    await expect(createPilotJob(deps, input(), row!.caseId)).rejects.toThrow(problem(submitHash));
+    expect(cases.find(row!.caseId)?.status).toBe("funded");
+    expect(node.sends).toHaveLength(sends);
+  },
+);
 
 test("of a submit that landed and a later one that reverted, the resume adopts the one that landed", async () => {
   const { node, cases, deps, chain } = setup({ runSubmit: true, withholdReceipt: "submit" });

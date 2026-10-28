@@ -2,7 +2,8 @@
  * The pilot job end to end on anvil: MockUSDC, MockERC8183Job and MockIdentityRegistry, the
  * buyer as the job's client, the seller as its provider, the referee as its evaluator. Here the
  * contract enforces who may call what, so the signers are proven by the calls succeeding, and the
- * `Submitted` log proves the deliverable's hash reached the chain.
+ * mock's `Submitted` log proves the deliverable's hash reached the chain (the deployed contract
+ * emits `JobSubmitted` instead, which the fake node tests cover).
  */
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -33,7 +34,11 @@ import { type MockJobEnv, deployMockJob } from "../helpers/anvilJob";
 import { loadArtifact } from "../helpers/artifacts";
 
 const BUDGET = 500_000n;
-const DELIVERABLE = new TextEncoder().encode("date,amount\n2026-10-01,12.50\n");
+/** The deliverable of test case 1, and the hash its fixture is pinned to. */
+const DELIVERABLE = new Uint8Array(
+  readFileSync(join(import.meta.dirname, "..", "fixtures", "pilot", "test-case-1-report.csv")),
+);
+const DELIVERABLE_HASH = "0xadedff9ae723ade4bfc2b287cd6818eb22151ed6a168c50f6df101c97d6cffb5";
 
 let env: MockJobEnv;
 let registry: Address;
@@ -137,7 +142,8 @@ test("the buyer creates and funds, the seller submits, and the Submitted log car
   const row = await createPilotJob(deps, input);
 
   expect(row.status).toBe("submitted");
-  expect(row.deliverableHash).toBe(keccak256(DELIVERABLE));
+  expect(keccak256(DELIVERABLE)).toBe(DELIVERABLE_HASH);
+  expect(row.deliverableHash).toBe(DELIVERABLE_HASH);
   expect(new Uint8Array(readFileSync(row.deliverablePath!))).toEqual(DELIVERABLE);
   for (const h of [row.createTxHash, row.fundTxHash, row.submitTxHash])
     expect(h).toMatch(/^0x[0-9a-f]{64}$/);

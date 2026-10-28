@@ -11,6 +11,7 @@ import type { FileDocumentStore } from "../persistence/documentStore";
 import { publicErrorMessage } from "../workflow/publicError";
 import { type PilotCaseRepository, newCaseId } from "./casesRepository";
 import type { PilotChain } from "./composition";
+import { jobSubmittedEventAbi, submittedDeliverableOf } from "./jobEvents";
 import { type LookupClient, activeLegalName } from "./lookup";
 import type { PilotCaseRecord, PilotMode } from "./types";
 
@@ -56,22 +57,6 @@ const MIN_REHEARSAL_EXPIRY_SECONDS = 120;
 const OPEN = 0;
 const FUNDED = 1;
 const SUBMITTED = 2;
-
-/**
- * The job contract's `Submitted` event, as the mock contract declares it: the backend's interface
- * ABI carries no events, and a deployed contract may emit none. Adoption never depends on it: a
- * log of this shape, when present, is only a second confirmation of the submit call itself.
- */
-const submittedEventAbi = [
-  {
-    type: "event",
-    name: "Submitted",
-    inputs: [
-      { name: "jobId", type: "uint256", indexed: true },
-      { name: "deliverable", type: "bytes32", indexed: false },
-    ],
-  },
-] as const;
 
 const unixNow = () => Math.floor(Date.now() / 1000);
 
@@ -422,8 +407,9 @@ const SENT_STATUSES: ReadonlySet<string> = new Set(["mined", "unconfirmed"]);
  * run stopped (unconfirmed in time, or mined and the block read after it failed). The case's sent
  * submits are tried newest first, and the first one proven to be this case's submit is adopted:
  * a transaction to the job contract from the seller whose calldata is `submit` of this job with
- * the hash of the bytes given now, with a successful receipt. A `Submitted` log, when the
- * contract emits one, must agree; its absence is not a refusal. The hash and block time come
+ * the hash of the bytes given now, with a successful receipt. A `JobSubmitted` log, when the
+ * contract emits one, must agree on the deliverable and the provider; its absence is not a
+ * refusal, since a contract may emit another shape (the local mock does). The hash and block time come
  * from the adopted transaction's receipt.
  */
 async function adoptSubmit(
@@ -511,11 +497,22 @@ async function submitProofOf(
     return "has a receipt that could not be read yet; resume again once it is mined";
   }
   if (receipt.status !== "success") return "has a receipt that says it reverted on chain";
-  const logs = parseEventLogs({ abi: submittedEventAbi, logs: receipt.logs }).filter(
-    (l) => sameAddress(l.address, chain.jobContract) && l.args.jobId === jobId,
+  let logged: Hex | undefined;
+  try {
+    logged = submittedDeliverableOf(receipt.logs, chain.jobContract, jobId);
+  } catch {
+    return `has JobSubmitted logs for job ${jobId} that disagree on the deliverable hash`;
+  }
+  if (logged !== undefined && logged.toLowerCase() !== deliverableHash.toLowerCase())
+    return `has a JobSubmitted log for job ${jobId} with deliverable hash ${logged}, and the deliverable given hashes to ${deliverableHash}`;
+  const otherProvider = parseEventLogs({ abi: jobSubmittedEventAbi, logs: receipt.logs }).find(
+    (l) =>
+      sameAddress(l.address, chain.jobContract) &&
+      l.args.jobId === jobId &&
+      !sameAddress(l.args.provider, row.sellerAddress),
   );
-  if (logs.some((l) => l.args.deliverable.toLowerCase() !== deliverableHash.toLowerCase()))
-    return `has a Submitted log for job ${jobId} with another deliverable hash than ${deliverableHash}`;
+  if (otherProvider)
+    return `has a JobSubmitted log for job ${jobId} naming provider ${otherProvider.args.provider}, not the seller ${row.sellerAddress}`;
   return { blockNumber: receipt.blockNumber };
 }
 

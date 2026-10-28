@@ -119,7 +119,7 @@ export interface JobResult {
   status: number;
   hook: Address;
   // Note: the submitted deliverable is NOT in the Job struct on-chain.
-  // To read it, query the Submitted(jobId, deliverable) event log.
+  // To read it, query the JobSubmitted(jobId, provider, deliverable) event log.
 }
 
 /**
@@ -203,8 +203,9 @@ export class JobAdapter {
   /**
    * createJob — client creates a new job.
    *
-   * The real contract emits no JobCreated event, so the jobId comes from simulateContract's
-   * return value. On a shared, heavily-used counter a concurrent createJob mining between
+   * The interface ABI declares no events, so the jobId is taken from simulateContract's return
+   * value rather than from a log. On a shared, heavily-used counter a concurrent createJob
+   * mining between
    * simulate and inclusion could shift the id — acceptable for the demo (our createJobs are
    * infrequent and persisted immediately), flagged as a V2 hardening caveat.
    *
