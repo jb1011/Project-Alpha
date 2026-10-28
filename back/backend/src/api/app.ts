@@ -33,6 +33,7 @@ import { mountMetadataRoutes } from "./routes/metadata";
 import { mountProtectedRoutes } from "./routes/onboard";
 import { mountPasskeyRoutes } from "./routes/passkey";
 import { mountPerTxCapRoutes } from "./routes/perTxCap";
+import { mountPilotCaseRoutes } from "./routes/pilotCases";
 import { mountPolicyRoutes } from "./routes/policy";
 import { mountProfileRoutes } from "./routes/profile";
 import { mountReputationRoutes } from "./routes/reputation";
@@ -299,6 +300,12 @@ export interface ApiDeps extends EntityViewDeps {
    */
   legalBodyStatements?: LegalBodyStatementDeps;
   /**
+   * The dispute pilot's cases, public and read only: `GET /pilot/cases` and
+   * `GET /pilot/cases/:caseId`. Present only on a box with the pilot block or the Kleros block;
+   * absent, neither route is mounted (404).
+   */
+  pilotCases?: import("./routes/pilotCases").PilotCaseDeps;
+  /**
    * The Hedera rail (design 2026-09-10). Present exactly when `HEDERA_ENABLED` produced a whole
    * `cfg.hedera` block; absent, the three MCP tools are NOT REGISTERED at all — not registered
    * and refusing, which would still advertise a capability this deployment does not have.
@@ -385,7 +392,11 @@ export function buildApiApp(deps: ApiDeps) {
         // The legal-body lookup (D3): a seller's own page, on a domain we will never know, has to
         // be able to ask. Same class of surface as `/transparency` — it publishes nothing that is
         // not already on it.
-        c.req.path.startsWith("/legal-bodies/")
+        c.req.path.startsWith("/legal-bodies/") ||
+        // The pilot's cases, read by a page that may sit on another origin: test data that is
+        // public on purpose, read only, with no credential.
+        c.req.path === "/pilot/cases" ||
+        c.req.path.startsWith("/pilot/cases/")
           ? "*"
           : deps.webOrigin,
       allowHeaders: ["authorization", "content-type"],
@@ -474,6 +485,9 @@ export function buildApiApp(deps: ApiDeps) {
   // a Hedera account's `hcs-11:` memo points at, read by agents holding no key of ours (task 11).
   mountProfileRoutes(app, deps);
   mountTransparencyRoutes(app, deps);
+  // The pilot's cases: public and unauthenticated like `/transparency`, outside `protect()` below,
+  // and mounted only where the pilot deps are wired.
+  mountPilotCaseRoutes(app, deps);
   // Public and unauthenticated for the same reason `/transparency` is, and mounted here so it is
   // outside `protect()` below: the caller is a seller that has never heard of us.
   mountLegalBodyRoutes(app, deps);
