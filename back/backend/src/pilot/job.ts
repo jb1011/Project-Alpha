@@ -240,6 +240,19 @@ function resumable(d: PilotJobDeps, input: CreatePilotJobInput, caseId: string):
     );
   if (row.jobId === null)
     throw new Error(`refusing to resume pilot case ${caseId}: it has no job id`);
+  // The case's own parties: a resume under another agent configuration would vet other agents
+  // and sign with other keys. Ids and addresses only; no key is named.
+  const pairs: [string, string, string, boolean][] = [
+    ["buyer's agent id", row.buyerAgentId, d.agentIds.buyer, false],
+    ["seller's agent id", row.sellerAgentId, d.agentIds.seller, false],
+    ["buyer's address", row.buyerAddress, d.chain.addresses.buyer, true],
+    ["seller's address", row.sellerAddress, d.chain.addresses.seller, true],
+  ];
+  for (const [what, onRow, now, isAddress] of pairs)
+    if (isAddress ? !sameAddress(onRow, now) : onRow !== now)
+      throw new Error(
+        `refusing to resume pilot case ${caseId}: the case's ${what} is ${onRow}, and this command's is ${now}`,
+      );
   return row;
 }
 

@@ -652,3 +652,52 @@ test("pre-flight boundaries: the budget at the maximum, the balance at budget pl
     (await preflightPilotJob(exact, input({ mode: "live", expirySeconds: 2_592_000 }))).ok,
   ).toBe(true);
 });
+
+// ── The case's own agents and addresses on resume ───────────────────────────────────────────────
+
+test.each<[string, (d: PilotJobDeps) => PilotJobDeps, RegExp]>([
+  [
+    "the buyer's agent id",
+    (d) => ({ ...d, agentIds: { ...d.agentIds, buyer: "99" } }),
+    /the case's buyer's agent id is 41, and this command's is 99/,
+  ],
+  [
+    "the seller's agent id",
+    (d) => ({ ...d, agentIds: { ...d.agentIds, seller: "98" } }),
+    /the case's seller's agent id is 42, and this command's is 98/,
+  ],
+  [
+    "the buyer's address",
+    (d) => ({ ...d, chain: { ...d.chain, addresses: { ...d.chain.addresses, buyer: STRANGER } } }),
+    /the case's buyer's address is .*, and this command's is /,
+  ],
+  [
+    "the seller's address",
+    (d) => ({ ...d, chain: { ...d.chain, addresses: { ...d.chain.addresses, seller: STRANGER } } }),
+    /the case's seller's address is .*, and this command's is /,
+  ],
+])(
+  "a resume refuses when %s differs from the case's, and sends nothing",
+  async (_n, change, problem) => {
+    const { node, deps, row } = await createdAfterRevertedFund();
+    const sent = node.sends.length;
+    await expect(createPilotJob(change(deps), input(), row.caseId)).rejects.toThrow(problem);
+    expect(node.sends).toHaveLength(sent);
+  },
+);
+
+test("a resume with the case's own agents and addresses, in another letter case, goes through", async () => {
+  const { deps, row } = await createdAfterRevertedFund();
+  const lower = {
+    ...deps,
+    chain: {
+      ...deps.chain,
+      addresses: {
+        ...deps.chain.addresses,
+        buyer: deps.chain.addresses.buyer.toLowerCase() as Address,
+        seller: deps.chain.addresses.seller.toLowerCase() as Address,
+      },
+    },
+  };
+  expect((await createPilotJob(lower, input(), row.caseId)).status).toBe("submitted");
+});
