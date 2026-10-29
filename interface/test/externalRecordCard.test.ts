@@ -200,6 +200,7 @@ describe("the card", () => {
     );
     expect(m.figures).toEqual([]);
     expect(m.status).toBe("Could not read Arc just now.");
+    expect(m.notices).toEqual(["Aevum's record could not be read just now."]);
     expect(m.retry).toBe(true);
   });
 

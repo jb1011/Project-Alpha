@@ -37,6 +37,9 @@ const TIMELOCK_TICK_MS = 1_000;
 
 /** How long to wait before asking the treasury again when restoring a scheduled change failed. */
 const RESTORE_RETRY_MS = 5_000;
+/** …a bounded number of times: a read that keeps failing (a wallet on another chain) must not
+ *  poll for as long as the record stands. A reload starts over. */
+const RESTORE_MAX_RETRIES = 6;
 
 type PendingPolicy = {
   policyId: `0x${string}`;
@@ -175,7 +178,8 @@ export function AgentSettings({ entityId }: { entityId: string }) {
       } catch {
         // Unchecked: ask again shortly, or a blip at load would hide the change (and its Veto
         // button) until a full reload.
-        if (!cancelled) retry = setTimeout(() => setRestoreAttempt((n) => n + 1), RESTORE_RETRY_MS);
+        if (!cancelled && restoreAttempt < RESTORE_MAX_RETRIES)
+          retry = setTimeout(() => setRestoreAttempt((n) => n + 1), RESTORE_RETRY_MS);
       }
     })();
     return () => {

@@ -170,8 +170,8 @@ export function externalRecordCardModel(
     }
   }
 
-  // With nothing graded on Arc there is no worst-result line to carry the failure, so it is said.
-  if (record.status === "unavailable" && chain.status === "ok" && chain.graded === 0)
+  // Without counts on Arc there is no worst-result line to carry the failure, so it is said.
+  if (record.status === "unavailable" && !(chain.status === "ok" && chain.graded > 0))
     notices.push(`${recordSource} could not be read just now.`);
   if (record.status === "unavailable") retry = true;
   if (record.status === "not_linked") notices.push(`This identity names no ${providerName} wallet.`);
