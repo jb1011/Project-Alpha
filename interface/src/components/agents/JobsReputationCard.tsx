@@ -11,9 +11,11 @@ export function JobsReputationCard({ entityId }: { entityId: string }) {
 
   return (
     <Card className="overflow-hidden">
-      <div className="flex items-center justify-between border-b hairline px-5 py-3.5">
-        <span className="text-[13px] font-medium text-ink">Jobs &amp; reputation</span>
-        <span className="text-[11.5px] text-muted-2">ERC-8183 track record</span>
+      <div className="flex items-baseline justify-between gap-3 border-b hairline px-4 py-3">
+        <h2 className="text-[20px] font-medium leading-tight tracking-[-0.02em] text-ink">
+          Jobs and reputation
+        </h2>
+        <span className="shrink-0 text-[12px] text-muted-2">ERC-8183 track record</span>
       </div>
 
       {reputation.data && (

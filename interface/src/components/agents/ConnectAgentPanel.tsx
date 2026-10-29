@@ -41,8 +41,10 @@ export function ConnectAgentPanel({ entity }: { entity: EntityView }) {
   }
 
   return (
-    <Card className="p-5">
-      <div className="text-[11px] uppercase tracking-[0.18em] text-muted-2">Connect your agent</div>
+    <Card className="p-4">
+      <h2 className="text-[20px] font-medium leading-tight tracking-[-0.02em] text-ink">
+        Connect your agent
+      </h2>
       <p className="mt-2 text-[12px] leading-relaxed text-muted">
         Generate a scoped connection so your MCP agent (Claude Code, Cursor, …) can operate this legal body.
       </p>

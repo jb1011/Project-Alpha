@@ -35,7 +35,14 @@ export function Nav() {
               />
               <span>My agents</span>
             </Link>
-          ) : null}
+          ) : (
+            <Link
+              href="/agents"
+              className="inline-flex items-center rounded-full border hairline-strong px-3.5 py-2 text-[13px] text-ink transition-colors hover:bg-paper-2"
+            >
+              Log in
+            </Link>
+          )}
           <Link
             href="/onboarding"
             className="group inline-flex items-center gap-1.5 rounded-full bg-ink px-4 py-2 text-[13px] font-medium text-paper hover:bg-ink-hover transition-colors"
