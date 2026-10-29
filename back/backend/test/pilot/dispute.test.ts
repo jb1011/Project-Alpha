@@ -408,7 +408,7 @@ function insertRow(h: Harness, mode: PilotMode, status: PilotStatus): PilotCaseR
 }
 
 /** A testnet case filed and recorded as looked at in the Court interface: the live gate's key. */
-function seenTestnetCase(h: Harness): void {
+function seenTestnetCase(h: Harness): PilotCaseRecord {
   const row = insertRow(h, "testnet", "filed");
   h.cases.recordEvent(
     row.caseId,
@@ -417,6 +417,7 @@ function seenTestnetCase(h: Harness): void {
     "https://court.example/1",
     "by an operator",
   );
+  return row;
 }
 
 const notSent = (o: unknown) => (o as { outcome: string }).outcome === "not_sent";
@@ -1023,6 +1024,31 @@ describe("the pre-flight refuses, and writes nothing", () => {
     },
   );
 
+  test("a job whose description on chain is not the row's, which the public case view serves", async () => {
+    const h = setup();
+    const row = await h.contested();
+    h.node.chainJob(BigInt(row.jobId!))!.description = "Another job's description.";
+    const { stage, kleros } = rehearsal();
+    const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: null });
+    expect(notSent(out)).toBe(true);
+    expect(textOf(out)).toContain("another description than the case's");
+    expectNothingWritten(h, row, kleros.calls);
+  });
+
+  test.each(["CSV", "reportfile123", "c.sv"])(
+    "a deliverable extension the Dispute Service refuses (%s) is refused by its own code, before any read",
+    async (extension) => {
+      const h = setup();
+      const row = await h.contested();
+      h.cases.patch(row.caseId, { deliverableExtension: extension });
+      const { stage, kleros } = rehearsal();
+      const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: null });
+      expect(out).toMatchObject({ outcome: "not_sent", code: "deliverable_extension_invalid" });
+      expect(textOf(out)).toContain("one to ten lowercase letters or digits");
+      expectNothingWritten(h, row, kleros.calls);
+    },
+  );
+
   test("under two hours to the job's expiry; exactly two hours passes", async () => {
     const h = setup();
     const row = await h.contested();
@@ -1372,6 +1398,57 @@ describe("the move to filing, and the mark before the create", () => {
       expect(h.cases.find(row.caseId)?.status).toBe("contested");
     },
   );
+
+  test("live: the gate is read again in the move, so a testnet case failed meanwhile closes it", async () => {
+    const h = setup();
+    const seen = seenTestnetCase(h);
+    const row = await h.contested("live");
+    // The only seen testnet case leaves the gate's count between the pre-flight and the move.
+    const cases = beforeMove(h, () => h.cases.advance(seen.caseId, "filed", "failed"));
+    const { stage, seen: requests } = http("live");
+    const out = await fileDispute(h.deps(stage, { cases }), row.caseId, {
+      confirmedFlag: "--live",
+    });
+    expect(notSent(out)).toBe(true);
+    expect(textOf(out)).toContain("file and look at a testnet case first");
+    expect(writesOf(requests)).toEqual([]);
+    expect(h.cases.find(row.caseId)?.status).toBe("contested");
+  });
+
+  test("a create whose sending mark cannot be written was never sent: not_sent, contested, zero creates", async () => {
+    const h = setup();
+    const row = await h.contested();
+    // The first transaction after the pin is the mark's: it fails once, as a busy database would.
+    let pinned = false;
+    const cases = new Proxy(h.cases, {
+      get(target, prop, receiver) {
+        if (prop === "recordEvent")
+          return (...a: Parameters<typeof target.recordEvent>) => {
+            if (a[1] === "pin" && a[2] === "published") pinned = true;
+            target.recordEvent(...a);
+          };
+        if (prop === "transaction")
+          return <T>(fn: () => T): T => {
+            if (pinned) {
+              pinned = false;
+              throw new Error("SQLITE_BUSY: database is locked");
+            }
+            return target.transaction(fn);
+          };
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const { stage, kleros } = rehearsal();
+    const out = await fileDispute(h.deps(stage, { cases }), row.caseId, { confirmedFlag: null });
+    expect(out).toMatchObject({ outcome: "not_sent" });
+    expect(textOf(out)).toContain("could not be marked as sending, so nothing was sent");
+    expect(kleros.calls.filter((c) => c.tool === "dispute_create")).toEqual([]);
+    const done = h.cases.find(row.caseId)!;
+    expect([done.status, done.createDisputeTx]).toEqual(["contested", null]);
+    // The filing's own trail (the job step's chain create is also a "create" event).
+    const creates = trail(h, row.caseId).filter(([step]) => step === "create");
+    expect(creates.map(([, status]) => status)).toEqual(["not_marked"]);
+  });
 
   test("a move to filing that fails is not_sent, with no write", async () => {
     const h = setup();

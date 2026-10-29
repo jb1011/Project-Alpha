@@ -678,6 +678,21 @@ describe("pilot:dispute on a row left at filing, testnet mode, through the real 
   });
 });
 
+describe("pilot:dispute: the help text", () => {
+  test("names each court by its deployment's label, with live only as the flag and the mode", () => {
+    const program = new Command();
+    registerPilotCommands(program, makeFake().open, {});
+    const options = program.commands.find((c) => c.name() === "pilot:dispute")?.options ?? [];
+    const help = (flag: string) => options.find((o) => o.long === flag)?.description;
+    expect(help("--testnet")).toBe(
+      "confirm a filing on the Kleros testnet court (arbitrum-sepolia-testnet); testnet mode only",
+    );
+    expect(help("--live")).toBe(
+      "confirm a filing on the Kleros Agentic Commerce Court (arbitrum-one); live mode only",
+    );
+  });
+});
+
 describe("pilot:kleros check", () => {
   test("prints the check, the instructions in full, and succeeds when there is no problem", async () => {
     const fake = makeFake("testnet");

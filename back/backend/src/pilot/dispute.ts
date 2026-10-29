@@ -112,6 +112,13 @@ const MIN_SECONDS_TO_EXPIRY = 7_200;
  * A `filing` row younger than this is another command's filing in progress. It covers the
  * client's write deadlines (the create and the submit up to four minutes each), its own waits
  * on WRITE_IN_PROGRESS (up to two minutes a write) and the one more call after them.
+ *
+ * The client's worst case before the create is about 20 minutes (a pin of four 120 s attempts
+ * and 120 s of WRITE_IN_PROGRESS waits, twice with the one more call, plus the rate limiter's
+ * waits), so the window leaves a margin of about 8 to 10 minutes, and it must stay above that
+ * bound whenever the client's deadlines or retries change. It decides liveness only: a slow
+ * command frozen early sends nothing (its sending mark refuses a row it no longer owns), so no
+ * dispute is ever created twice; the case then waits for a human.
  */
 const FILING_IN_PROGRESS_SECONDS = 30 * 60;
 /**
@@ -126,6 +133,9 @@ const UNAUTHORIZED = "unauthorized";
 const PIN_CHECKED_ONLY = "pin_checked_only";
 const FILING_IN_PROGRESS = "filing_in_progress";
 const FILING_MOVED = "filing_moved";
+const DELIVERABLE_EXTENSION_INVALID = "deliverable_extension_invalid";
+/** The extensions the Dispute Service attaches: one to ten lowercase letters or digits. */
+const SERVICE_EXTENSION = /^[a-z0-9]{1,10}$/;
 const UNAUTHORIZED_TEXT =
   "the Dispute Service refused the key of this stage (HTTP 401): it is wrong or revoked; nothing was sent";
 /** The alias slot keys of the preset when no Kleros config is set (a rehearsal box). */
@@ -195,6 +205,7 @@ export async function fileDispute(
       const count = cases.countFiled(stage.mode);
       if (stage.cap !== null && count >= stage.cap)
         return capProblemOf(stage.mode, count, stage.cap);
+      if (stage.mode === "live" && cases.countSeenInCourt("testnet") < 1) return LIVE_GATE;
       const current = cases.find(caseId);
       if (current === undefined) return `no pilot case ${caseId}`;
       if (current.klerosChain !== null && !sameDeployment(current, deployment))
@@ -274,17 +285,28 @@ export async function fileDispute(
   let created: CreateOutcome;
   try {
     created = await write("create", () => {
-      const current = cases.transaction(() => {
-        const now = cases.find(caseId);
-        if (now?.status === "filing" && now.filingStartedAt === moved.filingStartedAt)
-          cases.recordEvent(caseId, "create", "sending", null, null);
-        return now;
-      });
+      let current: PilotCaseRecord | undefined;
+      try {
+        current = cases.transaction(() => {
+          const now = cases.find(caseId);
+          if (now?.status === "filing" && now.filingStartedAt === moved.filingStartedAt)
+            cases.recordEvent(caseId, "create", "sending", null, null);
+          return now;
+        });
+      } catch (e) {
+        // Before the request: whatever failed here, nothing left this process.
+        throw new MarkFailedError(safe(e));
+      }
       if (current?.status !== "filing" || current.filingStartedAt !== moved.filingStartedAt)
         throw new FilingMovedError(current?.status ?? "missing");
       return stage.service.createDispute({ aliases });
     });
   } catch (e) {
+    if (e instanceof MarkFailedError) {
+      const text = `the create could not be marked as sending, so nothing was sent: ${e.text}`;
+      cases.recordEvent(caseId, "create", "not_marked", null, text);
+      return backToContested(d, moved, null, text);
+    }
     if (e instanceof FilingMovedError) {
       const text = `pilot case ${caseId} moved from this command's filing before its create (it is now ${e.status}, or filed again by another command): nothing was sent; read pilot:case show ${caseId}`;
       cases.recordEvent(caseId, "create", FILING_MOVED, null, text);
@@ -421,6 +443,11 @@ async function check(
   if (stage.cap !== null && filedCount >= stage.cap)
     return no(capProblemOf(stage.mode, filedCount, stage.cap));
   if (stage.mode === "live" && cases.countSeenInCourt("testnet") < 1) return no(LIVE_GATE);
+  if (row.deliverableExtension !== null && !SERVICE_EXTENSION.test(row.deliverableExtension))
+    return no(
+      `the case's deliverable extension ${JSON.stringify(row.deliverableExtension)} is not one the Dispute Service accepts (one to ten lowercase letters or digits), so its file cannot be attached; the job's deliverable must be submitted under such an extension`,
+      DELIVERABLE_EXTENSION_INVALID,
+    );
 
   const job = await jobFactsOf(d, row);
   if (typeof job === "string") return no(job);
@@ -596,6 +623,9 @@ async function jobFactsOf(
   }
   if (!sameAddress(onChain.provider, row.sellerAddress))
     return `job ${jobId} has provider ${onChain.provider}, not the case's seller ${row.sellerAddress}`;
+  // The evidence quotes the chain's text and the case view serves the row's: they must agree.
+  if (onChain.description !== row.description)
+    return `job ${jobId} carries another description than the case's`;
 
   let receipt: Awaited<ReturnType<typeof publicClient.getTransactionReceipt>>;
   try {
@@ -924,6 +954,14 @@ function neverRanTextOf(code: string): string {
   return code === UNAUTHORIZED
     ? UNAUTHORIZED_TEXT
     : `the Dispute Service refused the call before it ran (HTTP ${code.slice("http_".length)}), so nothing was sent`;
+}
+
+/** The create's sending mark could not be written: the request was never made. */
+class MarkFailedError extends Error {
+  constructor(readonly text: string) {
+    super(`the create could not be marked as sending: ${text}`);
+    this.name = "MarkFailedError";
+  }
 }
 
 /** The row stopped being this command's filing before its create: nothing is sent. */

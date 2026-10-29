@@ -16,7 +16,7 @@ import {
 } from "viem";
 import { iIdentityRegistryAbi } from "../abis/generated";
 import { awaitSuccessfulReceipt } from "../adapters/arc/receipts";
-import { klerosCaseUrl } from "../adapters/kleros/deployments";
+import { KLEROS_DEPLOYMENTS, klerosCaseUrl } from "../adapters/kleros/deployments";
 import type { FakeScript } from "../adapters/kleros/fakeDisputeService";
 import { type Config, loadConfig } from "../config/env";
 import {
@@ -1387,8 +1387,14 @@ export function registerPilotCommands(
       "--allow-standing <standing>",
       "accept a legal body of this standing; the evidence says so",
     )
-    .option("--testnet", "confirm a filing on the Kleros testnet court; testnet mode only")
-    .option("--live", "confirm a filing on the Kleros live court; live mode only")
+    .option(
+      "--testnet",
+      `confirm a filing on the ${KLEROS_DEPLOYMENTS.testnet.label} (${KLEROS_DEPLOYMENTS.testnet.chain}); testnet mode only`,
+    )
+    .option(
+      "--live",
+      `confirm a filing on the ${KLEROS_DEPLOYMENTS.live.label} (${KLEROS_DEPLOYMENTS.live.chain}); live mode only`,
+    )
     .option("--yes", "confirm: file")
     .action(async (opts: DisputeOptions) => {
       // Options are checked and the stage built before the context opens, so a refused option
