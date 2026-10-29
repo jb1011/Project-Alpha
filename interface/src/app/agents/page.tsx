@@ -8,6 +8,7 @@ import { AgentShell } from "@/components/agents/AgentShell";
 import { LoadingState, RequireAuth } from "@/components/agents/RequireAuth";
 import { Card, cx } from "@/components/onboarding/primitives";
 import { shortAddress } from "@/components/onboarding/types";
+import { LEGAL_BODY_COPY } from "@/lib/legalBody/copy";
 
 export default function AgentsPage() {
   return (
@@ -34,16 +35,30 @@ function AgentsList() {
             Create your first autonomous agent — passkey, policy, treasury, and
             governance in one flow.
           </p>
-          <Link
-            href="/onboarding"
-            className="mt-6 inline-flex rounded-full bg-ink px-5 py-2.5 text-[13px] font-medium text-paper hover:bg-ink-hover"
-          >
-            Create a new agent
-          </Link>
+          <div className="mt-6 flex flex-wrap justify-center gap-2">
+            <Link
+              href="/onboarding"
+              className="inline-flex rounded-full bg-ink px-5 py-2.5 text-[13px] font-medium text-paper hover:bg-ink-hover"
+            >
+              Create a new agent
+            </Link>
+            <Link
+              href="/legal-body"
+              className="inline-flex rounded-full border hairline-strong bg-paper/40 px-5 py-2.5 text-[13px] font-medium text-ink hover:bg-paper-2"
+            >
+              {LEGAL_BODY_COPY.entry.button}
+            </Link>
+          </div>
         </Card>
       ) : (
         <>
-          <div className="mb-4 flex justify-end gap-2">
+          <div className="mb-4 flex flex-wrap justify-end gap-2">
+            <Link
+              href="/legal-body"
+              className="inline-flex h-10 items-center rounded-full border hairline-strong bg-paper/40 px-5 text-[13px] font-medium leading-none text-ink hover:bg-paper-2"
+            >
+              {LEGAL_BODY_COPY.entry.button}
+            </Link>
             <Link
               href="/agents/connect"
               className="inline-flex h-10 items-center rounded-full border hairline-strong bg-paper/40 px-5 text-[13px] font-medium leading-none text-ink hover:bg-paper-2"

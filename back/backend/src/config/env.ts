@@ -2,6 +2,7 @@ import { getAddress, isAddress, parseEther } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { z } from "zod";
 import type { DoolaEnvironment } from "../adapters/doola/types";
+import { arcTestnet } from "../chains";
 import { parsePiiKey } from "../formation/pii";
 import { usdToUnits } from "../policy/units";
 import type { Address, Hex } from "../types";
@@ -79,6 +80,36 @@ function isGasSeedAmount(value: string): boolean {
  *  opt in: a line uncommented without a value must not be read as zero and refuse boot. */
 const blankAsUnset = (v: unknown): unknown =>
   typeof v === "string" && v.trim() === "" ? undefined : v;
+
+/** A URL with its trailing slashes removed, so a caller can append "/path" without doubling it. */
+const withoutTrailingSlash = (url: string): string => url.replace(/\/+$/, "");
+
+/** The default of KLEROS_EXPECTED_OPTIONS: the ruling options the settlement asserts. */
+export const DEFAULT_KLEROS_EXPECTED_OPTIONS = "1=Pay the provider;2=Refund the client";
+
+/**
+ * "1=Pay the provider;2=Refund the client" to { "1": "Pay the provider", "2": "Refund the client" }.
+ * Each key is a non-negative number, decimal or 0x (or 0X) hex, stored as the decimal string of its value,
+ * so "0x01" and "1" are the same option. THROWS on a malformed pair rather than skipping it: this
+ * map is the settlement's assertion, and a dropped option would make it assert less than it says.
+ */
+export function parseExpectedOptions(raw: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const pair of raw.split(";")) {
+    const eq = pair.indexOf("=");
+    if (!pair.trim()) throw new Error('an empty pair (a trailing ";"?)');
+    if (eq < 0) throw new Error(`"${pair.trim()}" is not value=label`);
+    const value = pair.slice(0, eq).trim();
+    const label = pair.slice(eq + 1).trim();
+    if (!/^(0[xX][0-9a-fA-F]+|[0-9]+)$/.test(value))
+      throw new Error(`"${value}" is not a non-negative number (decimal or 0x hex)`);
+    if (!label) throw new Error(`option ${value} has an empty label`);
+    const key = BigInt(value).toString();
+    if (key in out) throw new Error(`option ${key} is listed twice`);
+    out[key] = label;
+  }
+  return out;
+}
 
 /** Fallbacks for `Config.worldChain` (optional in the type for test fixtures). */
 export const WORLD_CHAIN_DEFAULTS = {
@@ -491,6 +522,67 @@ const EnvSchema = z.object({
       message: "must be a decimal from 0 to 0.05 (USDC) with at most 6 decimals",
     }),
   ),
+
+  // --- THE KLEROS PILOT (design 2026-10-22, section 5.9). All optional. The three pilot keys are
+  // all set or all unset; each Kleros key belongs to one deployment, and the mode picks the key and
+  // the chain together, so there is no chain variable. Grouped as cfg.pilot and cfg.kleros. ---
+  PILOT_BUYER_PRIVATE_KEY: z.preprocess(blankAsUnset, privKeySchema.optional()),
+  PILOT_SELLER_PRIVATE_KEY: z.preprocess(blankAsUnset, privKeySchema.optional()),
+  PILOT_REFEREE_PRIVATE_KEY: z.preprocess(blankAsUnset, privKeySchema.optional()),
+  PILOT_KLEROS_MODE: z.preprocess(
+    blankAsUnset,
+    z.enum(["rehearsal", "testnet", "live"]).default("rehearsal"),
+  ),
+  /** The testnet stage's soft cap: raised here, in the env. */
+  PILOT_TESTNET_CASES_CAP: z.preprocess(
+    blankAsUnset,
+    z.coerce.number().int().positive().default(10),
+  ),
+  /** The live stage's hard cap: no command-line flag overrides it. */
+  PILOT_LIVE_CASES_CAP: z.preprocess(blankAsUnset, z.coerce.number().int().positive().default(5)),
+  /** Where the two lookups are read. Unset: PUBLIC_API_URL, else METADATA_BASE_URL. */
+  PILOT_LOOKUP_BASE: z.preprocess(blankAsUnset, z.string().url().optional()),
+  /** The Testnet key (arbitrum-sepolia-testnet). A secret: masked by redact(). Both keys are
+   *  trimmed here, before any check, so "k" and "k " are refused as equal. */
+  KLEROS_API_KEY_TESTNET: z.preprocess(blankAsUnset, z.string().trim().optional()),
+  /** The Beta key (arbitrum-one): it creates real, permanent cases. A secret: masked by redact(). */
+  KLEROS_API_KEY_LIVE: z.preprocess(blankAsUnset, z.string().trim().optional()),
+  KLEROS_API_URL: z.preprocess(
+    blankAsUnset,
+    z.string().url().default("https://kleros-dispute-service.fly.dev/mcp"),
+  ),
+  KLEROS_COURT_ID_TESTNET: z.preprocess(
+    blankAsUnset,
+    z.coerce.number().int().positive().default(8),
+  ),
+  KLEROS_COURT_ID_LIVE: z.preprocess(blankAsUnset, z.coerce.number().int().positive().default(34)),
+  /** The alias slot KEYS (Kleros shows the labels, for example "Client agent"). */
+  KLEROS_ALIAS_CLIENT: z.preprocess(blankAsUnset, z.string().trim().min(1).default("client")),
+  KLEROS_ALIAS_PROVIDER: z.preprocess(blankAsUnset, z.string().trim().min(1).default("provider")),
+  KLEROS_EXPECTED_OPTIONS: z.preprocess(
+    blankAsUnset,
+    z
+      .string()
+      .default(DEFAULT_KLEROS_EXPECTED_OPTIONS)
+      .transform((raw, ctx) => {
+        try {
+          return parseExpectedOptions(raw);
+        } catch (err) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `must be value=label pairs separated by ";" (${(err as Error).message})`,
+          });
+          return z.NEVER;
+        }
+      }),
+  ),
+  /** Reference only: printed and written on the case row, never sent (the preset carries it). */
+  KLEROS_POLICY_URI: z.preprocess(
+    blankAsUnset,
+    z.string().trim().min(1).default("/ipfs/QmPbiXTAacEcw2BrWxqGERJ24BcAxGvGa3M75sqRruSfVW"),
+  ),
+  /** The explorer base for links in the evidence and the case view. */
+  ARC_EXPLORER_URL: z.preprocess(blankAsUnset, z.string().url().optional()),
 });
 
 /** The parsed-and-transformed shape `EnvSchema.safeParse` produces. */
@@ -521,6 +613,42 @@ function boolWithDerivedDefault(
   if (v === "true" || v === "1" || v === "yes") return true;
   if (v === "false" || v === "0" || v === "no") return false;
   throw new Error(`Invalid config: ${varName} must be true|false (got "${raw}")`);
+}
+
+/** Which Kleros deployment the pilot files with: none (`rehearsal`), the Testnet, or the live court. */
+export type PilotKlerosMode = "rehearsal" | "testnet" | "live";
+
+/** The Kleros pilot's own keys and limits. Present only when all three keys are set. */
+export interface PilotConfig {
+  buyerPrivateKey: Hex;
+  sellerPrivateKey: Hex;
+  refereePrivateKey: Hex;
+  /** PILOT_KLEROS_MODE, default "rehearsal". */
+  mode: PilotKlerosMode;
+  /** PILOT_TESTNET_CASES_CAP, default 10: soft, raised in the env. */
+  testnetCasesCap: number;
+  /** PILOT_LIVE_CASES_CAP, default 5: hard, no flag overrides it. */
+  liveCasesCap: number;
+  /** PILOT_LOOKUP_BASE, default publicApiUrl, else metadataBaseUrl; no trailing slash. */
+  lookupBase: string;
+}
+
+/** The Kleros service settings. Present when at least one of the two keys is set. */
+export interface KlerosConfig {
+  /** KLEROS_API_KEY_TESTNET: the Testnet key (arbitrum-sepolia-testnet). */
+  apiKeyTestnet?: string;
+  /** KLEROS_API_KEY_LIVE: the Beta key (arbitrum-one). */
+  apiKeyLive?: string;
+  apiUrl: string;
+  courtIdTestnet: number;
+  courtIdLive: number;
+  /** The slot KEY; Kleros shows "Client agent". */
+  aliasClient: string;
+  aliasProvider: string;
+  /** Keys are decimal strings of the normalised value. */
+  expectedOptions: Record<string, string>;
+  /** Reference only, never sent. */
+  policyUri: string;
 }
 
 export interface Config {
@@ -610,6 +738,16 @@ export interface Config {
   metadataBaseUrl: string;
   /** The API's own public origin; undefined = use `metadataBaseUrl`. */
   publicApiUrl?: string;
+  /** The Kleros pilot's keys, mode, caps and lookup base; undefined = no pilot keys on this box. */
+  pilot?: PilotConfig;
+  /** The Kleros service settings; undefined = neither Kleros key is set. */
+  kleros?: KlerosConfig;
+  /** ARC_EXPLORER_URL, no trailing slash. Optional in the type, always set by loadConfig(): the plan
+   *  declares it required, but that breaks existing test fixtures that build Config literals, which
+   *  this change may not edit. loadConfig() always sets it; a reader of a fixture-built Config falls
+   *  back to `arcTestnet.blockExplorers?.default.url` when it is undefined. Boot refuses when the
+   *  chain names no explorer. */
+  arcExplorerUrl?: string;
   gasSeedFloorUsdc: string;
   gasSeedTargetUsdc: string;
   enableX402Demo: boolean;
@@ -892,6 +1030,39 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     throw new Error(`Invalid config: ${path} — ${msg}`);
   }
   const e = parsed.data;
+
+  // v1 of the pilot design used one Kleros key, a chain variable and one court id. An env file
+  // still carrying them would silently mean "no key" or "the wrong court", so they are refused by
+  // name. The value is never echoed: one of them is a key.
+  const staleKleros: Array<[string, string]> = [
+    [
+      "KLEROS_API_KEY",
+      "KLEROS_API_KEY_TESTNET (the Testnet key) and KLEROS_API_KEY_LIVE (the Beta key)",
+    ],
+    [
+      "KLEROS_CHAIN",
+      "nothing: the chain follows PILOT_KLEROS_MODE, beside KLEROS_API_KEY_TESTNET and KLEROS_API_KEY_LIVE",
+    ],
+    [
+      "KLEROS_COURT_ID",
+      "KLEROS_COURT_ID_TESTNET and KLEROS_COURT_ID_LIVE, with KLEROS_API_KEY_TESTNET and KLEROS_API_KEY_LIVE",
+    ],
+  ];
+  for (const [name, replacement] of staleKleros) {
+    if (env[name] !== undefined)
+      throw new Error(
+        `Invalid config: ${name} is no longer read. Remove it; it is replaced by ${replacement}`,
+      );
+  }
+
+  // The explorer default is chains.ts's, so the chain facts stay in one place. viem types the
+  // explorer as optional; a chain definition without one is refused rather than guessed.
+  const arcExplorerUrl = e.ARC_EXPLORER_URL ?? arcTestnet.blockExplorers?.default.url;
+  if (!arcExplorerUrl)
+    throw new Error(
+      "Invalid config: ARC_EXPLORER_URL is unset and the Arc testnet chain definition names no explorer",
+    );
+
   const turnkey =
     e.TURNKEY_API_PUBLIC_KEY &&
     e.TURNKEY_API_PRIVATE_KEY &&
@@ -983,6 +1154,35 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     mcpPublicUrl: e.MCP_PUBLIC_URL,
     metadataBaseUrl: e.METADATA_BASE_URL,
     publicApiUrl: e.PUBLIC_API_URL,
+    pilot:
+      e.PILOT_BUYER_PRIVATE_KEY && e.PILOT_SELLER_PRIVATE_KEY && e.PILOT_REFEREE_PRIVATE_KEY
+        ? {
+            buyerPrivateKey: e.PILOT_BUYER_PRIVATE_KEY,
+            sellerPrivateKey: e.PILOT_SELLER_PRIVATE_KEY,
+            refereePrivateKey: e.PILOT_REFEREE_PRIVATE_KEY,
+            mode: e.PILOT_KLEROS_MODE,
+            testnetCasesCap: e.PILOT_TESTNET_CASES_CAP,
+            liveCasesCap: e.PILOT_LIVE_CASES_CAP,
+            lookupBase: withoutTrailingSlash(
+              e.PILOT_LOOKUP_BASE ?? e.PUBLIC_API_URL ?? e.METADATA_BASE_URL,
+            ),
+          }
+        : undefined,
+    kleros:
+      e.KLEROS_API_KEY_TESTNET || e.KLEROS_API_KEY_LIVE
+        ? {
+            apiKeyTestnet: e.KLEROS_API_KEY_TESTNET,
+            apiKeyLive: e.KLEROS_API_KEY_LIVE,
+            apiUrl: e.KLEROS_API_URL,
+            courtIdTestnet: e.KLEROS_COURT_ID_TESTNET,
+            courtIdLive: e.KLEROS_COURT_ID_LIVE,
+            aliasClient: e.KLEROS_ALIAS_CLIENT,
+            aliasProvider: e.KLEROS_ALIAS_PROVIDER,
+            expectedOptions: e.KLEROS_EXPECTED_OPTIONS,
+            policyUri: e.KLEROS_POLICY_URI,
+          }
+        : undefined,
+    arcExplorerUrl: withoutTrailingSlash(arcExplorerUrl),
     gasSeedFloorUsdc: e.GAS_SEED_FLOOR_USDC,
     gasSeedTargetUsdc: e.GAS_SEED_TARGET_USDC,
     enableX402Demo: e.ENABLE_X402_DEMO,
@@ -1112,6 +1312,48 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     );
   }
 
+  // The Kleros pilot (design 2026-10-22, section 5.9). The three keys come as a set: a box with
+  // a buyer and no referee can fund a job nobody can rule on.
+  const pilotKeyVars: Array<[string, Hex | undefined]> = [
+    ["PILOT_BUYER_PRIVATE_KEY", e.PILOT_BUYER_PRIVATE_KEY],
+    ["PILOT_SELLER_PRIVATE_KEY", e.PILOT_SELLER_PRIVATE_KEY],
+    ["PILOT_REFEREE_PRIVATE_KEY", e.PILOT_REFEREE_PRIVATE_KEY],
+  ];
+  const pilotSet = pilotKeyVars.filter(([, key]) => key).map(([name]) => name);
+  const pilotMissing = pilotKeyVars.filter(([, key]) => !key).map(([name]) => name);
+  if (pilotSet.length > 0 && pilotMissing.length > 0)
+    throw new Error(
+      `Invalid config: ${pilotSet.join(" and ")} ${pilotSet.length === 1 ? "is" : "are"} set but ${pilotMissing.join(" and ")} ${pilotMissing.length === 1 ? "is" : "are"} missing (all-or-nothing)`,
+    );
+  // Three roles, three addresses: a buyer that is also the referee rules on its own job.
+  for (let i = 0; i < pilotKeyVars.length; i++)
+    for (let j = 0; j < i; j++) {
+      const [name, key] = pilotKeyVars[i] as [string, Hex | undefined];
+      const [otherName, other] = pilotKeyVars[j] as [string, Hex | undefined];
+      if (key && other && key.toLowerCase() === other.toLowerCase())
+        throw new Error(
+          `Invalid config: ${name} must differ from ${otherName}: the buyer, the seller and the referee are three separate addresses`,
+        );
+    }
+  // One key per Kleros deployment. The same value in both slots would let a testnet run hold the
+  // key that files in the live court.
+  if (
+    e.KLEROS_API_KEY_TESTNET &&
+    e.KLEROS_API_KEY_LIVE &&
+    e.KLEROS_API_KEY_TESTNET === e.KLEROS_API_KEY_LIVE
+  )
+    throw new Error(
+      "Invalid config: KLEROS_API_KEY_TESTNET and KLEROS_API_KEY_LIVE must differ: each key belongs to one Kleros deployment",
+    );
+  if (e.PILOT_KLEROS_MODE === "testnet" && !e.KLEROS_API_KEY_TESTNET)
+    throw new Error(
+      "Invalid config: PILOT_KLEROS_MODE=testnet requires KLEROS_API_KEY_TESTNET (the Testnet key)",
+    );
+  if (e.PILOT_KLEROS_MODE === "live" && !e.KLEROS_API_KEY_LIVE)
+    throw new Error(
+      "Invalid config: PILOT_KLEROS_MODE=live requires KLEROS_API_KEY_LIVE (the Beta key, which creates real, permanent cases in Kleros's live court)",
+    );
+
   const isProd = (env.NODE_ENV ?? process.env.NODE_ENV) === "production";
 
   // AgentBook (design 2026-08-25 v3 §4.2). The submitter is a SINGLE-PURPOSE key holding World
@@ -1130,6 +1372,9 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       // authors resolver answers, and the pocket seed derives every legacy pocket.
       ["ENS_GATEWAY_SIGNER_KEY", cfg.ens?.signerKey],
       ["POCKET_MASTER_SEED", cfg.pocketMasterSeed],
+      ["PILOT_BUYER_PRIVATE_KEY", cfg.pilot?.buyerPrivateKey],
+      ["PILOT_SELLER_PRIVATE_KEY", cfg.pilot?.sellerPrivateKey],
+      ["PILOT_REFEREE_PRIVATE_KEY", cfg.pilot?.refereePrivateKey],
     ];
     const sub = cfg.agentBook.submitterPrivateKey.toLowerCase();
     for (const [name, value] of others) {
@@ -1234,6 +1479,9 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     ["X402_PROOF_AGENT_KEY", cfg.x402ProofAgentKey],
     ["ENS_GATEWAY_SIGNER_KEY", cfg.ens?.signerKey],
     ["WORLDCHAIN_SUBMITTER_PRIVATE_KEY", cfg.agentBook?.submitterPrivateKey],
+    ["PILOT_BUYER_PRIVATE_KEY", cfg.pilot?.buyerPrivateKey],
+    ["PILOT_SELLER_PRIVATE_KEY", cfg.pilot?.sellerPrivateKey],
+    ["PILOT_REFEREE_PRIVATE_KEY", cfg.pilot?.refereePrivateKey],
   ];
 
   // ── FORMATION PAYMENTS (2026-08-26 §6.6/§6.7) ──────────────────────────────────────────────
@@ -1551,6 +1799,30 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     );
   }
 
+  // The pilot keys, by the same rule and with the same split: a pilot key is a test identity that
+  // signs jobs on Arc testnet, and it must not be the platform key or any other signing key on this
+  // box, or a test job would go out as a role it was never meant to hold. Refused in production,
+  // warned elsewhere, like JOB_CLIENT_PRIVATE_KEY above. The pilot keys among themselves are
+  // refused everywhere, earlier.
+  const pilotNames = new Set(pilotKeyVars.map(([name]) => name));
+  for (const [name, key] of signingKeys) {
+    if (!key || !pilotNames.has(name)) continue;
+    const others: Array<[string, Hex | undefined]> = [
+      ["PLATFORM_PRIVATE_KEY", cfg.platformPrivateKey],
+      ...signingKeys.filter(([other]) => !pilotNames.has(other)),
+    ];
+    for (const [otherName, other] of others) {
+      if (!other || other.toLowerCase() !== key.toLowerCase()) continue;
+      if (isProd)
+        throw new Error(
+          `Invalid config: ${name} must not equal ${otherName}: a pilot key is a test identity with its own address and holds no other role on this box`,
+        );
+      console.warn(
+        `⚠ ${name} equals ${otherName}: a pilot key is signing as another role. Refused in production: give it its own address`,
+      );
+    }
+  }
+
   if (cfg.platformOutflowCeiling < cfg.maxTreasuryFund) {
     throw new Error(
       "Invalid config: PLATFORM_OUTFLOW_CEILING_USDC must be >= MAX_TREASURY_FUND_USDC (a single legal fund call must never be auto-blocked)",
@@ -1617,6 +1889,24 @@ export function redact(cfg: Config): Record<string, unknown> {
     alertWebhookUrl: cfg.alertWebhookUrl ? "REDACTED" : undefined,
     jobClientPrivateKey: cfg.jobClientPrivateKey ? "REDACTED" : undefined,
     jobEvaluatorPrivateKey: cfg.jobEvaluatorPrivateKey ? "REDACTED" : undefined,
+    // The three pilot keys and the two Kleros keys are key material, never a log line. The mode,
+    // the caps, the endpoint, the court ids and the policy URI are printed: they are what an
+    // operator checks in the boot line.
+    pilot: cfg.pilot
+      ? {
+          ...cfg.pilot,
+          buyerPrivateKey: "REDACTED",
+          sellerPrivateKey: "REDACTED",
+          refereePrivateKey: "REDACTED",
+        }
+      : undefined,
+    kleros: cfg.kleros
+      ? {
+          ...cfg.kleros,
+          apiKeyTestnet: cfg.kleros.apiKeyTestnet ? "REDACTED" : undefined,
+          apiKeyLive: cfg.kleros.apiKeyLive ? "REDACTED" : undefined,
+        }
+      : undefined,
     x402ProofAgentKey: cfg.x402ProofAgentKey ? "REDACTED" : undefined,
     // The World Chain submitter key: gas-only, but still key material and never a log line. The
     // write RPC goes with it for the same reason as `alertWebhookUrl` above — a dedicated endpoint

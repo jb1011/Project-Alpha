@@ -245,6 +245,8 @@ function timeOf(order: LegalBodyOrderView): number {
 /**
  * The identity step's refusal: an agentId that already has a body on its way or linked for this
  * tenant, on this deployment. Linking another body would replace it, which is not offered here.
+ * A live body whose pointer was cleared (`broken` with `not_linked`, not revoked) still belongs to
+ * its identity: writing its pointer again links it, so it counts too.
  */
 export function identityHasBody(
   orders: LegalBodyOrderView[],
@@ -256,7 +258,10 @@ export function identityHasBody(
       o.agentId === agentId &&
       o.chainId === where.chainId &&
       sameAddress(o.factory, where.factory) &&
-      (o.state === "linked" || o.state === "reserved" || o.state === "deployed"),
+      (o.state === "linked" ||
+        o.state === "reserved" ||
+        o.state === "deployed" ||
+        (o.state === "broken" && o.brokenReason === "not_linked" && !o.revoked)),
   );
 }
 

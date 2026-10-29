@@ -16,6 +16,9 @@ type Props<P extends string> = {
   heading?: ReactNode;
   /** The note under the rail; the wizard's by default. */
   footer?: ReactNode;
+  /** The word under the current step; the wizard's "In progress" by default, and none for null
+   *  (a flow whose last step, once reached, is not in progress). */
+  currentTag?: ReactNode;
 };
 
 const DEFAULT_FOOTER = (
@@ -33,6 +36,7 @@ export function Stepper<P extends string = Phase>({
   onJump,
   heading = "Create your agent",
   footer = DEFAULT_FOOTER,
+  currentTag = "In progress",
 }: Props<P>) {
   const currentIndex = phases.findIndex((p) => p.id === current);
 
@@ -85,9 +89,9 @@ export function Stepper<P extends string = Phase>({
                   >
                     {p.label}
                   </span>
-                  {isCurrent && (
+                  {isCurrent && currentTag !== null && (
                     <span className="mt-0.5 text-[10.5px] uppercase tracking-[0.14em] text-accent-soft/80">
-                      In progress
+                      {currentTag}
                     </span>
                   )}
                 </span>

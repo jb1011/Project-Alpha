@@ -125,7 +125,7 @@ export function configModeFor(args: ParsedArgs): ConfigMode {
 // ── main ─────────────────────────────────────────────────────────────────────────────────────
 
 const USAGE = "usage: guardian-pause.mts pause|unpause --entity <name|key> | --treasury <address>";
-const DEFAULT_ARC_TESTNET_RPC_URL = "https://rpc.testnet.arc.network";
+const DEFAULT_ARC_TESTNET_RPC_URL = "https://rpc.testnet.arc.io";
 const DEFAULT_ARC_CHAIN_ID = 5042002;
 
 function usageAndExit(message: string): never {

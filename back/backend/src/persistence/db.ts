@@ -1576,6 +1576,54 @@ export function migrate(db: Database.Database): void {
       PRIMARY KEY (job_key, step)
     );
 
+    -- Kleros pilot cases (design 2026-10-22 section 5.2). Never rows of \`jobs\`: the boot
+    -- reconciliation and the escrow refund read \`jobs\` and would act on a pilot case. Nothing in
+    -- the API writes these two tables; the pilot CLI does, through SqlitePilotCaseRepository.
+    CREATE TABLE IF NOT EXISTS pilot_cases (
+      case_id            TEXT PRIMARY KEY,          -- "pc_" + 12 hex
+      label              TEXT NOT NULL,             -- "TEST-1": the evidence names it
+      mode               TEXT NOT NULL CHECK (mode IN ('rehearsal','testnet','live')),
+      status             TEXT NOT NULL CHECK (status IN (
+                           'created','funded','submitted','contested','filing','filed',
+                           'ruled','settling','settled','filing_unknown','evidence_unknown','failed')),
+      chain_id           INTEGER NOT NULL,
+      job_contract       TEXT NOT NULL,
+      job_id             TEXT UNIQUE,               -- uint256 as decimal
+      buyer_address      TEXT NOT NULL, buyer_agent_id  TEXT NOT NULL,
+      seller_address     TEXT NOT NULL, seller_agent_id TEXT NOT NULL,
+      referee_address    TEXT NOT NULL,
+      budget_atomic      TEXT NOT NULL,
+      description        TEXT NOT NULL,
+      expired_at         INTEGER NOT NULL,          -- unix seconds, as sent to createJob
+      deliverable_path   TEXT, deliverable_hash TEXT, deliverable_extension TEXT,
+      create_tx_hash TEXT, fund_tx_hash TEXT, submit_tx_hash TEXT,
+      created_block_time INTEGER, funded_block_time INTEGER, submitted_block_time INTEGER,
+      contest_reason     TEXT, contest_reply TEXT, contested_at INTEGER,
+      buyer_record_path  TEXT, seller_record_path TEXT,   -- the two lookup answers, JSON, as read
+      evidence_path      TEXT, evidence_sha256 TEXT, evidence_name TEXT,
+      kleros_chain       TEXT CHECK (kleros_chain IN ('arbitrum-sepolia-testnet','arbitrum-one','fake')),
+      kleros_court_id    INTEGER, kleros_policy_uri TEXT,   -- the mode's deployment, written at \`filing\`; every read sends kleros_chain
+      attachment_uri     TEXT, attachment_cid TEXT,
+      filing_started_at  INTEGER,
+      core_dispute_id    TEXT, local_dispute_id TEXT, create_dispute_tx TEXT, filed_at INTEGER,
+      evidence_tx        TEXT, evidence_status TEXT,        -- mined | unknown | simulated
+      ruling_status      TEXT, ruling_value TEXT, ruling_tied INTEGER, ruling_round_count INTEGER,
+      ruling_label       TEXT, ruling_read_at INTEGER, ruling_deadline TEXT,
+      settle_action      TEXT CHECK (settle_action IN ('complete','reject','claimRefund','none')),
+      settle_reason      TEXT,                     -- the bytes32 sent
+      settle_tx_hash     TEXT, settled_at INTEGER, escrow_outcome TEXT,  -- released | refunded
+      error              TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS pilot_case_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      case_id TEXT NOT NULL REFERENCES pilot_cases(case_id),
+      step TEXT NOT NULL, status TEXT NOT NULL, ref TEXT, detail TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_pilot_cases_status ON pilot_cases(status);
+
     -- ── doola formation (design 2026-08-19 §3) ────────────────────────────────────────────
     -- NO new EntityStatus values: formation state layers BESIDE the status machine (ENS +
     -- guardian precedents), so the CHECK on entities.status above stays untouched.

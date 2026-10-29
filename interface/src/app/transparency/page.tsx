@@ -9,6 +9,9 @@ import type { TransparencyEntity, TransparencyView } from "@/lib/api/types";
 import { API_URL } from "@/lib/api/config";
 import { addressUrl } from "@/lib/chain";
 import { hederaTransparencyLinks } from "@/lib/hedera/identity";
+import { LegalBodiesSection } from "@/components/transparency/LegalBodiesSection";
+import { LEGAL_BODY_COPY } from "@/lib/legalBody/copy";
+import { legalBodiesStatValue } from "@/lib/legalBody/transparency";
 
 /** Atomic USDC (6 decimals) -> "1,234.56". Display-only, so float precision is fine. */
 function formatAtomicUsdc(atomic: string): string {
@@ -95,6 +98,7 @@ function VerifyLinks({ entity }: { entity: TransparencyEntity }) {
 export default function TransparencyPage() {
   const [view, setView] = useState<TransparencyView | null>(null);
   const [failed, setFailed] = useState(false);
+  const legalBodiesStat = legalBodiesStatValue(view);
 
   useEffect(() => {
     let cancelled = false;
@@ -139,7 +143,13 @@ export default function TransparencyPage() {
                 unreachable — please try again in a moment.
               </p>
             ) : (
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+              <div
+                className={
+                  legalBodiesStat === null
+                    ? "grid grid-cols-1 gap-4 sm:grid-cols-3"
+                    : "grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4"
+                }
+              >
                 <StatTile
                   label="Agent entities on Arc"
                   value={view ? String(view.stats.entities) : "—"}
@@ -152,6 +162,9 @@ export default function TransparencyPage() {
                   label="USDC settled"
                   value={view ? `$${formatAtomicUsdc(view.stats.usdcSettledAtomic)}` : "—"}
                 />
+                {legalBodiesStat !== null && (
+                  <StatTile label={LEGAL_BODY_COPY.transparency.statTile} value={legalBodiesStat} />
+                )}
               </div>
             )}
           </div>
@@ -229,6 +242,8 @@ export default function TransparencyPage() {
             )}
           </div>
         </section>
+
+        <LegalBodiesSection view={view} failed={failed} />
 
         <section className="border-t hairline bg-paper-2">
           <div className="mx-auto max-w-[1240px] px-6 py-16 lg:px-10 lg:py-20">

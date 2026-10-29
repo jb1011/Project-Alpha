@@ -16,6 +16,7 @@ import { runOnboarding } from "../workflow/onboarding";
 import { OnboardingRunner } from "../workflow/runner";
 import { registerCompanyCheckCommands } from "./companyChecks";
 import { type CliContext, buildContext } from "./context";
+import { registerPilotCommands } from "./pilot";
 
 /** Deps that can be injected for testing — bypasses live Anthropic + chain calls. */
 export interface AgentDeps {
@@ -782,6 +783,9 @@ export function buildCli(
   // ── company:* and legal-body:revoke — the operator's check of a customer's declaration ────────
   // DB-only, like the formation commands: each opens the configured database itself.
   registerCompanyCheckCommands(program);
+
+  // pilot:agent: the Kleros pilot test agents' commands; two of them (register, point) send transactions.
+  registerPilotCommands(program);
 
   return program;
 }

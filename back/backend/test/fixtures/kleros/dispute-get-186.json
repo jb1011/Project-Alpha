@@ -1,0 +1,27 @@
+{
+  "result": {
+    "_meta": {
+      "cta": {
+        "description": "Suggested commands:",
+        "commands": [
+          {
+            "command": "kleros evidence list --dispute 186 --chain arbitrum-sepolia-testnet",
+            "description": "Review full evidence record"
+          },
+          {
+            "command": "kleros court policy 8 --chain arbitrum-sepolia-testnet",
+            "description": "Read court policy that applied"
+          }
+        ]
+      }
+    },
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"items\":[{\"id\":\"186\",\"disputeId\":\"186\",\"court\":\"8\",\"status\":\"Executed\",\"ruling\":\"2\",\"ruled\":true,\"roundCount\":1,\"deadline\":null,\"createdAt\":\"2026-10-15T11:17:45.000Z\",\"chain\":\"arbitrum-sepolia-testnet\",\"ruledSemantics\":\"onchain\",\"arbitrated\":\"0xed31bee8b1f7ce89e93033c0d3b2ccf4ceb27652\",\"choiceCount\":null,\"round\":{\"id\":\"186-0\",\"jurorCount\":3},\"lastPeriodChange\":\"2026-10-15T12:31:45.000Z\",\"tied\":false,\"overridden\":false,\"evidenceCount\":null,\"rulingOptions\":[{\"value\":0,\"title\":\"Refuse to Arbitrate / Invalid\"},{\"value\":1,\"title\":\"Accept buyer; refund 100%.\"},{\"value\":2,\"title\":\"Do not accept; pay merchant.\"},{\"value\":3,\"title\":\"Partial; refund 50%.\"}],\"rulingLabel\":\"Do not accept; pay merchant.\",\"policyUri\":\"/ipfs/QmeNXLfpwd9VgwUxL1sPoxanvL4vBu3SATR96HFmW228iw\",\"metaEvidenceUri\":null,\"unresolvedFields\":[],\"unresolvedReason\":\"none\"}],\"nextCursor\":null,\"hasMore\":false,\"chainStatus\":[{\"chain\":\"arbitrum-sepolia-testnet\",\"ok\":true}]}\n\nSuggested commands:\n  kleros evidence list --dispute 186 --chain arbitrum-sepolia-testnet - Review full evidence record\n  kleros court policy 8 --chain arbitrum-sepolia-testnet - Read court policy that applied"
+      }
+    ]
+  },
+  "jsonrpc": "2.0",
+  "id": 3
+}

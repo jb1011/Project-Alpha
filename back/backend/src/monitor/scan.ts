@@ -11,8 +11,10 @@ import type { MonitorRpc, RawLog } from "./rpc";
  * monitor that was down for two hours already needs several chunks — this is the normal path, not
  * an edge case.
  *
- * The ceiling is NOT the same on every endpoint. The box's token'd RPC accepts 100,000; the public
- * `rpc.testnet.arc.network` rejected 90,000 and 50,000 but served 5,000 (measured 2026-08-18). A
+ * The ceiling is NOT the same on every endpoint. The token'd RPC the box once used accepted 100,000;
+ * Arc's public RPC rejected 90,000 and 50,000 but served 5,000 (measured 2026-08-18, when it lived at
+ * `rpc.testnet.arc.network`), and at its current address `rpc.testnet.arc.io` it rejects 10,000 and
+ * serves 5,000 (measured 2026-10-19). A
  * hardcoded chunk size therefore produces the worst possible failure on the wrong endpoint: a
  * process that is up, logging, and permanently unable to advance its cursor.
  *

@@ -1,0 +1,14 @@
+# Runs novi-heartbeat.service every 2 minutes. The Healthchecks check it pings has a period of
+# 5 minutes and a grace of 5 minutes, so one or two failed runs never alert; about 10 minutes
+# without a good run does. See docs/runbooks/controller-monitoring.md, "Dead-man's switch".
+
+[Unit]
+Description=Run the Novi box heartbeat every 2 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

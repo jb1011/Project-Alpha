@@ -98,7 +98,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20.18.2"
+          node-version: "22.23.4" # same as the prod box
           cache: npm
           cache-dependency-path: back/backend/package-lock.json
 
@@ -139,11 +139,12 @@ jobs:
           filters: |
             client:
               - 'back/hedera-client/**'
+              - '.github/workflows/ci.yml'
 
       - uses: actions/setup-node@v4
         if: steps.changes.outputs.client == 'true'
         with:
-          node-version: "20.18.2"
+          node-version: "22.23.4" # same as the prod box
           cache: npm
           cache-dependency-path: back/hedera-client/package-lock.json
 

@@ -256,7 +256,7 @@ async function runSettlement(cfg: Config) {
   );
   const wd = await gateway.withdraw(WITHDRAW);
   console.log("  ✅ settlement mint tx:", wd.mintTxHash);
-  console.log("  arcscan:", `https://testnet.arcscan.app/tx/${wd.mintTxHash}`);
+  console.log("  arcscan:", `https://explorer.testnet.arc.io/tx/${wd.mintTxHash}`);
   console.log(
     `  ${wd.sourceChain} -> ${wd.destinationChain}, recipient ${wd.recipient}, ${wd.formattedAmount} USDC`,
   );
