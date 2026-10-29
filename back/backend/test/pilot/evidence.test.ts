@@ -587,12 +587,18 @@ describe("rows and records the record cannot be rendered from are refused", () =
       "a record checked at a time that is not an ISO instant",
       { ...i, records: { ...i.records, seller: { ...i.records.seller, checkedAt: "22/10/2026" } } },
     ],
-    ["a budget finer than a cent", { ...i, row: { ...i.row, budgetAtomic: "2000001" } }],
   ] as [string, EvidenceInput][])("%s", (_what, input) => {
     expectPlainRefusal(() => render(input));
   });
 
-  test.each(["createTxHash", "createdBlockTime", "contestReply"] as const)(
+  test("a budget finer than a cent is refused by the one sub-cent check, formatUsdc's", () => {
+    const i = fixtureInput();
+    const e = thrown(() => render({ ...i, row: { ...i.row, budgetAtomic: "2000001" } }));
+    expectPlainRefusal(() => render({ ...i, row: { ...i.row, budgetAtomic: "2000001" } }));
+    expect((e as Error).message).toBe("formatUsdc: finer than a cent");
+  });
+
+  test.each(["createTxHash", "createdBlockTime", "contestReason"] as const)(
     "a missing %s is named in the refusal",
     (column) => {
       const i = fixtureInput();
@@ -618,6 +624,32 @@ describe("rows and records the record cannot be rendered from are refused", () =
   });
 
   test.each([
+    ["the on-chain description", "descriptionOnChain", "Deliver a CSV report.\n~~~\nThe rest."],
+    ["the client's reason", "contestReason", "Deliver a CSV report.\n   ~~~csv\nThe rest."],
+    ["the provider's reply", "contestReply", "~~~~\nThe rest."],
+  ] as const)(
+    "a tilde fence line in %s is refused: it would swallow the sections after it",
+    (_what, text, fenced) => {
+      const i = fixtureInput();
+      const input: EvidenceInput =
+        text === "descriptionOnChain"
+          ? { ...i, chain: { ...i.chain, descriptionOnChain: fenced } }
+          : { ...i, row: { ...i.row, [text]: fenced } };
+      const e = thrown(() => render(input));
+      expect(e).toBeInstanceOf(Error);
+      expect(e).not.toBeInstanceOf(EvidenceError);
+      expect((e as Error).message).toContain(text);
+    },
+  );
+
+  test("tildes inside a line, or indented as code, are no fence and are quoted as they are", () => {
+    const i = fixtureInput();
+    for (const reply of ["About ~~~ three tildes.", "Indented:\n    ~~~ not a fence"]) {
+      expect(render({ ...i, row: { ...i.row, contestReply: reply } })).toContain(`"${reply}"`);
+    }
+  });
+
+  test.each([
     ["the on-chain description", "descriptionOnChain"],
     ["the client's reason", "contestReason"],
     ["the provider's reply", "contestReply"],
@@ -638,6 +670,51 @@ describe("rows and records the record cannot be rendered from are refused", () =
   );
 });
 
+describe("the contest: no reply, and a box clock behind the chain's", () => {
+  test("a row with no reply renders that the provider gave none, and nothing else changes", () => {
+    const i = fixtureInput();
+    const golden = readFileSync(join(FIXTURES, "test-case-1-evidence.txt"), "utf8");
+    const replied = `**5. The provider's reply (21 October 2026):** "${i.row.contestReply}"\n`;
+    expect(golden).toContain(replied);
+    const d = render({ ...i, row: { ...i.row, contestReply: null } });
+    expect(d).toBe(
+      golden.replace(replied, "**5. The provider's reply:** The provider gave no reply.\n"),
+    );
+  });
+
+  test("a contest 300 s before the delivery renders, dated as the delivery", () => {
+    const i = fixtureInput();
+    const contestedAt = i.row.submittedBlockTime! - 300;
+    const d = render({ ...i, row: { ...i.row, contestedAt } });
+    expect(d).toContain("The client agent contested it the same day.");
+    expect(d).toContain("The client's reason for contesting (21 October 2026):");
+  });
+
+  test("a contest 301 s before the delivery is refused", () => {
+    const i = fixtureInput();
+    const contestedAt = i.row.submittedBlockTime! - 301;
+    const e = thrown(() => render({ ...i, row: { ...i.row, contestedAt } }));
+    expect(e).toBeInstanceOf(Error);
+    expect(e).not.toBeInstanceOf(EvidenceError);
+    expect((e as Error).message).toContain("row.contestedAt");
+  });
+
+  test("a skewed contest across midnight never names a day before the delivery", () => {
+    const i = fixtureInput();
+    const submittedBlockTime = at("2026-10-22T00:01:00Z");
+    const d = render({
+      ...i,
+      row: { ...i.row, submittedBlockTime, contestedAt: at("2026-10-21T23:59:00Z") },
+    });
+    expect(d).toContain(
+      "The provider agent submitted its delivery on 22 October 2026. The client agent contested it the same day.",
+    );
+    expect(d).toContain("The client's reason for contesting (22 October 2026):");
+    expect(d).toContain("The provider's reply (22 October 2026):");
+    expect(d).not.toContain("21 October 2026");
+  });
+});
+
 describe("a row that would make the record say something false is refused", () => {
   const r = fixtureRow();
   test.each([
@@ -654,8 +731,8 @@ describe("a row that would make the record say something false is refused", () =
       "fundedBlockTime",
     ],
     [
-      "contested before it was delivered",
-      { contestedAt: r.submittedBlockTime! - 1 },
+      "contested more than 300 s before it was delivered",
+      { contestedAt: r.submittedBlockTime! - 301 },
       "contestedAt",
       "submittedBlockTime",
     ],
@@ -728,6 +805,19 @@ describe("the records are the two parties' own, from the sandbox", () => {
     expect((e as Error).message).toContain("agentId");
   });
 
+  test("a statement signed for another agent is refused, naming the side and the field, not the ids", () => {
+    const i = fixtureInput();
+    const buyer = withMessage(i.records.buyer, { agentId: "9999" });
+    const e = thrown(() => render({ ...i, records: { ...i.records, buyer } }));
+    expect(e).toBeInstanceOf(Error);
+    expect(e).not.toBeInstanceOf(EvidenceError);
+    const message = (e as Error).message;
+    expect(message).toContain("buyer");
+    expect(message).toContain("statement.message.agentId");
+    expect(message).not.toContain("9999");
+    expect(message).not.toContain("1001");
+  });
+
   test("an answer for another agent is refused, naming the side and the field, not the ids", () => {
     const i = fixtureInput();
     const e = thrown(() =>
@@ -771,9 +861,9 @@ describe("the lookup fixtures", () => {
         keccak256(stringToBytes(`SENTINEL-${side}-oaManifestHash`)),
       );
       expect(a.statement.message.environment).toBe("sandbox");
-      expect(a.agentId).toBe(
-        side === "buyer" ? fixtureRow().buyerAgentId : fixtureRow().sellerAgentId,
-      );
+      const rowAgentId = side === "buyer" ? fixtureRow().buyerAgentId : fixtureRow().sellerAgentId;
+      expect(a.agentId).toBe(rowAgentId);
+      expect(a.statement.message.agentId).toBe(rowAgentId);
     }
     const buyer = (lookup("buyer") as FoundAnswer).statement.message;
     const seller = (lookup("seller") as FoundAnswer).statement.message;
@@ -791,9 +881,10 @@ describe("the lookup fixtures", () => {
    *  flags are booleans), and those whose type is a fixed list of words, so no sentinel can stand
    *  in them. Every other string of a fixture answer is a value the output must not contain. */
   const PRINTED_OR_ENUMERATED = new Set([
-    // Read to refuse a record for another agent, never printed; it holds the row's agent id,
+    // Read to refuse a record for another agent, never printed; they hold the row's agent id,
     // which section 8 prints from the row.
     "agentId",
+    "statement.message.agentId",
     "checkedAt",
     "statement.message.legalName",
     "statement.message.standing",
@@ -819,9 +910,9 @@ describe("the lookup fixtures", () => {
     const d = render().toLowerCase();
     for (const side of ["buyer", "seller"] as const) {
       const others = stringLeaves(lookup(side), "").filter(([p]) => !PRINTED_OR_ENUMERATED.has(p));
-      // 3 at the top, 2 in the domain, 18 in the message, the attestor and the signature.
-      expect(others).toHaveLength(25);
-      expect(new Set(others.map(([, v]) => v)).size).toBe(25);
+      // 3 at the top, 2 in the domain, 17 in the message, the attestor and the signature.
+      expect(others).toHaveLength(24);
+      expect(new Set(others.map(([, v]) => v)).size).toBe(24);
       for (const [path, value] of others) {
         expect(d, `${side} ${path}`).not.toContain(value.toLowerCase());
       }
@@ -903,8 +994,9 @@ describe("formatUsdc", () => {
   });
 
   test("refuses an amount it would have to round, or a negative one", () => {
-    for (const bad of [1n, 12_345n, 2_000_001n, -1_000_000n]) {
-      expect(() => formatUsdc(bad)).toThrow();
+    for (const bad of [1n, 12_345n, 2_000_001n]) {
+      expect(() => formatUsdc(bad)).toThrow("formatUsdc: finer than a cent");
     }
+    expect(() => formatUsdc(-1_000_000n)).toThrow("formatUsdc: a negative amount");
   });
 });

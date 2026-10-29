@@ -21,7 +21,7 @@
       "identityRegistry": "0x1111111111111111111111111111111111111111",
       "factory": "0x2222222222222222222222222222222222222222",
       "legalBody": "0x3333333333333333333333333333333333333333",
-      "agentId": "SENTINEL-buyer-message-agentId",
+      "agentId": "1001",
       "agentWallet": "0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65",
       "identityOwnerAtCreation": "0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc",
       "bindingState": "linked",

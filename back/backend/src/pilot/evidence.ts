@@ -10,26 +10,30 @@ import type { PilotCaseRecord } from "./types";
  * contest's time, its expiry, its id, the parties' addresses and agent ids, the transaction
  * hashes, the description re-read from the chain and the delivered bytes) and five fields of each
  * lookup answer: the legal name, the standing, the two control flags and when the answer was
- * checked. Two more are read to refuse, never printed: the answer's agent id (it must be the row's
- * for that side) and the statement's environment (it must be the sandbox). Nothing else of an
- * answer is read, and no natural person is named: the record names a test entity and says whether
- * a verified person controls it.
+ * checked. Three more are read to refuse, never printed: the answer's agent id and the agent id
+ * its statement was signed for (both must be the row's for that side) and the statement's
+ * environment (it must be the sandbox). Nothing else of an answer is read, and no natural person
+ * is named: the record names a test entity and says whether a verified person controls it.
  *
  * Dates are UTC days. A job funded on a later day than it was created, a contest on a later day
  * than the delivery, and two records checked on different days each name the other day in the
  * approved sentence's smallest variant; on one day, the sentence is the approved one unchanged.
+ * The contest's time is the box's clock and the delivery's the chain's, so a contest up to five
+ * minutes before the delivery is a clock skew, not a story: it is dated as the delivery. A row
+ * with no reply says the provider gave none.
  *
  * Two kinds of refusal, both naming fields or a side and never a value. An EvidenceError carries
  * one of the codes below. A plain Error marks an input that would make the record say something
  * false, or that it cannot be rendered from at all:
  *  - a row on another chain or job contract than the configured one;
  *  - a column the contested row must have that is not set;
- *  - times out of order (created, funded, delivered and contested in that order, then expiry);
+ *  - times out of order (created, funded, delivered and contested in that order, then expiry;
+ *    the contest within the clock skew above);
  *  - a budget that is not a decimal, or that is finer than a cent;
- *  - a code fence in the on-chain description, the reason or the reply (in a Markdown view it
- *    would swallow the sections after it);
- *  - a record for another agent than the row's, of another environment than the sandbox, with no
- *    legal name, or checked at a time that is not a real ISO instant.
+ *  - a code fence in the on-chain description, the reason or the reply, or a line of theirs that
+ *    opens a tilde fence (in a Markdown view it would swallow the sections after it);
+ *  - a record or a statement for another agent than the row's, of another environment than the
+ *    sandbox, with no legal name, or checked at a time that is not a real ISO instant.
  *
  * Pure and deterministic: no clock, no locale, no I/O. The same input renders the same bytes.
  */
@@ -108,6 +112,10 @@ const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/;
 const CANONICAL_DECIMAL = /^(0|[1-9]\d*)$/;
 /** USDC has 6 decimals; the record prints 2. */
 const ATOMIC_PER_CENT = 10_000n;
+/** How far the box's clock (the contest) may run behind the chain's (the delivery), in seconds. */
+const CONTEST_CLOCK_SKEW_SECONDS = 300;
+/** A line that opens a tilde fence in Markdown: up to three spaces, then three tildes. */
+const TILDE_FENCE_LINE = /^ {0,3}~~~/m;
 
 const NOTICE =
   "**TEST DATA.** This case is part of the Kleros x Novi Corpus pilot. The job runs on Arc Testnet with testnet USDC, which has no value. The companies named below are test entities, not real filings. Both agents are test agents operated by Novi Corpus, which also operates the referee that filed this record: a controlled test. Please decide it as a case between unrelated parties.";
@@ -117,6 +125,7 @@ const SECTION_6_CLOSE =
   "These records say who answers for each agent. They say nothing about the quality of the work (dispute policy, section 2).";
 const SECTION_7 =
   '**7. The question.** Did the provider agent deliver what the ERC-8183 job on Arc describes? Answer 1, "Pay the provider", or Answer 2, "Refund the client". The dispute policy linked to this case says how to decide.';
+const NO_REPLY = "The provider gave no reply.";
 const VERIFIED_CONTROL = "controlled by a person verified as a unique human (World ID)";
 const UNVERIFIED_CONTROL = "control not verified on this record";
 
@@ -162,11 +171,17 @@ export function renderEvidence(i: EvidenceInput, opts?: { allowStanding?: string
   const createdAt = required(row, "createdBlockTime");
   const fundedAt = required(row, "fundedBlockTime");
   const submittedAt = required(row, "submittedBlockTime");
-  const contestedAt = required(row, "contestedAt");
   // Section 1 tells the job in order; a row out of order would tell it falsely.
   notBefore("fundedBlockTime", fundedAt, "createdBlockTime", createdAt);
   notBefore("submittedBlockTime", submittedAt, "fundedBlockTime", fundedAt);
-  notBefore("contestedAt", contestedAt, "submittedBlockTime", submittedAt);
+  notBefore(
+    "contestedAt",
+    required(row, "contestedAt") + CONTEST_CLOCK_SKEW_SECONDS,
+    "submittedBlockTime",
+    submittedAt,
+  );
+  // Within the skew the contest is dated as the delivery, so no day before it is ever named.
+  const contestedAt = Math.max(required(row, "contestedAt"), submittedAt);
   if (row.expiredAt <= contestedAt)
     throw new Error("evidence: row.expiredAt is not after row.contestedAt");
   const created = formatUtcDate(createdAt);
@@ -175,14 +190,12 @@ export function renderEvidence(i: EvidenceInput, opts?: { allowStanding?: string
   const contested = formatUtcDate(contestedAt);
   const expires = formatUtcDate(row.expiredAt);
   const reason = freeText("row.contestReason", required(row, "contestReason"));
-  const reply = freeText("row.contestReply", required(row, "contestReply"));
+  const reply = row.contestReply === null ? null : freeText("row.contestReply", row.contestReply);
   const asked = freeText("chain.descriptionOnChain", chain.descriptionOnChain);
   if (!CANONICAL_DECIMAL.test(row.budgetAtomic))
     throw new Error("evidence: row.budgetAtomic is not a decimal");
-  const budget = BigInt(row.budgetAtomic);
-  if (budget % ATOMIC_PER_CENT !== 0n)
-    throw new Error("evidence: row.budgetAtomic is finer than a cent");
-  const price = formatUsdc(budget);
+  // formatUsdc refuses an amount finer than a cent: the record never rounds a price.
+  const price = formatUsdc(BigInt(row.budgetAtomic));
   // Section 1's approved sentence pays on the creation day and contests on the delivery day; any
   // other day is named where it happened.
   const escrow =
@@ -216,7 +229,9 @@ export function renderEvidence(i: EvidenceInput, opts?: { allowStanding?: string
     "",
     `**4. The client's reason for contesting (${contested}):** "${reason}"`,
     "",
-    `**5. The provider's reply (${contested}):** "${reply}"`,
+    reply === null
+      ? `**5. The provider's reply:** ${NO_REPLY}`
+      : `**5. The provider's reply (${contested}):** "${reply}"`,
     "",
     `**6. Who answers for each agent** (Novi Corpus records, ${snapshots}):`,
     `- Client agent: ${buyer.text}`,
@@ -260,10 +275,11 @@ function notBefore(later: string, laterAt: number, earlier: string, earlierAt: n
   if (laterAt < earlierAt) throw new Error(`evidence: row.${later} is before row.${earlier}`);
 }
 
-/** A text the record quotes as it is. A code fence in it would open a block in a Markdown view
- *  and swallow the sections after it. */
+/** A text the record quotes as it is. A code fence in it, or a line of it that opens a tilde
+ *  fence, would open a block in a Markdown view and swallow the sections after it. */
 function freeText(field: string, text: string): string {
-  if (text.includes("```")) throw new Error(`evidence: ${field} holds a code fence`);
+  if (text.includes("```") || TILDE_FENCE_LINE.test(text))
+    throw new Error(`evidence: ${field} holds a code fence`);
   return text;
 }
 
@@ -324,9 +340,9 @@ function occurrences(s: string, sub: string): number {
 }
 
 /** One side's line of section 6 and the day its answer was checked. Prints five fields and no
- *  other: the legal name, the standing, the two control flags and `checkedAt`. Reads two more to
- *  refuse: the answer's agent id, which must be the row's for that side, and the statement's
- *  environment, which must be the sandbox. */
+ *  other: the legal name, the standing, the two control flags and `checkedAt`. Reads three more to
+ *  refuse: the answer's agent id and the statement's, which must both be the row's for that side,
+ *  and the statement's environment, which must be the sandbox. */
 function recordFacts(
   a: ByAgentAnswer,
   side: "buyer" | "seller",
@@ -339,6 +355,11 @@ function recordFacts(
   // Without a statement there is no name to print, whatever standing the operator accepts.
   if (!a.legalBody || a.statement === null) throw new EvidenceError("record_not_active", side);
   const m = a.statement.message;
+  // The route echoes the agent asked for; the statement names the agent it was signed for.
+  if (m.agentId !== rowAgentId)
+    throw new Error(
+      `evidence: the ${side} record's statement.message.agentId is not the row's ${side}AgentId`,
+    );
   if (m.standing !== "active" && m.standing !== allowStanding)
     throw new EvidenceError("record_not_active", side);
   // The notice calls the companies test entities: only a sandbox record is one.
