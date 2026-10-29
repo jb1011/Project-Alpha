@@ -84,6 +84,35 @@ const blankAsUnset = (v: unknown): unknown =>
 /** A URL with its trailing slashes removed, so a caller can append "/path" without doubling it. */
 const withoutTrailingSlash = (url: string): string => url.replace(/\/+$/, "");
 
+/** An https URL. False (never a throw) for anything `URL` cannot parse: zod 3 runs a refine even
+ *  after `.url()` failed, and a throw here would crash boot without naming the variable. */
+function isHttpsUrl(raw: string): boolean {
+  try {
+    return new URL(raw).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+/** An https origin and nothing else: no path, query, fragment, port or userinfo. */
+function isHttpsOrigin(raw: string): boolean {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return false;
+  }
+  return (
+    u.protocol === "https:" &&
+    u.port === "" &&
+    u.username === "" &&
+    u.password === "" &&
+    u.pathname === "/" &&
+    u.search === "" &&
+    u.hash === ""
+  );
+}
+
 /** The default of KLEROS_EXPECTED_OPTIONS: the ruling options the settlement asserts. */
 export const DEFAULT_KLEROS_EXPECTED_OPTIONS = "1=Pay the provider;2=Refund the client";
 
@@ -583,6 +612,47 @@ const EnvSchema = z.object({
   ),
   /** The explorer base for links in the evidence and the case view. */
   ARC_EXPLORER_URL: z.preprocess(blankAsUnset, z.string().url().optional()),
+
+  // --- AN EXTERNAL TRACK RECORD on the guardian's settings screen (design 2026-10-23). All
+  // optional; the first six come as a set, and the block is refused on mainnet. The code is
+  // generic, the provider is configured here. Grouped as cfg.externalRecord. ---
+  /** The only address whose posts on the Reputation registry count. */
+  EXTERNAL_RECORD_POSTER: z.preprocess(blankAsUnset, addressSchema.optional()),
+  EXTERNAL_RECORD_TAG1: z.preprocess(blankAsUnset, z.string().trim().min(1).max(64).optional()),
+  EXTERNAL_RECORD_TAG2: z.preprocess(blankAsUnset, z.string().trim().min(1).max(64).optional()),
+  /** The provider's https origin: its record API, and the only host a record link may point at. */
+  EXTERNAL_RECORD_API_BASE: z.preprocess(
+    blankAsUnset,
+    z
+      .string()
+      .url()
+      .refine(isHttpsOrigin, { message: "must be an https origin with no path" })
+      .optional(),
+  ),
+  /** The identity metadata key that names the provider-side wallet as `eip155:1:<address>`. */
+  EXTERNAL_RECORD_METADATA_KEY: z.preprocess(
+    blankAsUnset,
+    z.string().trim().min(1).max(64).optional(),
+  ),
+  /** The word the card shows for the provider. */
+  EXTERNAL_RECORD_PROVIDER_NAME: z.preprocess(
+    blankAsUnset,
+    z.string().trim().min(1).max(40).optional(),
+  ),
+  /** The explorer's etherscan-style API, read for the date of the last post. */
+  EXTERNAL_RECORD_EXPLORER_API: z.preprocess(
+    blankAsUnset,
+    z
+      .string()
+      .url()
+      .refine(isHttpsUrl, { message: "must be an https URL" })
+      .default("https://explorer.testnet.arc.io/api"),
+  ),
+  /** The first block the explorer is asked about: any block before the provider's first post. */
+  EXTERNAL_RECORD_FROM_BLOCK: z.preprocess(
+    blankAsUnset,
+    z.coerce.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).default(0),
+  ),
 });
 
 /** The parsed-and-transformed shape `EnvSchema.safeParse` produces. */
@@ -631,6 +701,25 @@ export interface PilotConfig {
   liveCasesCap: number;
   /** PILOT_LOOKUP_BASE, default publicApiUrl, else metadataBaseUrl; no trailing slash. */
   lookupBase: string;
+}
+
+/**
+ * The configured external track record (design 2026-10-23, section 4.4). Present only when the
+ * six settings are all set, and never on mainnet.
+ */
+export interface ExternalRecordConfig {
+  /** EXTERNAL_RECORD_POSTER, checksummed. */
+  poster: Address;
+  tag1: string;
+  tag2: string;
+  /** EXTERNAL_RECORD_API_BASE: an https origin, no trailing slash. */
+  apiBase: string;
+  metadataKey: string;
+  providerName: string;
+  /** EXTERNAL_RECORD_EXPLORER_API, default the Arc testnet explorer's API. */
+  explorerApi: string;
+  /** EXTERNAL_RECORD_FROM_BLOCK, default 0. A number, so the config stays printable. */
+  fromBlock: number;
 }
 
 /** The Kleros service settings. Present when at least one of the two keys is set. */
@@ -742,6 +831,8 @@ export interface Config {
   pilot?: PilotConfig;
   /** The Kleros service settings; undefined = neither Kleros key is set. */
   kleros?: KlerosConfig;
+  /** The external track record shown to the guardian; undefined = not configured. */
+  externalRecord?: ExternalRecordConfig;
   /** ARC_EXPLORER_URL, no trailing slash. Optional in the type, always set by loadConfig(): the plan
    *  declares it required, but that breaks existing test fixtures that build Config literals, which
    *  this change may not edit. loadConfig() always sets it; a reader of a fixture-built Config falls
@@ -1183,6 +1274,24 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
           }
         : undefined,
     arcExplorerUrl: withoutTrailingSlash(arcExplorerUrl),
+    externalRecord:
+      e.EXTERNAL_RECORD_POSTER &&
+      e.EXTERNAL_RECORD_TAG1 &&
+      e.EXTERNAL_RECORD_TAG2 &&
+      e.EXTERNAL_RECORD_API_BASE &&
+      e.EXTERNAL_RECORD_METADATA_KEY &&
+      e.EXTERNAL_RECORD_PROVIDER_NAME
+        ? {
+            poster: e.EXTERNAL_RECORD_POSTER,
+            tag1: e.EXTERNAL_RECORD_TAG1,
+            tag2: e.EXTERNAL_RECORD_TAG2,
+            apiBase: withoutTrailingSlash(e.EXTERNAL_RECORD_API_BASE),
+            metadataKey: e.EXTERNAL_RECORD_METADATA_KEY,
+            providerName: e.EXTERNAL_RECORD_PROVIDER_NAME,
+            explorerApi: e.EXTERNAL_RECORD_EXPLORER_API,
+            fromBlock: e.EXTERNAL_RECORD_FROM_BLOCK,
+          }
+        : undefined,
     gasSeedFloorUsdc: e.GAS_SEED_FLOOR_USDC,
     gasSeedTargetUsdc: e.GAS_SEED_TARGET_USDC,
     enableX402Demo: e.ENABLE_X402_DEMO,
@@ -1352,6 +1461,29 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   if (e.PILOT_KLEROS_MODE === "live" && !e.KLEROS_API_KEY_LIVE)
     throw new Error(
       "Invalid config: PILOT_KLEROS_MODE=live requires KLEROS_API_KEY_LIVE (the Beta key, which creates real, permanent cases in Kleros's live court)",
+    );
+
+  // The external track record (design 2026-10-23, section 4.4). The six settings come as a set:
+  // a card with a poster and no provider name, or a key and no record API, would show figures
+  // without their source. Testnet only: the card says "Arc testnet", and a mainnet box must not
+  // grow a third-party panel by accident.
+  const recordVars: Array<[string, unknown]> = [
+    ["EXTERNAL_RECORD_POSTER", e.EXTERNAL_RECORD_POSTER],
+    ["EXTERNAL_RECORD_TAG1", e.EXTERNAL_RECORD_TAG1],
+    ["EXTERNAL_RECORD_TAG2", e.EXTERNAL_RECORD_TAG2],
+    ["EXTERNAL_RECORD_API_BASE", e.EXTERNAL_RECORD_API_BASE],
+    ["EXTERNAL_RECORD_METADATA_KEY", e.EXTERNAL_RECORD_METADATA_KEY],
+    ["EXTERNAL_RECORD_PROVIDER_NAME", e.EXTERNAL_RECORD_PROVIDER_NAME],
+  ];
+  const recordSet = recordVars.filter(([, v]) => v !== undefined).map(([name]) => name);
+  const recordMissing = recordVars.filter(([, v]) => v === undefined).map(([name]) => name);
+  if (recordSet.length > 0 && recordMissing.length > 0)
+    throw new Error(
+      `Invalid config: ${recordSet.join(" and ")} ${recordSet.length === 1 ? "is" : "are"} set but ${recordMissing.join(" and ")} ${recordMissing.length === 1 ? "is" : "are"} missing (all-or-nothing)`,
+    );
+  if (cfg.externalRecord && cfg.arcNetwork === "mainnet")
+    throw new Error(
+      "Invalid config: the EXTERNAL_RECORD_* block is testnet only (ARC_NETWORK=mainnet): the track-record card is labelled Arc testnet",
     );
 
   const isProd = (env.NODE_ENV ?? process.env.NODE_ENV) === "production";
