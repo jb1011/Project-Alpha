@@ -489,6 +489,7 @@ describe("pilot:dispute: the filing", () => {
         `policy URI: ${POLICY}`,
         `cap: 3 filed so far, of ${cap}`,
         `case: TEST-1 (${fake.caseRow.caseId})`,
+        `evidence: sha256 0x${"ab".repeat(32)}, ${EVIDENCE_TEXT.length} bytes`,
       ])
         expect(banner).toContain(fact);
       expect(lines.indexOf(banner!)).toBeLessThan(lines.length - 1);
@@ -507,6 +508,26 @@ describe("pilot:dispute: the filing", () => {
     });
     const lines = await runFake(fake, disputeArgs(fake, ["--testnet", "--yes"]));
     expect(lines.find((l) => l.includes("juror count"))).toContain("juror count: 5");
+  });
+
+  test("filed with its evidence in doubt: exit 0, with a warning and a next step that says so", async () => {
+    const fake = makeFake();
+    fake.file.mockImplementation(async (_d: unknown, caseId: string) => {
+      fake.cases.advance(caseId, "contested", "evidence_unknown", {
+        klerosChain: "fake",
+        coreDisputeId: "186",
+      });
+      return { outcome: "filed", coreDisputeId: "186", evidenceStatus: "unknown" };
+    });
+    const out = resultOf(await runFake(fake, disputeArgs(fake, ["--yes"])));
+    expect(out).toMatchObject({
+      outcome: "filed",
+      evidenceStatus: "unknown",
+      status: "evidence_unknown",
+    });
+    expect(String(out.warning)).toContain("the evidence item is in doubt");
+    expect(String(out.next)).toContain("check the Court's evidence tab");
+    expect(String(out.next)).toContain("do not submit again without deciding with Kleros");
   });
 
   test("not_sent: the outcome is printed and the command fails", async () => {
@@ -541,6 +562,75 @@ describe("pilot:dispute: the filing", () => {
     const out = resultOf(lines);
     expect(out).toMatchObject({ failed: true, outcome: "filing_unknown", txHash });
     expect(String(out.next)).toContain("do not file it again");
+  });
+});
+
+describe("pilot:dispute on a row left at filing, testnet mode, through the real steps", () => {
+  /** A testnet row a command left at `filing`, and a fetch that records every request. */
+  function leftAtFiling(o: { startedAgo: number; ids?: boolean }) {
+    const fake = makeFake("testnet");
+    const { caseId } = fake.caseRow;
+    fake.cases.advance(caseId, "contested", "filing", {
+      filingStartedAt: NOW - o.startedAgo,
+      klerosChain: "arbitrum-sepolia-testnet",
+      klerosCourtId: 8,
+      klerosPolicyUri: POLICY,
+      ...(o.ids ? { coreDisputeId: "186", localDisputeId: "42" } : {}),
+    });
+    fake.cases.recordEvent(caseId, "filing", "started", "arbitrum-sepolia-testnet", null);
+    fake.cases.recordEvent(caseId, "create", "sending", null, null);
+    const requests: string[] = [];
+    vi.stubGlobal("fetch", async (url: string | URL | Request) => {
+      requests.push(String(url));
+      throw new Error("no request is made on this path");
+    });
+    // The real pre-flight and filing; only the config, the clock, the stage and the wait are the test's.
+    const deps: Partial<PilotCommandDeps> = {
+      readConfig: fake.deps.readConfig,
+      now: () => NOW,
+      buildStage: fake.deps.buildStage,
+      sleep: fake.sleep,
+    };
+    const go = (lines: string[]) =>
+      run(fake.open, deps, ["pilot:dispute", "--case", caseId, "--testnet", "--yes"], lines);
+    return { fake, caseId, requests, go };
+  }
+
+  test("started under 30 minutes ago: a filing is in progress, the row stays at filing, nothing is read", async () => {
+    const w = leftAtFiling({ startedAgo: 60 });
+    const lines: string[] = [];
+    await expect(w.go(lines)).rejects.toThrow("a filing is in progress: wait");
+    expect(resultOf(lines)).toMatchObject({
+      failed: true,
+      outcome: "not_sent",
+      code: "filing_in_progress",
+    });
+    expect(w.fake.cases.find(w.caseId)?.status).toBe("filing");
+    expect(w.requests).toEqual([]);
+    expect(w.fake.sleep).not.toHaveBeenCalled();
+  });
+
+  test("started over 30 minutes ago with a create sent and no id: filing_unknown, nothing is read", async () => {
+    const w = leftAtFiling({ startedAgo: 31 * 60 });
+    const lines: string[] = [];
+    await expect(w.go(lines)).rejects.toThrow("filing_unknown");
+    expect(resultOf(lines)).toMatchObject({ failed: true, outcome: "filing_unknown" });
+    expect(w.fake.cases.find(w.caseId)?.status).toBe("filing_unknown");
+    expect(w.requests).toEqual([]);
+  });
+
+  test("started over 30 minutes ago with a dispute id: evidence_unknown, filed with a warning", async () => {
+    const w = leftAtFiling({ startedAgo: 31 * 60, ids: true });
+    const out = resultOf(await w.go([]));
+    expect(out).toMatchObject({
+      outcome: "filed",
+      coreDisputeId: "186",
+      evidenceStatus: "unknown",
+      status: "evidence_unknown",
+      courtUrl: "https://v2-testnet.kleros.builders/#/cases/186/overview",
+    });
+    expect(String(out.warning)).toContain("in doubt");
+    expect(w.requests).toEqual([]);
   });
 });
 

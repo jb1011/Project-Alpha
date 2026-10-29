@@ -1,9 +1,15 @@
 import { KLEROS_DEPLOYMENTS, type KlerosDeployment } from "../adapters/kleros/deployments";
 import type { CourtClock } from "../adapters/kleros/disputeService";
-import { KlerosHttpError } from "../adapters/kleros/errors";
+import {
+  KlerosHttpError,
+  KlerosRefusal,
+  KlerosTransportError,
+  KlerosWrongDeploymentError,
+} from "../adapters/kleros/errors";
 import { FakeDisputeService } from "../adapters/kleros/fakeDisputeService";
 import { publicErrorMessage } from "../workflow/publicError";
 import type { KlerosStage } from "./composition";
+import { withoutEmDash } from "./job";
 
 /**
  * THE KLEROS CHECK: what the stage's Dispute Service answers to the three reads a filing believes,
@@ -45,6 +51,55 @@ export const MIN_EVIDENCE_PERIOD_SECONDS = 300;
 export const UNAUTHORIZED_PROBLEM =
   "the Dispute Service refused this stage's key (HTTP 401): the key is wrong or revoked";
 
+/** The most of a Kleros text an event, a row or an outcome keeps, by default. */
+const KLEROS_TEXT_SHORT = 300;
+
+/**
+ * A scheme-ful URL, a credential named by its label, and a hex run longer than a hash: the three
+ * shapes `publicErrorMessage` strips from a text, with the same rules.
+ */
+const URL_RUN = /[a-z][a-z0-9+.-]*:\/\/[^\s"'`<>)}\\]+/gi;
+const LABELLED_SECRET =
+  /\b(authorization|bearer|api[-_ ]?key|apikey|x-api-key|token|secret|seed|private[-_ ]?key)\b(\s*["']?\s*[:=]\s*["']?\s*|\s+)([A-Za-z0-9._~+/=-]{12,})/gi;
+const LONG_HEX = /0x[0-9a-fA-F]{65,}/g;
+
+/**
+ * A Kleros text (a refusal, an HTTP status, an answer the client could not read, an `unknown`
+ * result) as an event, a row or an outcome keeps it: the code and the service's own words, with
+ * URL paths and labelled credentials redacted, on one line, cut at `max` characters. Never
+ * `publicErrorMessage`'s fixed sentences: a fee wallet's "insufficient funds" is Kleros's, not
+ * the platform's. The client keeps up to 4,000 characters of a filing's answer it could not read,
+ * where a person finds the dispute's ids, so the create and the submit pass a larger `max`. Any
+ * other error goes through `publicErrorMessage` as before.
+ */
+export function klerosTextOf(e: unknown, max: number = KLEROS_TEXT_SHORT): string {
+  const kleros =
+    typeof e === "string" ||
+    e instanceof KlerosRefusal ||
+    e instanceof KlerosHttpError ||
+    e instanceof KlerosTransportError ||
+    e instanceof KlerosWrongDeploymentError;
+  if (!kleros) return withoutEmDash(publicErrorMessage(e));
+  const text = (typeof e === "string" ? e : e.message)
+    .replace(URL_RUN, originOf)
+    .replace(LABELLED_SECRET, (_m, label: string, sep: string) => `${label}${sep}<redacted>`)
+    .replace(LONG_HEX, (hex) => `${hex.slice(0, 10)}...`)
+    .replace(/\s+/g, " ")
+    .trim();
+  const cut = text.length > max ? `${text.slice(0, max - 3)}...` : text;
+  return withoutEmDash(cut);
+}
+
+/** `https://host`: the scheme and the host, never the path, the query or the user. */
+function originOf(raw: string): string {
+  try {
+    const u = new URL(raw);
+    return u.origin !== "null" ? u.origin : `${u.protocol}//${u.host}`;
+  } catch {
+    return `${raw.split("://")[0]}://(redacted)`;
+  }
+}
+
 /** A court named in the instructions: "court 8", "Court ID 34", "court #8". */
 const COURT_PHRASE = /\bcourt\s*(?:id\s*)?#?\s*(\d+)\b/gi;
 
@@ -79,7 +134,7 @@ export async function checkKleros(stage: KlerosStage): Promise<KlerosCheckResult
   const failed = (what: string, e: unknown) => {
     if (e instanceof KlerosHttpError && e.status === 401) {
       if (!problems.includes(UNAUTHORIZED_PROBLEM)) problems.push(UNAUTHORIZED_PROBLEM);
-    } else problems.push(`${what}: ${publicErrorMessage(e)}`);
+    } else problems.push(`${what}: ${klerosTextOf(e)}`);
   };
 
   try {

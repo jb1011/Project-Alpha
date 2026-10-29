@@ -15,7 +15,7 @@ import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { resetSenderNonces } from "../../src/adapters/arc/senderLock";
 import { type KlerosDeploymentName, deploymentFor } from "../../src/adapters/kleros/deployments";
-import type { CreateOutcome } from "../../src/adapters/kleros/disputeService";
+import type { CreateOutcome, SubmitOutcome } from "../../src/adapters/kleros/disputeService";
 import { KlerosRefusal } from "../../src/adapters/kleros/errors";
 import {
   FakeDisputeService,
@@ -472,6 +472,7 @@ describe("a rehearsal: the fake, script by script", () => {
         ["evidence", "stored", done.evidenceSha256],
         ["filing", "started", "fake"],
         ["pin", "published", done.attachmentUri],
+        ["create", "sending", null],
         ["create", "mined", done.createDisputeTx],
         ["submit", "mined", done.evidenceTx],
       ]);
@@ -532,21 +533,53 @@ describe("a rehearsal: the fake, script by script", () => {
     expect(trail(h, row.caseId).at(-1)).toEqual(["submit", "unknown", done.evidenceTx]);
   });
 
-  test("write-in-progress-once: one wait of 30 s, one more call, then filed", async () => {
+  test("write-in-progress-once: one more call at once, with no wait of its own, then filed", async () => {
     const h = setup();
     const row = await h.contested();
     const { stage, kleros } = rehearsal("write-in-progress-once");
     const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: null });
 
     expect(out).toMatchObject({ outcome: "filed", evidenceStatus: "mined" });
-    expect(h.sleeps).toEqual([30_000]);
+    // The HTTP client has already waited the refusal out; the filing calls once more at once.
+    expect(h.sleeps).toEqual([]);
     expect(kleros.calls.filter((c) => c.tool === "dispute_create")).toHaveLength(2);
     expect(h.cases.find(row.caseId)?.status).toBe("filed");
     const creates = trail(h, row.caseId).filter(([step]) => step === "create");
-    expect(creates.map(([, status]) => status)).toEqual(["write_in_progress", "mined"]);
+    expect(creates.map(([, status]) => status)).toEqual([
+      "sending",
+      "write_in_progress",
+      "sending",
+      "mined",
+    ]);
   });
 
-  test("a second WRITE_IN_PROGRESS after the wait is not_sent, and the row is contested again", async () => {
+  test("a second WRITE_IN_PROGRESS on the submit: evidence_unknown, with no wait", async () => {
+    const h = setup();
+    const row = await h.contested();
+    class Busy extends FakeDisputeService {
+      override async submitEvidence(): Promise<SubmitOutcome> {
+        throw new KlerosRefusal("evidence_submit", "WRITE_IN_PROGRESS: another write is running");
+      }
+    }
+    const kleros = new Busy({ script: "pay" });
+    const stage: KlerosStage = {
+      mode: "rehearsal",
+      service: kleros,
+      deployment: null,
+      cap: null,
+      flag: null,
+    };
+    const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: null });
+    expect(out).toMatchObject({ outcome: "filed", evidenceStatus: "unknown" });
+    expect(h.sleeps).toEqual([]);
+    const done = h.cases.find(row.caseId)!;
+    expect(done.status).toBe("evidence_unknown");
+    expect(done.error).toContain("WRITE_IN_PROGRESS");
+    const submits = trail(h, row.caseId).filter(([step]) => step === "submit");
+    expect(submits.map(([, status]) => status)).toEqual(["write_in_progress", "refused"]);
+  });
+
+  test("a second WRITE_IN_PROGRESS is not_sent, and the row is contested again", async () => {
     const h = setup();
     const row = await h.contested();
     const { stage, kleros } = rehearsalWithCreate(async () => {
@@ -555,7 +588,7 @@ describe("a rehearsal: the fake, script by script", () => {
     const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: null });
 
     expect(out).toMatchObject({ outcome: "not_sent", code: "WRITE_IN_PROGRESS" });
-    expect(h.sleeps).toEqual([30_000]);
+    expect(h.sleeps).toEqual([]);
     expect(kleros.calls.filter((c) => c.tool === "dispute_create")).toHaveLength(2);
     expect(h.cases.find(row.caseId)?.status).toBe("contested");
   });
@@ -764,6 +797,24 @@ describe("a rehearsal never reaches the real service", () => {
     expect(kleros.calls).toEqual([]);
   });
 
+  test.each([
+    ["a deployment", { deployment: deploymentFor("testnet") }],
+    ["a cap", { cap: 10 }],
+    ["a flag", { flag: "--testnet" }],
+  ] as const)(
+    "a rehearsal stage holding the fake and %s refuses before any call",
+    async (_what, over) => {
+      const h = setup();
+      const row = await h.contested();
+      const { stage, kleros } = rehearsal();
+      const out = await fileDispute(h.deps({ ...stage, ...over }), row.caseId, {
+        confirmedFlag: null,
+      });
+      expect(notSent(out)).toBe(true);
+      expect(kleros.calls).toEqual([]);
+    },
+  );
+
   test("a row of another mode refuses before any call", async () => {
     const h = setup();
     const row = await h.contested("testnet");
@@ -834,6 +885,34 @@ describe("the caps and the live gate", () => {
     const { stage } = http("live");
     const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: "--live" });
     expect(out.outcome).toBe("filed");
+  });
+
+  test("two filings at once, one under the cap: one is filed, the other refused by the cap read in the move", async () => {
+    const h = setup();
+    const a = await h.contested("testnet");
+    const b = await h.contested("testnet");
+    // Both pre-flights pass the cap before either moves: their lookups wait until both are asked.
+    let asked = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const lookup: LookupClient = {
+      byAgent: async (id) => {
+        if (++asked === 2) release();
+        await gate;
+        return id === BUYER_AGENT ? fixtureAnswer("buyer") : fixtureAnswer("seller");
+      },
+    };
+    const { stage, seen } = http("testnet", { cap: 1 });
+    const outs = await Promise.all(
+      [a, b].map((r) =>
+        fileDispute(h.deps(stage, { lookup }), r.caseId, { confirmedFlag: "--testnet" }),
+      ),
+    );
+    expect(outs.map((o) => o.outcome).sort()).toEqual(["filed", "not_sent"]);
+    expect(textOf(outs.find(notSent))).toContain("cap");
+    expect(seen.filter((s) => s.tool === "dispute_create")).toHaveLength(1);
   });
 
   test("live with no testnet case seen in the Court interface refuses with zero calls", async () => {
@@ -924,6 +1003,22 @@ describe("the pre-flight refuses, and writes nothing", () => {
     expectNothingWritten(h, row, kleros.calls);
   });
 
+  test.each(["budget", "expiry"] as const)(
+    "a job whose %s on chain is not the row's, which the evidence prints",
+    async (what) => {
+      const h = setup();
+      const row = await h.contested();
+      const job = h.node.chainJob(BigInt(row.jobId!))!;
+      if (what === "budget") job.budget = BUDGET + 1n;
+      else job.expiredAt = job.expiredAt + 1n;
+      const { stage, kleros } = rehearsal();
+      const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: null });
+      expect(notSent(out)).toBe(true);
+      expect(textOf(out)).toContain(what === "budget" ? "budget" : "expires at");
+      expectNothingWritten(h, row, kleros.calls);
+    },
+  );
+
   test("under two hours to the job's expiry; exactly two hours passes", async () => {
     const h = setup();
     const row = await h.contested();
@@ -995,6 +1090,20 @@ describe("the delivered file, read back and checked twice", () => {
       ok: false,
       problem: expect.stringContaining("the submit receipt carries no JobSubmitted log"),
     });
+    expect(kleros.calls).toEqual([]);
+  });
+
+  test("a submit receipt that says reverted refuses", async () => {
+    const h = setup();
+    const row = await h.contested();
+    const client = h.chain.publicClient;
+    const real = client.getTransactionReceipt.bind(client);
+    vi.spyOn(client, "getTransactionReceipt").mockImplementation((async (
+      a: Parameters<typeof real>[0],
+    ) => ({ ...(await real(a)), status: "reverted" })) as never);
+    const { stage, kleros } = rehearsal();
+    const pre = await preflightDispute(h.deps(stage), row.caseId, {});
+    expect(pre).toEqual({ ok: false, problem: expect.stringContaining("reverted") });
     expect(kleros.calls).toEqual([]);
   });
 
@@ -1121,14 +1230,137 @@ describe("what the pre-flight stores, and what the filing serves", () => {
   });
 });
 
-describe("a filing that stopped part way", () => {
-  test("a row at filing with no dispute id is refused and reported as filing_unknown, with zero calls", async () => {
+describe("the stored evidence is the evidence filed", () => {
+  test("a dry run whose reads straddle a filing stores nothing: the files stay the ones filed", async () => {
     const h = setup();
     const row = await h.contested();
-    h.cases.advance(row.caseId, "contested", "filing", {
-      filingStartedAt: h.clock(),
-      klerosChain: "fake",
+    const { stage, kleros } = rehearsal();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
     });
+    const later = {
+      ...fixtureAnswer("buyer"),
+      checkedAt: "2026-10-25T11:00:00.000Z",
+    } as ByAgentAnswer;
+    const held: LookupClient = {
+      byAgent: async (id) => {
+        await gate;
+        return id === BUYER_AGENT ? later : fixtureAnswer("seller");
+      },
+    };
+    // The dry run reads the row at contested, then waits on its lookups while the case is filed.
+    const dry = preflightDispute(h.deps(stage, { lookup: held }), row.caseId, {});
+    const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: null });
+    expect(out.outcome).toBe("filed");
+    release();
+    expect(await dry).toEqual({ ok: false, problem: expect.stringContaining("moved") });
+
+    const done = h.cases.find(row.caseId)!;
+    const submitted = kleros.calls.find((c) => c.tool === "evidence_submit")?.args as {
+      description: string;
+    };
+    const stored = h.docStore.get(done.evidencePath!);
+    expect(stored).toBe(submitted.description);
+    expect(sha256(stringToBytes(stored))).toBe(done.evidenceSha256);
+    expect(h.docStore.get(done.buyerRecordPath!)).toBe(JSON.stringify(fixtureAnswer("buyer")));
+  });
+
+  test("a filing whose stored evidence changed after its pre-flight sends nothing", async () => {
+    const h = setup();
+    const row = await h.contested();
+    const { stage, kleros } = rehearsal();
+    // Another command stores its own evidence between this filing's pre-flight and its move.
+    let storedOnce = false;
+    const cases = new Proxy(h.cases, {
+      get(target, prop, receiver) {
+        if (prop === "recordEvent")
+          return (...a: Parameters<typeof target.recordEvent>) => {
+            if (a[1] === "evidence" && a[2] === "stored") storedOnce = true;
+            target.recordEvent(...a);
+          };
+        if (prop === "transaction")
+          return <T>(fn: () => T): T => {
+            if (storedOnce) {
+              storedOnce = false;
+              target.patch(row.caseId, { evidenceSha256: `0x${"ee".repeat(32)}` });
+            }
+            return target.transaction(fn);
+          };
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const out = await fileDispute(h.deps(stage, { cases }), row.caseId, { confirmedFlag: null });
+    expect(notSent(out)).toBe(true);
+    expect(textOf(out)).toContain("the stored evidence changed");
+    expect(fakeWrites(kleros)).toEqual([]);
+    expect(h.cases.find(row.caseId)?.status).toBe("contested");
+  });
+
+  test("a store that fails: not_sent with a sanitised text, nothing on the row, no write", async () => {
+    const h = setup();
+    const row = await h.contested();
+    const docStore = new Proxy(h.docStore, {
+      get(target, prop, receiver) {
+        if (prop === "put")
+          return () => {
+            throw new Error(
+              "EIO: write failed, see https://store.example.test/v1/secret-path-0123456789",
+            );
+          };
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const { stage, kleros } = rehearsal();
+    const out = await fileDispute(h.deps(stage, { docStore }), row.caseId, { confirmedFlag: null });
+    expect(notSent(out)).toBe(true);
+    expect(textOf(out)).toContain("could not be stored");
+    expect(textOf(out)).not.toContain("secret-path-0123456789");
+    const now = h.cases.find(row.caseId)!;
+    expect([now.status, now.evidencePath]).toEqual(["contested", null]);
+    expect(fakeWrites(kleros)).toEqual([]);
+  });
+});
+
+describe("a filing that stopped part way", () => {
+  /** The row as a command leaves it at `filing`, `startedAgo` seconds ago. */
+  function atFiling(
+    h: Harness,
+    row: PilotCaseRecord,
+    o: { startedAgo: number; createSent?: boolean; ids?: boolean },
+  ): void {
+    h.cases.advance(row.caseId, "contested", "filing", {
+      filingStartedAt: h.clock() - o.startedAgo,
+      klerosChain: "fake",
+      klerosPolicyUri: POLICY,
+      ...(o.ids ? { coreDisputeId: "77", localDisputeId: "78", createDisputeTx: CREATE_TX } : {}),
+    });
+    h.cases.recordEvent(row.caseId, "filing", "started", "fake", null);
+    if (o.createSent) h.cases.recordEvent(row.caseId, "create", "sending", null, null);
+  }
+
+  test("under 30 minutes old, a filing is in progress: wait, with no move and no call", async () => {
+    const h = setup();
+    const row = await h.contested();
+    atFiling(h, row, { startedAgo: 1_799, createSent: true });
+    const { stage, kleros } = rehearsal();
+
+    const pre = await preflightDispute(h.deps(stage), row.caseId, {});
+    expect(pre).toEqual({
+      ok: false,
+      problem: expect.stringContaining("a filing is in progress: wait"),
+    });
+    const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: null });
+    expect(out).toMatchObject({ outcome: "not_sent", code: "filing_in_progress" });
+    expect(textOf(out)).toContain("a filing is in progress: wait");
+    expect(h.cases.find(row.caseId)?.status).toBe("filing");
+    expect(kleros.calls).toEqual([]);
+  });
+
+  test("30 minutes old with a create sent and no dispute id: filing_unknown, with zero calls", async () => {
+    const h = setup();
+    const row = await h.contested();
+    atFiling(h, row, { startedAgo: 1_800, createSent: true });
     const { stage, kleros } = rehearsal();
 
     const pre = await preflightDispute(h.deps(stage), row.caseId, {});
@@ -1141,16 +1373,30 @@ describe("a filing that stopped part way", () => {
     expect(kleros.calls).toEqual([]);
   });
 
-  test("a row at filing with a dispute id is filed with its evidence in doubt, with zero calls", async () => {
+  test("30 minutes old with no create sent: contested again, and then it files once", async () => {
     const h = setup();
     const row = await h.contested();
-    h.cases.advance(row.caseId, "contested", "filing", {
-      filingStartedAt: h.clock(),
-      klerosChain: "fake",
-      coreDisputeId: "77",
-      localDisputeId: "78",
-      createDisputeTx: CREATE_TX,
-    });
+    // A create sent on an earlier attempt does not count: only this attempt's trail does.
+    h.cases.recordEvent(row.caseId, "create", "sending", null, null);
+    atFiling(h, row, { startedAgo: 3_600 });
+    const { stage, kleros } = rehearsal();
+
+    const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: null });
+    expect(out).toMatchObject({ outcome: "not_sent", code: "filing_stopped" });
+    expect(h.cases.find(row.caseId)?.status).toBe("contested");
+    expect(kleros.calls).toEqual([]);
+
+    const again = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: null });
+    expect(again.outcome).toBe("filed");
+    expect(kleros.calls.filter((c) => c.tool === "dispute_create")).toHaveLength(1);
+  });
+
+  test("30 minutes old with a dispute id: filed with its evidence in doubt, an ops line, zero calls", async () => {
+    const h = setup();
+    const row = await h.contested();
+    atFiling(h, row, { startedAgo: 1_800, createSent: true, ids: true });
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((m) => lines.push(String(m)));
     const { stage, kleros } = rehearsal();
     const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: null });
     expect(out).toEqual({
@@ -1161,6 +1407,88 @@ describe("a filing that stopped part way", () => {
     });
     expect(h.cases.find(row.caseId)?.status).toBe("evidence_unknown");
     expect(kleros.calls).toEqual([]);
+    const filed = lines.map((l) => JSON.parse(l)).filter((l) => l.opslog === "pilot_case_filed");
+    expect(filed).toEqual([expect.objectContaining({ caseId: row.caseId, coreDisputeId: "77" })]);
+  });
+});
+
+describe("a case filed once is never filed again", () => {
+  test.each([
+    ["a 401", { evidence_submit: () => httpStatus(401) }],
+    ["a network failure", "network"],
+  ] as const)(
+    "%s on the submit after a mined create: evidence_unknown, then zero creates",
+    async (_what, how) => {
+      const h = setup();
+      const row = await h.contested("testnet");
+      const { stage, seen } = http(
+        "testnet",
+        how === "network"
+          ? {
+              every: (s) => {
+                if (s.tool === "evidence_submit") throw new TypeError("fetch failed");
+                return undefined;
+              },
+            }
+          : { answers: how },
+      );
+      const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: "--testnet" });
+      expect(out).toEqual({
+        outcome: "filed",
+        coreDisputeId: "186",
+        localDisputeId: "42",
+        evidenceStatus: "unknown",
+      });
+      const done = h.cases.find(row.caseId)!;
+      expect([done.status, done.coreDisputeId]).toEqual(["evidence_unknown", "186"]);
+
+      const again = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: "--testnet" });
+      expect(notSent(again)).toBe(true);
+      expect(seen.filter((s) => s.tool === "dispute_create")).toHaveLength(1);
+    },
+  );
+
+  test("a raw simulated submit after a mined create: evidence_unknown, never mined, then zero creates", async () => {
+    const h = setup();
+    const row = await h.contested();
+    class Simulating extends FakeDisputeService {
+      override async submitEvidence(): Promise<SubmitOutcome> {
+        return { status: "simulated" };
+      }
+    }
+    const kleros = new Simulating({ script: "pay" });
+    const stage: KlerosStage = {
+      mode: "rehearsal",
+      service: kleros,
+      deployment: null,
+      cap: null,
+      flag: null,
+    };
+    const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: null });
+    expect(out).toMatchObject({ outcome: "filed", evidenceStatus: "unknown" });
+    const done = h.cases.find(row.caseId)!;
+    expect([done.status, done.evidenceStatus, done.evidenceTx]).toEqual([
+      "evidence_unknown",
+      "unknown",
+      null,
+    ]);
+    await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: null });
+    expect(kleros.calls.filter((c) => c.tool === "dispute_create")).toHaveLength(1);
+  });
+
+  test.each([
+    ["a dispute id", { coreDisputeId: "186" }],
+    ["a create transaction", { createDisputeTx: CREATE_TX }],
+  ] as const)("a contested row that already holds %s is never filed", async (_what, patch) => {
+    const h = setup();
+    const row = await h.contested();
+    h.cases.patch(row.caseId, patch);
+    const { stage, kleros } = rehearsal();
+    const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: null });
+    expect(notSent(out)).toBe(true);
+    expect(textOf(out)).toContain("never filed again");
+    expect(kleros.calls).toEqual([]);
+    expect(h.cases.find(row.caseId)?.status).toBe("contested");
   });
 });
 
@@ -1209,6 +1537,23 @@ describe("filing again after nothing was sent", () => {
     expect(seen).toEqual([]);
   });
 
+  test("a re-filing whose policy URI changed refuses before any call", async () => {
+    const h = setup();
+    const row = await h.contested();
+    await fileDispute(h.deps(rehearsal("insufficient-balance").stage), row.caseId, {
+      confirmedFlag: null,
+    });
+    expect(h.cases.find(row.caseId)?.klerosPolicyUri).toBe(POLICY);
+    const { stage, kleros } = rehearsal();
+    const klerosCfg = { ...KLEROS_CFG, policyUri: "/ipfs/another-policy-uri" };
+    const out = await fileDispute(h.deps(stage, { klerosCfg }), row.caseId, {
+      confirmedFlag: null,
+    });
+    expect(notSent(out)).toBe(true);
+    expect(textOf(out)).toMatch(/^this case was started on another deployment: fake/);
+    expect(kleros.calls).toEqual([]);
+  });
+
   test("a testnet re-filing on the same deployment files", async () => {
     const h = setup();
     const row = await h.contested("testnet");
@@ -1252,6 +1597,10 @@ describe("what the service answers on the writes", () => {
     ],
     ["a refusal with no code", () => refusal("something went wrong")],
     ["an HTTP 500", () => httpStatus(500)],
+    [
+      "an HTTP 502 from a proxy, which may come after the request reached the service",
+      () => httpStatus(502),
+    ],
   ])("%s on dispute_create freezes the row at filing_unknown", async (_what, answer) => {
     const h = setup();
     const row = await h.contested("testnet");
@@ -1261,6 +1610,99 @@ describe("what the service answers on the writes", () => {
     expect(h.cases.find(row.caseId)?.status).toBe("filing_unknown");
     expect(seen.filter((s) => s.tool === "dispute_create")).toHaveLength(1);
     expect(seen.map((s) => s.tool)).not.toContain("evidence_submit");
+  });
+
+  test.each([
+    [429, "http_429"],
+    [413, "http_413"],
+  ] as const)(
+    "an HTTP %s on dispute_create was decided before the call ran: not_sent %s, contested again",
+    async (code, named) => {
+      const h = setup();
+      const row = await h.contested("testnet");
+      const { stage, seen } = http("testnet", {
+        answers: { dispute_create: () => httpStatus(code) },
+      });
+      const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: "--testnet" });
+      expect(out).toMatchObject({ outcome: "not_sent", code: named });
+      expect(textOf(out)).toContain("nothing was sent");
+      const done = h.cases.find(row.caseId)!;
+      expect([done.status, done.klerosChain]).toEqual(["contested", "arbitrum-sepolia-testnet"]);
+      expect(seen.filter((s) => s.tool === "dispute_create")).toHaveLength(1);
+    },
+  );
+
+  test("an HTTP 429 on the pin: not_sent http_429, nothing created", async () => {
+    const h = setup();
+    const row = await h.contested("testnet");
+    const { stage, seen } = http("testnet", { answers: { evidence_pin: () => httpStatus(429) } });
+    const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: "--testnet" });
+    expect(out).toMatchObject({ outcome: "not_sent", code: "http_429" });
+    expect(seen.map((s) => s.tool)).not.toContain("dispute_create");
+    expect(h.cases.find(row.caseId)?.status).toBe("contested");
+  });
+
+  test("an HTTP 429 on the submit: evidence_unknown, like every submit that is not mined", async () => {
+    const h = setup();
+    const row = await h.contested("testnet");
+    const { stage } = http("testnet", { answers: { evidence_submit: () => httpStatus(429) } });
+    const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: "--testnet" });
+    expect(out).toMatchObject({ outcome: "filed", evidenceStatus: "unknown" });
+    expect(h.cases.find(row.caseId)?.status).toBe("evidence_unknown");
+  });
+
+  test("a Kleros text keeps its own words: a funds sentence is never rewritten as the platform's", async () => {
+    const h = setup();
+    const row = await h.contested("testnet");
+    const text =
+      "INSUFFICIENT_BALANCE: insufficient funds in the fee wallet for the arbitration fee";
+    const { stage } = http("testnet", { answers: { dispute_create: () => refusal(text) } });
+    const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: "--testnet" });
+    expect(out).toMatchObject({ outcome: "not_sent", code: "INSUFFICIENT_BALANCE" });
+    expect(textOf(out)).toContain(text);
+    expect(textOf(out)).not.toContain("platform");
+    expect(h.cases.events(row.caseId).at(-1)?.detail).toBe(text);
+  });
+
+  test("a mined create the client could not read keeps the service's text past 300 characters, ids included", async () => {
+    const h = setup();
+    const row = await h.contested("testnet");
+    const { stage } = http("testnet", {
+      answers: {
+        dispute_create: () =>
+          toolResult({
+            note: "n".repeat(600),
+            status: "mined",
+            coreDisputeID: "186",
+            localDisputeID: "42",
+            txHash: "not-a-hash",
+          }),
+      },
+    });
+    const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: "--testnet" });
+    expect(out.outcome).toBe("filing_unknown");
+    const done = h.cases.find(row.caseId)!;
+    expect(done.status).toBe("filing_unknown");
+    expect(done.error).toContain('"coreDisputeID":"186","localDisputeID":"42"');
+    const event = h.cases.events(row.caseId).at(-1)!;
+    expect([event.step, event.status]).toEqual(["create", "unknown"]);
+    expect(event.detail).toContain('"coreDisputeID":"186"');
+  });
+
+  test("a Kleros text has its URL paths and labelled credentials redacted", async () => {
+    const h = setup();
+    const row = await h.contested("testnet");
+    const text =
+      "UNKNOWN: the upstream https://rpc.example.test/v2/path-k3y-0123456789abcdef failed; authorization: Bearer abcdefghijklmnopqrstuvwx";
+    const { stage } = http("testnet", { answers: { dispute_create: () => refusal(text) } });
+    const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: "--testnet" });
+    expect(out).toMatchObject({ outcome: "not_sent", code: "UNKNOWN" });
+    const detail = h.cases.events(row.caseId).at(-1)?.detail ?? "";
+    for (const shown of [textOf(out), detail]) {
+      expect(shown).toContain("https://rpc.example.test");
+      expect(shown).not.toContain("path-k3y-0123456789abcdef");
+      expect(shown).not.toContain("abcdefghijklmnopqrstuvwx");
+    }
   });
 
   test("a network failure on dispute_create freezes the row at filing_unknown", async () => {

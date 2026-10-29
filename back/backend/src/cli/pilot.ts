@@ -1089,6 +1089,7 @@ function bannerOf(
     `  policy URI: ${policyUri ?? "none configured"}`,
     `  cap: ${pre.filedCount} filed so far, of ${pre.cap ?? "no cap"}`,
     `  case: ${row.label} (${row.caseId})`,
+    `  evidence: sha256 ${pre.evidence.sha256}, ${pre.evidence.byteLength} bytes (the dry run's, if nothing changed since)`,
   ].join("\n");
 }
 
@@ -1096,8 +1097,16 @@ function bannerOf(
 function nextAfter(outcome: Exclude<FileOutcome, { outcome: "filed" }>, caseId: string): string {
   if (outcome.outcome === "filing_unknown")
     return `the dispute may exist on Kleros: do not file it again; find it in the Court interface by the alias addresses and the time, then record its ids, or mark the case failed once Kleros confirms none exists (pilot:case show ${caseId} has the trail)`;
+  if (outcome.code === "filing_in_progress")
+    return `another command is filing this case: nothing was sent; wait for it to end, then read pilot:case show ${caseId}`;
+  if (outcome.code === "filing_stopped")
+    return "nothing was sent: the stopped filing never sent a create, and the case is contested again; run the same command again to file it";
   return "nothing was sent: fix the cause, then run the same command again; the row is contested and keeps its attachment";
 }
+
+/** What a filed case whose evidence is in doubt says, on top of its outcome. */
+const EVIDENCE_IN_DOUBT =
+  "the evidence item is in doubt: the dispute exists, but whether the evidence reached it is not known";
 
 async function dispute(
   ctx: PilotContext,
@@ -1139,7 +1148,9 @@ async function dispute(
     };
   }
 
-  if (stage.flag !== null) {
+  // A row found at `filing` sends nothing whatever happens next (the filing reads it and answers
+  // without a call), so it goes straight to the filing, which knows what that row means.
+  if (stage.flag !== null && findCase(ctx, p.caseId).status !== "filing") {
     const pre = await deps.preflightDispute(d, p.caseId, opts);
     if (!pre.ok) refuse(pre.problem);
     console.log(bannerOf(stage, pre, findCase(ctx, p.caseId), ctx.cfg.kleros?.policyUri));
@@ -1149,6 +1160,15 @@ async function dispute(
   const outcome = await deps.fileDispute(d, p.caseId, { ...opts, confirmedFlag: p.flag });
   const row = findCase(ctx, p.caseId);
   const base = { ...outcome, caseId: p.caseId, status: row.status, stage: view };
+  if (outcome.outcome === "filed" && outcome.evidenceStatus === "unknown")
+    return {
+      ...base,
+      courtUrl: courtUrlOf(row),
+      warning: EVIDENCE_IN_DOUBT,
+      case: row,
+      note: PILOT_NOTE,
+      next: "the evidence is in doubt: check the Court's evidence tab; do not submit again without deciding with Kleros",
+    };
   if (outcome.outcome === "filed")
     return {
       ...base,

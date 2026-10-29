@@ -285,6 +285,16 @@ describe("the problems", () => {
     expect(at.problems).toEqual([]);
   });
 
+  test("a problem carries the service's words with no em dash", async () => {
+    const dash = String.fromCodePoint(0x2014);
+    const { fetch } = klerosFetch({
+      court: () => refusal(`COURT_NOT_FOUND: no court 8 ${dash} try another chain`),
+    });
+    const r = await checkKleros(httpStage("testnet", fetch));
+    expect(r.problems).toEqual([expect.stringContaining("COURT_NOT_FOUND: no court 8")]);
+    expect(r.problems.join("").includes(dash)).toBe(false);
+  });
+
   test("a rehearsal stage that does not hold the fake reads nothing", async () => {
     const { fetch, seen } = klerosFetch();
     const stage: KlerosStage = {

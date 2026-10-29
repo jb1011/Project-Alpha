@@ -25,7 +25,7 @@ import type { KlerosStage, PilotChain } from "./composition";
 import { type Evidence, renderEvidence } from "./evidence";
 import { withoutEmDash } from "./job";
 import { submittedDeliverableOf } from "./jobEvents";
-import { UNAUTHORIZED_PROBLEM, checkKleros } from "./klerosCheck";
+import { UNAUTHORIZED_PROBLEM, checkKleros, klerosTextOf } from "./klerosCheck";
 import type { LookupClient } from "./lookup";
 import type { KlerosChainOnRow, PilotCaseRecord } from "./types";
 
@@ -38,24 +38,31 @@ import type { KlerosChainOnRow, PilotCaseRecord } from "./types";
  *
  *  - Nothing reaches Kleros before the stage gate and the pre-flight pass. The gate: a rehearsal
  *    files with the fake only (an `instanceof` check, so the real client in a rehearsal refuses
- *    before any call) and with no flag; testnet needs `--testnet` and live `--live`. The
- *    pre-flight reads only, then stores the evidence and the two records the filing serves.
+ *    before any call), with no deployment, cap or flag; testnet needs `--testnet` and live
+ *    `--live`. The pre-flight reads only, then stores the evidence and the two records the
+ *    filing serves, and only while the row is at `contested`.
  *  - A dispute is created only for a row the compare-and-set just moved from `contested` to
- *    `filing`, in the same command. That move writes the stage's chain, court and policy URI,
- *    which never change after. A create whose outcome is in doubt freezes the row at
- *    `filing_unknown`, and no later command creates again: a human resolves it.
- *  - A refusal the Kleros docs say sent nothing moves the row back to `contested`, to be filed
- *    again once the cause is fixed; the attempt's start time and deployment stay on the row.
- *  - Every Kleros write writes an event with its status and reference, and the row's moves are
- *    compare-and-set. The ids and hashes of a mined write are written whatever the row's status
- *    by then: they are facts about Kleros.
+ *    `filing`, in the same command, with the stored evidence still the one this command is about
+ *    to submit. That move writes the stage's chain, court and policy URI, which never change
+ *    after. A row that already holds a dispute id or a create transaction is never filed again.
+ *    A create whose outcome is in doubt freezes the row at `filing_unknown`: a human resolves it.
+ *  - A refusal the Kleros docs say sent nothing, or an HTTP status decided before the call ran
+ *    (401, 429, 413), moves the row back to `contested`, to be filed again once the cause is
+ *    fixed; the attempt's start time and deployment stay on the row.
+ *  - A row found at `filing` is another command's filing while it is under 30 minutes old (wait),
+ *    and a stopped one after that: back to `contested` when its trail shows no create was sent,
+ *    else frozen.
+ *  - Every Kleros write writes an event with its status and reference (the create also when it is
+ *    about to be sent), and the row's moves are compare-and-set. The ids and hashes of a mined
+ *    write are written whatever the row's status by then: they are facts about Kleros.
  *
- * No key is read here: the stage's client holds it. Every text an event or an outcome carries
- * from an exception goes through `publicErrorMessage` first.
+ * No key is read here: the stage's client holds it. A Kleros text keeps its own words with
+ * credentials redacted (`klerosTextOf`); any other exception's text goes through
+ * `publicErrorMessage`.
  */
 
-/** The escrow as the job adapter reads it from the chain. */
-export type EscrowState = Awaited<ReturnType<JobAdapter["escrowState"]>>;
+/** The job's escrow as the job adapter reads it from the chain. */
+export type EscrowOnChain = Awaited<ReturnType<JobAdapter["escrowState"]>>;
 
 export interface FileDisputeDeps {
   chain: PilotChain;
@@ -78,7 +85,7 @@ export type Preflight =
       evidence: Evidence;
       court: CourtClock;
       instructions: string | null;
-      escrow: EscrowState;
+      escrow: EscrowOnChain;
       records: { buyer: ByAgentAnswer; seller: ByAgentAnswer };
       filedCount: number;
       cap: number | null;
@@ -97,12 +104,24 @@ export type FileOutcome =
 
 /** An expired job refunds the client whatever the ruling: a case is filed with two hours left. */
 const MIN_SECONDS_TO_EXPIRY = 7_200;
-/** Another write on the same key was running (nothing was sent): wait once, then call again. */
+/**
+ * A `filing` row younger than this is another command's filing in progress. It covers the
+ * client's write deadlines (the create and the submit up to four minutes each), its own waits
+ * on WRITE_IN_PROGRESS (up to two minutes a write) and the one more call after them.
+ */
+const FILING_IN_PROGRESS_SECONDS = 30 * 60;
+/**
+ * Another write on the same key was running and nothing was sent. The HTTP client has already
+ * waited it out, so the filing calls once more at once; a second one is refused like any other.
+ */
 const WRITE_IN_PROGRESS = "WRITE_IN_PROGRESS";
-const WRITE_IN_PROGRESS_WAIT_MS = 30_000;
+/** The create and the submit keep a long Kleros text: a person may read the ids out of it. */
+const KLEROS_FILING_TEXT_MAX = 4_500;
 /** The codes of a refusal that is ours, not the service's. */
 const UNAUTHORIZED = "unauthorized";
 const PIN_CHECKED_ONLY = "pin_checked_only";
+const FILING_IN_PROGRESS = "filing_in_progress";
+const FILING_STOPPED = "filing_stopped";
 const UNAUTHORIZED_TEXT =
   "the Dispute Service refused the key of this stage (HTTP 401): it is wrong or revoked; nothing was sent";
 /** The alias slot keys of the preset when no Kleros config is set (a rehearsal box). */
@@ -110,13 +129,13 @@ const DEFAULT_ALIAS_CLIENT = "client";
 const DEFAULT_ALIAS_PROVIDER = "provider";
 /** The store's own names for the pilot's files; every one starts with this. */
 const PILOT_FILE_PREFIX = "pilot-";
+const CANONICAL_DECIMAL = /^(0|[1-9]\d*)$/;
 const LIVE_GATE =
   "file and look at a testnet case first: live mode files only once a testnet case is filed and recorded as seen in the Kleros Court interface (pilot:case seen-in-court)";
 
 const unixNow = () => Math.floor(Date.now() / 1000);
-const realSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const sameAddress = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
-/** An exception's text, fit to persist or print. */
+/** An exception that is not Kleros's, fit to persist or print. */
 const safe = (e: unknown) => withoutEmDash(publicErrorMessage(e));
 
 /** The pre-flight's inner answer: the public one, plus what the filing goes on with. */
@@ -155,21 +174,32 @@ export async function fileDispute(
   const now = (d.now ?? unixNow)();
   const deployment = deploymentOf(d);
   // The cap is read again in the transaction that moves the row, so two filings at once cannot
-  // both pass it. The deployment is written on the first filing and only compared after it.
-  const moved = cases.transaction((): PilotCaseRecord | string => {
-    const count = cases.countFiled(stage.mode);
-    if (stage.cap !== null && count >= stage.cap) return capProblemOf(stage.mode, count, stage.cap);
-    const current = cases.find(caseId);
-    if (current?.klerosChain != null && !sameDeployment(current, deployment))
-      return otherDeploymentProblemOf(current, deployment);
-    const next = cases.advance(caseId, "contested", "filing", {
-      filingStartedAt: now,
-      ...(current?.klerosChain == null ? deployment : {}),
+  // both pass it; the stored evidence and records must still be the ones this command is about
+  // to file, since another command's pre-flight may have stored its own since. The deployment
+  // is written on the first filing and only compared after it.
+  let moved: PilotCaseRecord | string;
+  try {
+    moved = cases.transaction((): PilotCaseRecord | string => {
+      const count = cases.countFiled(stage.mode);
+      if (stage.cap !== null && count >= stage.cap)
+        return capProblemOf(stage.mode, count, stage.cap);
+      const current = cases.find(caseId);
+      if (current === undefined) return `no pilot case ${caseId}`;
+      if (current.klerosChain !== null && !sameDeployment(current, deployment))
+        return otherDeploymentProblemOf(current, deployment);
+      if (!storedIsFiled(d, current, pre))
+        return "the stored evidence changed while this command ran (another command stored its own): nothing was sent; run the command again";
+      const next = cases.advance(caseId, "contested", "filing", {
+        filingStartedAt: now,
+        ...(current.klerosChain === null ? deployment : {}),
+      });
+      if (!next) return `pilot case ${caseId} moved from contested while this command ran`;
+      cases.recordEvent(caseId, "filing", "started", deployment.klerosChain, null);
+      return next;
     });
-    if (!next) return `pilot case ${caseId} moved from contested while this command ran`;
-    cases.recordEvent(caseId, "filing", "started", deployment.klerosChain, null);
-    return next;
-  });
+  } catch (e) {
+    return notSent(null, `the case could not be moved to filing, so nothing was sent: ${safe(e)}`);
+  }
   if (typeof moved === "string") return notSent(null, moved);
 
   const write = <T>(step: string, call: () => Promise<T>) =>
@@ -186,19 +216,15 @@ export async function fileDispute(
     try {
       pinned = await write("pin", () => stage.service.pin({ bytes, extension }));
     } catch (e) {
-      cases.recordEvent(
-        caseId,
-        "pin",
-        e instanceof KlerosRefusal ? "refused" : "failed",
-        null,
-        safe(e),
-      );
-      if (isUnauthorized(e)) return backToContested(d, caseId, UNAUTHORIZED, UNAUTHORIZED_TEXT);
+      const detail = klerosTextOf(e);
+      cases.recordEvent(caseId, "pin", refusedOrFailed(e), null, detail);
+      const never = neverRanCodeOf(e);
+      if (never) return backToContested(d, caseId, never, neverRanTextOf(never));
       return backToContested(
         d,
         caseId,
         e instanceof KlerosRefusal ? e.code : null,
-        `the delivered file was not pinned, so nothing was filed: ${safe(e)}`,
+        `the delivered file was not pinned, so nothing was filed: ${detail}`,
       );
     }
     if (pinned.status === "checked") {
@@ -224,19 +250,24 @@ export async function fileDispute(
     attachment = { fileUri: published.fileUri, cid: published.cid };
   }
 
-  // 2. The dispute, created once.
+  // 2. The dispute, created once. Each call is marked as sending first, so a filing that stops
+  //    without that mark provably never sent a create.
   const aliases: Record<string, Address> = {
     [d.klerosCfg?.aliasClient ?? DEFAULT_ALIAS_CLIENT]: moved.buyerAddress as Address,
     [d.klerosCfg?.aliasProvider ?? DEFAULT_ALIAS_PROVIDER]: moved.sellerAddress as Address,
   };
   let created: CreateOutcome;
   try {
-    created = await write("create", () => stage.service.createDispute({ aliases }));
+    created = await write("create", () => {
+      cases.recordEvent(caseId, "create", "sending", null, null);
+      return stage.service.createDispute({ aliases });
+    });
   } catch (e) {
-    const detail = safe(e);
-    if (isUnauthorized(e)) {
+    const detail = klerosTextOf(e, KLEROS_FILING_TEXT_MAX);
+    const never = neverRanCodeOf(e);
+    if (never) {
       cases.recordEvent(caseId, "create", "refused", null, detail);
-      return backToContested(d, caseId, UNAUTHORIZED, UNAUTHORIZED_TEXT);
+      return backToContested(d, caseId, never, neverRanTextOf(never));
     }
     if (e instanceof KlerosRefusal && sentOf("dispute_create", e.code) === "no") {
       cases.recordEvent(caseId, "create", "refused", null, detail);
@@ -263,7 +294,7 @@ export async function fileDispute(
     return backToContested(d, caseId, PRESET_SIMULATES, text);
   }
   if (created.status === "unknown") {
-    const text = safe(created.text);
+    const text = klerosTextOf(created.text, KLEROS_FILING_TEXT_MAX);
     cases.recordEvent(caseId, "create", "unknown", created.txHash ?? null, text);
     return frozenFiling(d, caseId, created.txHash, text);
   }
@@ -279,7 +310,8 @@ export async function fileDispute(
   });
   const filed = { coreDisputeId, ...(localDisputeId === undefined ? {} : { localDisputeId }) };
 
-  // 3. The evidence, submitted once: any answer but mined is the human's to read.
+  // 3. The evidence, submitted once: any answer but mined is the human's to read, and the
+  //    dispute exists whatever the answer, so the row never goes back to `contested`.
   let submitted: SubmitOutcome;
   try {
     submitted = await write("submit", () =>
@@ -292,8 +324,8 @@ export async function fileDispute(
       }),
     );
   } catch (e) {
-    const detail = safe(e);
-    const refused = e instanceof KlerosRefusal || isUnauthorized(e);
+    const detail = klerosTextOf(e, KLEROS_FILING_TEXT_MAX);
+    const refused = e instanceof KlerosRefusal || neverRanCodeOf(e) !== undefined;
     cases.recordEvent(caseId, "submit", refused ? "refused" : "unknown", null, detail);
     return evidenceInDoubt(d, moved, filed, undefined, detail);
   }
@@ -303,7 +335,7 @@ export async function fileDispute(
     return evidenceInDoubt(d, moved, filed, undefined, text);
   }
   if (submitted.status === "unknown") {
-    const text = safe(submitted.text);
+    const text = klerosTextOf(submitted.text, KLEROS_FILING_TEXT_MAX);
     cases.recordEvent(caseId, "submit", "unknown", submitted.txHash ?? null, text);
     return evidenceInDoubt(d, moved, filed, submitted.txHash, text);
   }
@@ -318,8 +350,9 @@ export async function fileDispute(
 }
 
 /**
- * The pre-flight. Reads only until every check has passed; then writes the evidence and the two
- * records to the store and their names to the row, in one compare-and-set on `contested`.
+ * The pre-flight. Reads only until every check has passed; then, while the row is still at
+ * `contested`, writes the evidence and the two records to the store and their names to the row,
+ * in one IMMEDIATE transaction, so a filing's move cannot fall between the files and the row.
  */
 async function check(
   d: FileDisputeDeps,
@@ -342,8 +375,12 @@ async function check(
       `pilot case ${caseId} was created in ${row.mode} mode, and this stage files in ${stage.mode} mode`,
     );
   if (row.status === "filing")
-    return { ok: false, problem: stoppedFilingProblemOf(row), code: null, atFiling: row };
+    return { ok: false, problem: filingProblemOf(d, row), code: null, atFiling: row };
   if (row.status !== "contested") return no(statusProblemOf(row));
+  if (row.coreDisputeId !== null || row.createDisputeTx !== null)
+    return no(
+      `pilot case ${caseId} already holds a dispute or a create transaction on Kleros (${row.coreDisputeId === null ? `transaction ${row.createDisputeTx}` : `dispute ${row.coreDisputeId}`}), so it is never filed again`,
+    );
   const deployment = deploymentOf(d);
   if (row.klerosChain !== null && !sameDeployment(row, deployment))
     return no(otherDeploymentProblemOf(row, deployment));
@@ -398,31 +435,41 @@ async function check(
     );
 
   // Every check passed: the bytes the dry run shows are the bytes the filing serves. Each record
-  // is the lookup's answer exactly as it came back, as read for this filing.
-  const evidenceFile = d.docStore.put(
-    `${PILOT_FILE_PREFIX}${caseId}-evidence.txt`,
-    evidence.description,
-  );
-  const buyerFile = d.docStore.put(
-    `${PILOT_FILE_PREFIX}${caseId}-buyer-record.json`,
-    JSON.stringify(records.buyer),
-  );
-  const sellerFile = d.docStore.put(
-    `${PILOT_FILE_PREFIX}${caseId}-seller-record.json`,
-    JSON.stringify(records.seller),
-  );
-  const stored = cases.transaction(() => {
-    const next = cases.advance(caseId, "contested", "contested", {
-      evidencePath: evidenceFile.id,
-      evidenceSha256: evidence.sha256,
-      evidenceName: evidence.name,
-      buyerRecordPath: buyerFile.id,
-      sellerRecordPath: sellerFile.id,
+  // is the lookup's answer exactly as it came back, as read for this filing. Nothing is written
+  // once the row has left `contested`: the files of a filed case are the ones it filed.
+  let stored: PilotCaseRecord | undefined;
+  try {
+    stored = cases.transaction(() => {
+      if (cases.find(caseId)?.status !== "contested") return undefined;
+      const evidenceFile = d.docStore.put(
+        `${PILOT_FILE_PREFIX}${caseId}-evidence.txt`,
+        evidence.description,
+      );
+      const buyerFile = d.docStore.put(
+        `${PILOT_FILE_PREFIX}${caseId}-buyer-record.json`,
+        JSON.stringify(records.buyer),
+      );
+      const sellerFile = d.docStore.put(
+        `${PILOT_FILE_PREFIX}${caseId}-seller-record.json`,
+        JSON.stringify(records.seller),
+      );
+      const next = cases.advance(caseId, "contested", "contested", {
+        evidencePath: evidenceFile.id,
+        evidenceSha256: evidence.sha256,
+        evidenceName: evidence.name,
+        buyerRecordPath: buyerFile.id,
+        sellerRecordPath: sellerFile.id,
+      });
+      if (next) cases.recordEvent(caseId, "evidence", "stored", evidence.sha256, null);
+      return next;
     });
-    if (next) cases.recordEvent(caseId, "evidence", "stored", evidence.sha256, null);
-    return next;
-  });
-  if (!stored) return no(`pilot case ${caseId} moved from contested while the pre-flight ran`);
+  } catch (e) {
+    return no(`the evidence could not be stored, so nothing was sent: ${safe(e)}`);
+  }
+  if (!stored)
+    return no(
+      `pilot case ${caseId} moved from contested while the pre-flight ran; nothing was stored`,
+    );
 
   return {
     ok: true,
@@ -438,11 +485,31 @@ async function check(
   };
 }
 
+/** Whether the row's stored evidence and records are still the ones this command will file. */
+function storedIsFiled(
+  d: FileDisputeDeps,
+  row: PilotCaseRecord,
+  pre: Extract<Checked, { ok: true }>,
+): boolean {
+  if (row.evidenceSha256 !== pre.evidence.sha256) return false;
+  const files: [string | null, string][] = [
+    [row.evidencePath, pre.evidence.description],
+    [row.buyerRecordPath, JSON.stringify(pre.records.buyer)],
+    [row.sellerRecordPath, JSON.stringify(pre.records.seller)],
+  ];
+  try {
+    return files.every(([id, text]) => id !== null && d.docStore.get(id) === text);
+  } catch {
+    return false;
+  }
+}
+
 /**
- * The job's side, read from the chain: the escrow is Submitted, far enough from its expiry, and
- * the case's own (its client the buyer, its evaluator the referee, its provider the seller); the
- * description as written on chain; and the delivered file, read back from the store and checked
- * against both the row's hash and the `JobSubmitted` deliverable of the submit's receipt.
+ * The job's side, read from the chain: the escrow is Submitted, holds the row's budget and
+ * expiry (the evidence prints both), is far enough from its expiry, and is the case's own (its
+ * client the buyer, its evaluator the referee, its provider the seller); the description as
+ * written on chain; and the delivered file, read back from the store and checked against both
+ * the row's hash and the `JobSubmitted` deliverable of the submit's receipt.
  */
 async function jobFactsOf(
   d: FileDisputeDeps,
@@ -450,7 +517,7 @@ async function jobFactsOf(
 ): Promise<
   | string
   | {
-      escrow: EscrowState;
+      escrow: EscrowOnChain;
       description: string;
       submitted: Hex;
       deliverable: { bytes: Uint8Array; extension: string };
@@ -465,9 +532,11 @@ async function jobFactsOf(
     row.deliverableExtension === null
   )
     return `pilot case ${row.caseId} has no stored deliverable`;
+  if (!CANONICAL_DECIMAL.test(row.budgetAtomic))
+    return `pilot case ${row.caseId} has a budget that is not a decimal`;
   const jobId = BigInt(row.jobId);
 
-  let escrow: EscrowState;
+  let escrow: EscrowOnChain;
   try {
     escrow = await job.escrowState(jobId);
   } catch (e) {
@@ -475,6 +544,10 @@ async function jobFactsOf(
   }
   if (escrow.status !== JobStatusOnChain.submitted)
     return `job ${jobId} is at chain status ${escrow.status}, not Submitted (${JobStatusOnChain.submitted}): only a delivered job is disputed`;
+  if (escrow.budget !== BigInt(row.budgetAtomic))
+    return `job ${jobId} holds a budget of ${escrow.budget}, not the case's ${row.budgetAtomic} (atomic USDC)`;
+  if (escrow.expiredAt !== BigInt(row.expiredAt))
+    return `job ${jobId} expires at ${escrow.expiredAt}, not at the case's ${row.expiredAt}`;
   const left = escrow.expiredAt - BigInt((d.now ?? unixNow)());
   if (left < BigInt(MIN_SECONDS_TO_EXPIRY))
     return `job ${jobId} expires in ${left > 0n ? left : 0n} s, under ${MIN_SECONDS_TO_EXPIRY} s: an expired job refunds the client whatever the ruling`;
@@ -533,9 +606,12 @@ async function jobFactsOf(
 /** What the stage must be before anything is read. */
 function stageProblemOf(stage: KlerosStage): string | undefined {
   if (stage.mode === "rehearsal")
-    return stage.service instanceof FakeDisputeService
+    return stage.service instanceof FakeDisputeService &&
+      stage.deployment === null &&
+      stage.cap === null &&
+      stage.flag === null
       ? undefined
-      : "a rehearsal files with the fake Dispute Service only, and this stage holds another client: nothing was read or sent";
+      : "a rehearsal files with the fake Dispute Service only, and with no deployment, cap or flag; this stage is not that: nothing was read or sent";
   if (stage.deployment === null || stage.cap === null || stage.service.deployment !== stage.mode)
     return `the ${stage.mode} stage must hold the ${stage.mode} deployment's own client and cap: nothing was read or sent`;
   return undefined;
@@ -597,16 +673,68 @@ function statusProblemOf(row: PilotCaseRecord): string {
   return `pilot case ${row.caseId} is at ${row.status}; only a contested case is filed`;
 }
 
-function stoppedFilingProblemOf(row: PilotCaseRecord): string {
-  return row.coreDisputeId === null
-    ? `pilot case ${row.caseId} is at filing with no dispute id: a filing stopped part way, so its dispute may exist on Kleros; it is treated as filing_unknown and never filed again`
-    : `pilot case ${row.caseId} is at filing with dispute ${row.coreDisputeId}: its evidence submission stopped part way; it is treated as evidence_unknown`;
+/** How a row found at `filing` reads: in progress, stopped before its create, or stopped after. */
+type FilingState =
+  | { kind: "in_progress"; age: number }
+  | { kind: "never_created" }
+  | { kind: "created_no_id" }
+  | { kind: "created_with_id"; coreDisputeId: string };
+
+function filingStateOf(d: FileDisputeDeps, row: PilotCaseRecord): FilingState {
+  const age =
+    row.filingStartedAt === null
+      ? Number.POSITIVE_INFINITY
+      : (d.now ?? unixNow)() - row.filingStartedAt;
+  if (age < FILING_IN_PROGRESS_SECONDS) return { kind: "in_progress", age };
+  if (row.coreDisputeId !== null)
+    return { kind: "created_with_id", coreDisputeId: row.coreDisputeId };
+  return createWasSent(d.cases, row) ? { kind: "created_no_id" } : { kind: "never_created" };
 }
 
-/** A row found at `filing`: a command stopped between a write and the row's move. */
+/** Whether this attempt's trail (since its `filing` start) shows a create about to be sent. */
+function createWasSent(cases: PilotCaseRepository, row: PilotCaseRecord): boolean {
+  if (row.createDisputeTx !== null) return true;
+  const events = cases.events(row.caseId);
+  let start = -1;
+  events.forEach((e, i) => {
+    if (e.step === "filing" && e.status === "started") start = i;
+  });
+  return events.slice(start + 1).some((e) => e.step === "create" && e.status === "sending");
+}
+
+function filingProblemOf(d: FileDisputeDeps, row: PilotCaseRecord): string {
+  const state = filingStateOf(d, row);
+  switch (state.kind) {
+    case "in_progress":
+      return `pilot case ${row.caseId} is being filed by another command, started ${state.age} s ago: a filing is in progress: wait, then run the command again (a filing still at filing after ${FILING_IN_PROGRESS_SECONDS / 60} minutes is treated as stopped)`;
+    case "never_created":
+      return `pilot case ${row.caseId} is at filing: a filing stopped before its create was sent, so no dispute exists; with --yes it goes back to contested`;
+    case "created_no_id":
+      return `pilot case ${row.caseId} is at filing with no dispute id: a filing stopped after its create was sent, so its dispute may exist on Kleros; it is treated as filing_unknown and never filed again`;
+    case "created_with_id":
+      return `pilot case ${row.caseId} is at filing with dispute ${state.coreDisputeId}: its evidence submission stopped part way; it is treated as evidence_unknown`;
+  }
+}
+
+/** A row found at `filing`: another command's filing, or a command that stopped part way. */
 function stoppedFiling(d: FileDisputeDeps, row: PilotCaseRecord): FileOutcome {
-  const text = stoppedFilingProblemOf(row);
-  if (row.coreDisputeId === null) {
+  const state = filingStateOf(d, row);
+  const text = filingProblemOf(d, row);
+  if (state.kind === "in_progress") return notSent(FILING_IN_PROGRESS, text);
+  if (state.kind === "never_created") {
+    const back = d.cases.transaction(() => {
+      const moved = d.cases.advance(row.caseId, "filing", "contested");
+      if (moved) d.cases.recordEvent(row.caseId, "filing", "stopped_before_create", null, text);
+      return moved;
+    });
+    return notSent(
+      FILING_STOPPED,
+      back
+        ? "the stopped filing never sent a create, so no dispute exists: the case is contested again; run the command again to file it"
+        : `${text} (the case had moved and was left as it is)`,
+    );
+  }
+  if (state.kind === "created_no_id") {
     d.cases.transaction(() => {
       if (d.cases.advance(row.caseId, "filing", "filing_unknown", { error: text }))
         d.cases.recordEvent(row.caseId, "filing", "filing_unknown", row.createDisputeTx, text);
@@ -626,9 +754,10 @@ function stoppedFiling(d: FileDisputeDeps, row: PilotCaseRecord): FileOutcome {
     )
       d.cases.recordEvent(row.caseId, "filing", "evidence_unknown", row.evidenceTx, text);
   });
+  noteFiled(row, state.coreDisputeId);
   return {
     outcome: "filed",
-    coreDisputeId: row.coreDisputeId,
+    coreDisputeId: state.coreDisputeId,
     ...(row.localDisputeId === null ? {} : { localDisputeId: row.localDisputeId }),
     evidenceStatus: "unknown",
   };
@@ -691,7 +820,7 @@ function noteFiled(row: PilotCaseRecord, coreDisputeId: string): void {
   }
 }
 
-/** `WRITE_IN_PROGRESS` sent nothing: one wait, one more call, each call with its own event. */
+/** `WRITE_IN_PROGRESS` sent nothing and the client has waited it out: one more call, at once. */
 async function oneMoreCallAfterWriteInProgress<T>(
   d: FileDisputeDeps,
   caseId: string,
@@ -707,14 +836,32 @@ async function oneMoreCallAfterWriteInProgress<T>(
       step,
       "write_in_progress",
       null,
-      `${safe(e)}; waiting ${WRITE_IN_PROGRESS_WAIT_MS / 1000} s, then one more call`,
+      `${klerosTextOf(e)}; calling once more`,
     );
-    await (d.sleep ?? realSleep)(WRITE_IN_PROGRESS_WAIT_MS);
     return await call();
   }
 }
 
-const isUnauthorized = (e: unknown) => e instanceof KlerosHttpError && e.status === 401;
+/**
+ * An HTTP status the service decides before the call runs (Kleros docs, "When something goes
+ * wrong"): 401 (the key), 429 (the per-key rate) and 413 (the body's size). Nothing was sent. Any
+ * other status may come from a proxy after the request reached the service, and stays in doubt.
+ */
+function neverRanCodeOf(e: unknown): string | undefined {
+  if (!(e instanceof KlerosHttpError)) return undefined;
+  if (e.status === 401) return UNAUTHORIZED;
+  if (e.status === 429 || e.status === 413) return `http_${e.status}`;
+  return undefined;
+}
+
+function neverRanTextOf(code: string): string {
+  return code === UNAUTHORIZED
+    ? UNAUTHORIZED_TEXT
+    : `the Dispute Service refused the call before it ran (HTTP ${code.slice("http_".length)}), so nothing was sent`;
+}
+
+const refusedOrFailed = (e: unknown) =>
+  e instanceof KlerosRefusal || neverRanCodeOf(e) !== undefined ? "refused" : "failed";
 
 const notSent = (code: string | null, text: string): FileOutcome => ({
   outcome: "not_sent",
