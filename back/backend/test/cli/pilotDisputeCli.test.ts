@@ -565,6 +565,31 @@ describe("pilot:dispute: the filing", () => {
   });
 });
 
+describe("pilot:dispute on a row it reads at filing", () => {
+  test("goes to the filing with no banner and asks it to refuse a row that has moved since", async () => {
+    const fake = makeFake("testnet");
+    fake.cases.advance(fake.caseRow.caseId, "contested", "filing", {
+      filingStartedAt: NOW - 60,
+      klerosChain: "arbitrum-sepolia-testnet",
+    });
+    fake.file.mockResolvedValue({
+      outcome: "not_sent",
+      code: "filing_in_progress",
+      text: "a filing is in progress: wait",
+    });
+    await expect(runFake(fake, disputeArgs(fake, ["--testnet", "--yes"]))).rejects.toThrow(
+      "a filing is in progress: wait",
+    );
+    expect(fake.preflight).not.toHaveBeenCalled();
+    expect(fake.sleep).not.toHaveBeenCalled();
+    expect(fake.file).toHaveBeenCalledTimes(1);
+    expect(fake.file.mock.calls[0]?.[2]).toEqual({
+      confirmedFlag: "--testnet",
+      onlyAtFiling: true,
+    });
+  });
+});
+
 describe("pilot:dispute on a row left at filing, testnet mode, through the real steps", () => {
   /** A testnet row a command left at `filing`, and a fetch that records every request. */
   function leftAtFiling(o: { startedAgo: number; ids?: boolean }) {
@@ -614,7 +639,9 @@ describe("pilot:dispute on a row left at filing, testnet mode, through the real 
     const w = leftAtFiling({ startedAgo: 31 * 60 });
     const lines: string[] = [];
     await expect(w.go(lines)).rejects.toThrow("filing_unknown");
-    expect(resultOf(lines)).toMatchObject({ failed: true, outcome: "filing_unknown" });
+    const out = resultOf(lines);
+    expect(out).toMatchObject({ failed: true, outcome: "filing_unknown" });
+    expect(String(out.text)).toContain("its create was marked as sent");
     expect(w.fake.cases.find(w.caseId)?.status).toBe("filing_unknown");
     expect(w.requests).toEqual([]);
   });

@@ -394,7 +394,7 @@ export interface PilotCommandDeps {
   preflightDispute: typeof preflightDispute;
   fileDispute: typeof fileDispute;
   checkKleros: typeof checkKleros;
-  /** The banner's wait before a filing, and the filing's own waits. */
+  /** The banner's wait before a testnet or live filing. */
   sleep: (ms: number) => Promise<void>;
 }
 
@@ -1099,8 +1099,6 @@ function nextAfter(outcome: Exclude<FileOutcome, { outcome: "filed" }>, caseId: 
     return `the dispute may exist on Kleros: do not file it again; find it in the Court interface by the alias addresses and the time, then record its ids, or mark the case failed once Kleros confirms none exists (pilot:case show ${caseId} has the trail)`;
   if (outcome.code === "filing_in_progress")
     return `another command is filing this case: nothing was sent; wait for it to end, then read pilot:case show ${caseId}`;
-  if (outcome.code === "filing_stopped")
-    return "nothing was sent: the stopped filing never sent a create, and the case is contested again; run the same command again to file it";
   return "nothing was sent: fix the cause, then run the same command again; the row is contested and keeps its attachment";
 }
 
@@ -1149,15 +1147,21 @@ async function dispute(
   }
 
   // A row found at `filing` sends nothing whatever happens next (the filing reads it and answers
-  // without a call), so it goes straight to the filing, which knows what that row means.
-  if (stage.flag !== null && findCase(ctx, p.caseId).status !== "filing") {
+  // without a call), so it goes straight to the filing, which knows what that row means. With no
+  // banner shown, the filing is asked to refuse the row if it has moved from `filing` since.
+  const seenAtFiling = findCase(ctx, p.caseId).status === "filing";
+  if (stage.flag !== null && !seenAtFiling) {
     const pre = await deps.preflightDispute(d, p.caseId, opts);
     if (!pre.ok) refuse(pre.problem);
     console.log(bannerOf(stage, pre, findCase(ctx, p.caseId), ctx.cfg.kleros?.policyUri));
     await deps.sleep(BANNER_WAIT_MS);
   }
 
-  const outcome = await deps.fileDispute(d, p.caseId, { ...opts, confirmedFlag: p.flag });
+  const outcome = await deps.fileDispute(d, p.caseId, {
+    ...opts,
+    confirmedFlag: p.flag,
+    ...(seenAtFiling ? { onlyAtFiling: true } : {}),
+  });
   const row = findCase(ctx, p.caseId);
   const base = { ...outcome, caseId: p.caseId, status: row.status, stage: view };
   if (outcome.outcome === "filed" && outcome.evidenceStatus === "unknown")

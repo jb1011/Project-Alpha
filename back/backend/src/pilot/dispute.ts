@@ -25,7 +25,7 @@ import type { KlerosStage, PilotChain } from "./composition";
 import { type Evidence, renderEvidence } from "./evidence";
 import { withoutEmDash } from "./job";
 import { submittedDeliverableOf } from "./jobEvents";
-import { UNAUTHORIZED_PROBLEM, checkKleros, klerosTextOf } from "./klerosCheck";
+import { UNAUTHORIZED_PROBLEM, checkKleros, klerosTextOf, withoutPaths } from "./klerosCheck";
 import type { LookupClient } from "./lookup";
 import type { KlerosChainOnRow, PilotCaseRecord } from "./types";
 
@@ -50,15 +50,17 @@ import type { KlerosChainOnRow, PilotCaseRecord } from "./types";
  *    (401, 429, 413), moves the row back to `contested`, to be filed again once the cause is
  *    fixed; the attempt's start time and deployment stay on the row.
  *  - A row found at `filing` is another command's filing while it is under 30 minutes old (wait),
- *    and a stopped one after that: back to `contested` when its trail shows no create was sent,
- *    else frozen.
+ *    and a stopped one after that, frozen for a human whatever its trail: `filing_unknown`, or
+ *    `evidence_unknown` when it holds a dispute id. It never goes back to `contested`, so that a
+ *    dispute is created once does not rest on any clock. The freeze says whether the create was
+ *    marked as sent.
  *  - Every Kleros write writes an event with its status and reference (the create also when it is
  *    about to be sent), and the row's moves are compare-and-set. The ids and hashes of a mined
  *    write are written whatever the row's status by then: they are facts about Kleros.
  *
  * No key is read here: the stage's client holds it. A Kleros text keeps its own words with
  * credentials redacted (`klerosTextOf`); any other exception's text goes through
- * `publicErrorMessage`.
+ * `publicErrorMessage`. Neither names an absolute path, only a file.
  */
 
 /** The job's escrow as the job adapter reads it from the chain. */
@@ -76,6 +78,8 @@ export interface FileDisputeDeps {
   lookupBase: string;
   /** Unix seconds. */
   now?: () => number;
+  /** Unused: the filing makes no wait of its own (the HTTP client waits out WRITE_IN_PROGRESS);
+   *  kept so the dependencies stay the ones the commands pass. */
   sleep?: (ms: number) => Promise<void>;
 }
 
@@ -121,7 +125,6 @@ const KLEROS_FILING_TEXT_MAX = 4_500;
 const UNAUTHORIZED = "unauthorized";
 const PIN_CHECKED_ONLY = "pin_checked_only";
 const FILING_IN_PROGRESS = "filing_in_progress";
-const FILING_STOPPED = "filing_stopped";
 const UNAUTHORIZED_TEXT =
   "the Dispute Service refused the key of this stage (HTTP 401): it is wrong or revoked; nothing was sent";
 /** The alias slot keys of the preset when no Kleros config is set (a rehearsal box). */
@@ -135,8 +138,8 @@ const LIVE_GATE =
 
 const unixNow = () => Math.floor(Date.now() / 1000);
 const sameAddress = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
-/** An exception that is not Kleros's, fit to persist or print. */
-const safe = (e: unknown) => withoutEmDash(publicErrorMessage(e));
+/** An exception that is not Kleros's, fit to persist or print: no credential, no path. */
+const safe = (e: unknown) => withoutEmDash(withoutPaths(publicErrorMessage(e)));
 
 /** The pre-flight's inner answer: the public one, plus what the filing goes on with. */
 type Checked =
@@ -158,11 +161,19 @@ export async function preflightDispute(
   return { ok: true, evidence, court, instructions, escrow, records, filedCount, cap };
 }
 
-/** Pre-flight again, then: advance contested -> filing (writing the stage's chain, court and policy URI); pin; create; submit; the row's final status per outcome. */
+/**
+ * Pre-flight again, then: advance contested -> filing (writing the stage's chain, court and policy URI); pin; create; submit; the row's final status per outcome.
+ * `onlyAtFiling`: the caller read the row at `filing` and printed no banner, so a row found at
+ * any other status is refused with no call.
+ */
 export async function fileDispute(
   d: FileDisputeDeps,
   caseId: string,
-  opts: { allowStanding?: string; confirmedFlag: "--testnet" | "--live" | null },
+  opts: {
+    allowStanding?: string;
+    confirmedFlag: "--testnet" | "--live" | null;
+    onlyAtFiling?: boolean;
+  },
 ): Promise<FileOutcome> {
   const flagProblem = flagProblemOf(d.stage, opts.confirmedFlag);
   if (flagProblem) return notSent(null, flagProblem);
@@ -299,6 +310,8 @@ export async function fileDispute(
     return frozenFiling(d, caseId, created.txHash, text);
   }
   const { coreDisputeId, localDisputeId, txHash: createTx } = created;
+  // Written first: if the row write below fails, the dispute's ids are still in the journal.
+  noteCreated(moved, coreDisputeId, localDisputeId, createTx);
   cases.transaction(() => {
     cases.patch(caseId, {
       coreDisputeId,
@@ -357,7 +370,7 @@ export async function fileDispute(
 async function check(
   d: FileDisputeDeps,
   caseId: string,
-  opts: { allowStanding?: string },
+  opts: { allowStanding?: string; onlyAtFiling?: boolean },
 ): Promise<Checked> {
   const no = (problem: string, code: string | null = null): Checked => ({
     ok: false,
@@ -376,6 +389,10 @@ async function check(
     );
   if (row.status === "filing")
     return { ok: false, problem: filingProblemOf(d, row), code: null, atFiling: row };
+  if (opts.onlyAtFiling)
+    return no(
+      `pilot case ${caseId} moved from filing to ${row.status} while this command ran: nothing was sent; run the command again`,
+    );
   if (row.status !== "contested") return no(statusProblemOf(row));
   if (row.coreDisputeId !== null || row.createDisputeTx !== null)
     return no(
@@ -673,12 +690,10 @@ function statusProblemOf(row: PilotCaseRecord): string {
   return `pilot case ${row.caseId} is at ${row.status}; only a contested case is filed`;
 }
 
-/** How a row found at `filing` reads: in progress, stopped before its create, or stopped after. */
+/** How a row found at `filing` reads: another command's filing in progress, or one that stopped. */
 type FilingState =
   | { kind: "in_progress"; age: number }
-  | { kind: "never_created" }
-  | { kind: "created_no_id" }
-  | { kind: "created_with_id"; coreDisputeId: string };
+  | { kind: "stopped"; age: number; createMarked: boolean; coreDisputeId: string | null };
 
 function filingStateOf(d: FileDisputeDeps, row: PilotCaseRecord): FilingState {
   const age =
@@ -686,13 +701,20 @@ function filingStateOf(d: FileDisputeDeps, row: PilotCaseRecord): FilingState {
       ? Number.POSITIVE_INFINITY
       : (d.now ?? unixNow)() - row.filingStartedAt;
   if (age < FILING_IN_PROGRESS_SECONDS) return { kind: "in_progress", age };
-  if (row.coreDisputeId !== null)
-    return { kind: "created_with_id", coreDisputeId: row.coreDisputeId };
-  return createWasSent(d.cases, row) ? { kind: "created_no_id" } : { kind: "never_created" };
+  return {
+    kind: "stopped",
+    age,
+    createMarked: createWasMarked(d.cases, row),
+    coreDisputeId: row.coreDisputeId,
+  };
 }
 
-/** Whether this attempt's trail (since its `filing` start) shows a create about to be sent. */
-function createWasSent(cases: PilotCaseRepository, row: PilotCaseRecord): boolean {
+/**
+ * Whether this attempt's trail (since its `filing` start) marks a create as sent, or the row
+ * holds a create transaction. A fact for the person who resolves the case, never a reason to
+ * file again: a slower command may still send its create after this was read.
+ */
+function createWasMarked(cases: PilotCaseRepository, row: PilotCaseRecord): boolean {
   if (row.createDisputeTx !== null) return true;
   const events = cases.events(row.caseId);
   let start = -1;
@@ -704,37 +726,23 @@ function createWasSent(cases: PilotCaseRepository, row: PilotCaseRecord): boolea
 
 function filingProblemOf(d: FileDisputeDeps, row: PilotCaseRecord): string {
   const state = filingStateOf(d, row);
-  switch (state.kind) {
-    case "in_progress":
-      return `pilot case ${row.caseId} is being filed by another command, started ${state.age} s ago: a filing is in progress: wait, then run the command again (a filing still at filing after ${FILING_IN_PROGRESS_SECONDS / 60} minutes is treated as stopped)`;
-    case "never_created":
-      return `pilot case ${row.caseId} is at filing: a filing stopped before its create was sent, so no dispute exists; with --yes it goes back to contested`;
-    case "created_no_id":
-      return `pilot case ${row.caseId} is at filing with no dispute id: a filing stopped after its create was sent, so its dispute may exist on Kleros; it is treated as filing_unknown and never filed again`;
-    case "created_with_id":
-      return `pilot case ${row.caseId} is at filing with dispute ${state.coreDisputeId}: its evidence submission stopped part way; it is treated as evidence_unknown`;
-  }
+  if (state.kind === "in_progress")
+    return `pilot case ${row.caseId} is being filed by another command, started ${state.age} s ago: a filing is in progress: wait, then run the command again (a filing still at filing after ${FILING_IN_PROGRESS_SECONDS / 60} minutes is treated as stopped)`;
+  const started = row.filingStartedAt === null ? "at an unrecorded time" : `${state.age} s ago`;
+  const marked = state.createMarked
+    ? "its create was marked as sent"
+    : "no create was marked as sent, but a slower command may still send one";
+  if (state.coreDisputeId === null)
+    return `pilot case ${row.caseId} is at filing with no dispute id, a filing started ${started} that stopped part way; ${marked}; it is frozen at filing_unknown and never filed again: check Kleros for a dispute by the alias addresses and the time before recording its ids or marking the case failed`;
+  return `pilot case ${row.caseId} is at filing with dispute ${state.coreDisputeId}, a filing started ${started} whose evidence submission stopped part way; ${marked}; it is treated as evidence_unknown`;
 }
 
-/** A row found at `filing`: another command's filing, or a command that stopped part way. */
+/** A row found at `filing`: another command's filing, or one that stopped, frozen for a human. */
 function stoppedFiling(d: FileDisputeDeps, row: PilotCaseRecord): FileOutcome {
   const state = filingStateOf(d, row);
   const text = filingProblemOf(d, row);
   if (state.kind === "in_progress") return notSent(FILING_IN_PROGRESS, text);
-  if (state.kind === "never_created") {
-    const back = d.cases.transaction(() => {
-      const moved = d.cases.advance(row.caseId, "filing", "contested");
-      if (moved) d.cases.recordEvent(row.caseId, "filing", "stopped_before_create", null, text);
-      return moved;
-    });
-    return notSent(
-      FILING_STOPPED,
-      back
-        ? "the stopped filing never sent a create, so no dispute exists: the case is contested again; run the command again to file it"
-        : `${text} (the case had moved and was left as it is)`,
-    );
-  }
-  if (state.kind === "created_no_id") {
+  if (state.coreDisputeId === null) {
     d.cases.transaction(() => {
       if (d.cases.advance(row.caseId, "filing", "filing_unknown", { error: text }))
         d.cases.recordEvent(row.caseId, "filing", "filing_unknown", row.createDisputeTx, text);
@@ -804,6 +812,27 @@ function evidenceInDoubt(
     d.cases.patch(row.caseId, facts);
   noteFiled(row, filed.coreDisputeId);
   return { outcome: "filed", ...filed, evidenceStatus: "unknown" };
+}
+
+/** The ops line of a mined create, with the ids a person needs. Observes, never gates. */
+function noteCreated(
+  row: PilotCaseRecord,
+  coreDisputeId: string,
+  localDisputeId: string | undefined,
+  txHash: Hex,
+): void {
+  try {
+    opsLog("pilot_dispute_created", {
+      caseId: row.caseId,
+      mode: row.mode,
+      klerosChain: row.klerosChain,
+      coreDisputeId,
+      localDisputeId: localDisputeId ?? null,
+      txHash,
+    });
+  } catch {
+    // observe, never gate
+  }
 }
 
 /** The ops line of a dispute that exists. Observes, never gates. */

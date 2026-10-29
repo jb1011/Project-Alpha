@@ -62,11 +62,22 @@ const URL_RUN = /[a-z][a-z0-9+.-]*:\/\/[^\s"'`<>)}\\]+/gi;
 const LABELLED_SECRET =
   /\b(authorization|bearer|api[-_ ]?key|apikey|x-api-key|token|secret|seed|private[-_ ]?key)\b(\s*["']?\s*[:=]\s*["']?\s*|\s+)([A-Za-z0-9._~+/=-]{12,})/gi;
 const LONG_HEX = /0x[0-9a-fA-F]{65,}/g;
+/**
+ * An absolute file path: a slash that starts no URL and no word, one directory or more, then the
+ * file. An IPFS address (`/ipfs/<cid>`) is a content address, not a path of this box, and stays.
+ */
+const ABSOLUTE_PATH = /(?<![\w.:/~-])\/(?!ipfs\/)(?:[^\s'"`/()<>,;]+\/)+([^\s'"`/()<>,;]+)/g;
+
+/** Every absolute path in `text` cut to its file name: the box's layout is nobody's to read. */
+export function withoutPaths(text: string): string {
+  return text.replace(ABSOLUTE_PATH, "$1");
+}
 
 /**
  * A Kleros text (a refusal, an HTTP status, an answer the client could not read, an `unknown`
  * result) as an event, a row or an outcome keeps it: the code and the service's own words, with
- * URL paths and labelled credentials redacted, on one line, cut at `max` characters. Never
+ * URL paths, labelled credentials and absolute file paths redacted, on one line, cut at `max`
+ * characters. Never
  * `publicErrorMessage`'s fixed sentences: a fee wallet's "insufficient funds" is Kleros's, not
  * the platform's. The client keeps up to 4,000 characters of a filing's answer it could not read,
  * where a person finds the dispute's ids, so the create and the submit pass a larger `max`. Any
@@ -79,11 +90,12 @@ export function klerosTextOf(e: unknown, max: number = KLEROS_TEXT_SHORT): strin
     e instanceof KlerosHttpError ||
     e instanceof KlerosTransportError ||
     e instanceof KlerosWrongDeploymentError;
-  if (!kleros) return withoutEmDash(publicErrorMessage(e));
+  if (!kleros) return withoutEmDash(withoutPaths(publicErrorMessage(e)));
   const text = (typeof e === "string" ? e : e.message)
     .replace(URL_RUN, originOf)
     .replace(LABELLED_SECRET, (_m, label: string, sep: string) => `${label}${sep}<redacted>`)
     .replace(LONG_HEX, (hex) => `${hex.slice(0, 10)}...`)
+    .replace(ABSOLUTE_PATH, "$1")
     .replace(/\s+/g, " ")
     .trim();
   const cut = text.length > max ? `${text.slice(0, max - 3)}...` : text;

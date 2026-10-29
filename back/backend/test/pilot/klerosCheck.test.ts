@@ -295,6 +295,20 @@ describe("the problems", () => {
     expect(r.problems.join("").includes(dash)).toBe(false);
   });
 
+  test("a problem names a file, never its absolute path; an IPFS address stays whole", async () => {
+    const { fetch } = klerosFetch({
+      court: () =>
+        refusal(
+          "COURT_NOT_FOUND: see /var/lib/kleros/courts/8.json, or the policy /ipfs/bafypolicy",
+        ),
+    });
+    const r = await checkKleros(httpStage("testnet", fetch));
+    expect(r.problems).toEqual([
+      expect.stringContaining("see 8.json, or the policy /ipfs/bafypolicy"),
+    ]);
+    expect(r.problems.join("")).not.toContain("/var/lib");
+  });
+
   test("a rehearsal stage that does not hold the fake reads nothing", async () => {
     const { fetch, seen } = klerosFetch();
     const stage: KlerosStage = {

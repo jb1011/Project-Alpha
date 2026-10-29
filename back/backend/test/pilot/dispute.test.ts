@@ -15,7 +15,11 @@ import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { resetSenderNonces } from "../../src/adapters/arc/senderLock";
 import { type KlerosDeploymentName, deploymentFor } from "../../src/adapters/kleros/deployments";
-import type { CreateOutcome, SubmitOutcome } from "../../src/adapters/kleros/disputeService";
+import type {
+  CreateOutcome,
+  PinOutcome,
+  SubmitOutcome,
+} from "../../src/adapters/kleros/disputeService";
 import { KlerosRefusal } from "../../src/adapters/kleros/errors";
 import {
   FakeDisputeService,
@@ -1297,16 +1301,22 @@ describe("the stored evidence is the evidence filed", () => {
     expect(h.cases.find(row.caseId)?.status).toBe("contested");
   });
 
-  test("a store that fails: not_sent with a sanitised text, nothing on the row, no write", async () => {
+  test("a store that fails: not_sent naming the file and not its path, nothing on the row, no write", async () => {
     const h = setup();
     const row = await h.contested();
+    // The shape the file system throws: the message and the error carry the absolute path.
+    const name = `pilot-${row.caseId}-evidence.txt.tmp-4242-1`;
+    const path = join(h.docDir, name);
     const docStore = new Proxy(h.docStore, {
       get(target, prop, receiver) {
         if (prop === "put")
           return () => {
-            throw new Error(
-              "EIO: write failed, see https://store.example.test/v1/secret-path-0123456789",
-            );
+            throw Object.assign(new Error(`EACCES: permission denied, open '${path}'`), {
+              errno: -13,
+              code: "EACCES",
+              syscall: "open",
+              path,
+            });
           };
         return Reflect.get(target, prop, receiver);
       },
@@ -1315,10 +1325,148 @@ describe("the stored evidence is the evidence filed", () => {
     const out = await fileDispute(h.deps(stage, { docStore }), row.caseId, { confirmedFlag: null });
     expect(notSent(out)).toBe(true);
     expect(textOf(out)).toContain("could not be stored");
-    expect(textOf(out)).not.toContain("secret-path-0123456789");
+    expect(textOf(out)).toContain(`EACCES: permission denied, open '${name}'`);
+    expect(textOf(out)).not.toContain(h.docDir);
+    expect(textOf(out)).not.toContain(tmpdir());
     const now = h.cases.find(row.caseId)!;
     expect([now.status, now.evidencePath]).toEqual(["contested", null]);
     expect(fakeWrites(kleros)).toEqual([]);
+  });
+});
+
+describe("the move to filing, and the mark before the create", () => {
+  /** The repository, with `before` run once just before the move to filing. */
+  function beforeMove(h: Harness, before: () => void) {
+    let stored = false;
+    return new Proxy(h.cases, {
+      get(target, prop, receiver) {
+        if (prop === "recordEvent")
+          return (...a: Parameters<typeof target.recordEvent>) => {
+            if (a[1] === "evidence" && a[2] === "stored") stored = true;
+            target.recordEvent(...a);
+          };
+        if (prop === "transaction")
+          return <T>(fn: () => T): T => {
+            if (stored) {
+              stored = false;
+              before();
+            }
+            return target.transaction(fn);
+          };
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+  }
+
+  test.each(["evidence.txt", "buyer-record.json", "seller-record.json"])(
+    "a stored %s that changed with the same evidence sha256 sends nothing",
+    async (file) => {
+      const h = setup();
+      const row = await h.contested();
+      const cases = beforeMove(h, () => h.docStore.put(`pilot-${row.caseId}-${file}`, "{}"));
+      const { stage, kleros } = rehearsal();
+      const out = await fileDispute(h.deps(stage, { cases }), row.caseId, { confirmedFlag: null });
+      expect(notSent(out)).toBe(true);
+      expect(textOf(out)).toContain("the stored evidence changed");
+      expect(fakeWrites(kleros)).toEqual([]);
+      expect(h.cases.find(row.caseId)?.status).toBe("contested");
+    },
+  );
+
+  test("a move to filing that fails is not_sent, with no write", async () => {
+    const h = setup();
+    const row = await h.contested();
+    const cases = new Proxy(h.cases, {
+      get(target, prop, receiver) {
+        if (prop === "advance")
+          return (...a: Parameters<typeof target.advance>) => {
+            if (a[1] === "contested" && a[2] === "filing")
+              throw new Error("SQLITE_BUSY: database is locked");
+            return target.advance(...a);
+          };
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const { stage, kleros } = rehearsal();
+    const out = await fileDispute(h.deps(stage, { cases }), row.caseId, { confirmedFlag: null });
+    expect(notSent(out)).toBe(true);
+    expect(textOf(out)).toContain("could not be moved to filing");
+    expect(fakeWrites(kleros)).toEqual([]);
+    expect(h.cases.find(row.caseId)?.status).toBe("contested");
+  });
+
+  test("the create is marked as sending in the trail before its request leaves", async () => {
+    const h = setup();
+    const row = await h.contested();
+    const marked: boolean[] = [];
+    class Watching extends FakeDisputeService {
+      override async createDispute(p: {
+        aliases: Record<string, Address>;
+      }): Promise<CreateOutcome> {
+        const trailNow = h.cases.events(row.caseId);
+        marked.push(trailNow.at(-1)?.step === "create" && trailNow.at(-1)?.status === "sending");
+        return super.createDispute(p);
+      }
+    }
+    const kleros = new Watching({ script: "pay" });
+    const stage: KlerosStage = {
+      mode: "rehearsal",
+      service: kleros,
+      deployment: null,
+      cap: null,
+      flag: null,
+    };
+    await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: null });
+    expect(marked).toEqual([true]);
+  });
+
+  test("a mined create writes an ops line with its ids before the row write, so they survive its failure", async () => {
+    const h = setup();
+    const row = await h.contested();
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((m) => lines.push(String(m)));
+    const cases = new Proxy(h.cases, {
+      get(target, prop, receiver) {
+        if (prop === "patch")
+          return (...a: Parameters<typeof target.patch>) => {
+            if (a[1].coreDisputeId !== undefined) throw new Error("SQLITE_IOERR: disk I/O error");
+            return target.patch(...a);
+          };
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const { stage, kleros } = rehearsal();
+    await expect(
+      fileDispute(h.deps(stage, { cases }), row.caseId, { confirmedFlag: null }),
+    ).rejects.toThrow("SQLITE_IOERR");
+    expect(kleros.calls.map((c) => c.tool)).toContain("dispute_create");
+    const created = lines
+      .map((l) => JSON.parse(l))
+      .filter((l) => l.opslog === "pilot_dispute_created");
+    expect(created).toEqual([
+      expect.objectContaining({
+        caseId: row.caseId,
+        coreDisputeId: "1000",
+        localDisputeId: "1000",
+        txHash: expect.stringMatching(/^0x[0-9a-f]{64}$/),
+      }),
+    ]);
+    // The row is left at filing with its create marked as sent: a later command freezes it.
+    expect(h.cases.find(row.caseId)?.status).toBe("filing");
+  });
+
+  test("a command that saw the row at filing refuses a row that is anything else, with no call", async () => {
+    const h = setup();
+    const row = await h.contested();
+    const { stage, kleros } = rehearsal();
+    const out = await fileDispute(h.deps(stage), row.caseId, {
+      confirmedFlag: null,
+      onlyAtFiling: true,
+    });
+    expect(notSent(out)).toBe(true);
+    expect(textOf(out)).toContain("moved from filing");
+    expect(kleros.calls).toEqual([]);
+    expect(h.cases.find(row.caseId)?.status).toBe("contested");
   });
 });
 
@@ -1369,26 +1517,106 @@ describe("a filing that stopped part way", () => {
 
     const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: null });
     expect(out.outcome).toBe("filing_unknown");
+    expect(textOf(out)).toContain("its create was marked as sent");
     expect(h.cases.find(row.caseId)?.status).toBe("filing_unknown");
     expect(kleros.calls).toEqual([]);
+    const last = h.cases.events(row.caseId).at(-1)!;
+    expect([last.step, last.status, last.detail]).toEqual([
+      "filing",
+      "filing_unknown",
+      textOf(out),
+    ]);
   });
 
-  test("30 minutes old with no create sent: contested again, and then it files once", async () => {
+  test("30 minutes old with no create marked as sent: frozen all the same, never sent back, and it says so", async () => {
     const h = setup();
     const row = await h.contested();
-    // A create sent on an earlier attempt does not count: only this attempt's trail does.
+    // A create marked on an earlier attempt is not this attempt's: the text reads this one's.
     h.cases.recordEvent(row.caseId, "create", "sending", null, null);
     atFiling(h, row, { startedAgo: 3_600 });
     const { stage, kleros } = rehearsal();
 
+    const pre = await preflightDispute(h.deps(stage), row.caseId, {});
+    expect(pre).toEqual({ ok: false, problem: expect.stringContaining("filing_unknown") });
     const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: null });
-    expect(out).toMatchObject({ outcome: "not_sent", code: "filing_stopped" });
-    expect(h.cases.find(row.caseId)?.status).toBe("contested");
-    expect(kleros.calls).toEqual([]);
+    expect(out.outcome).toBe("filing_unknown");
+    expect(textOf(out)).toContain("no create was marked as sent");
+    expect(textOf(out)).toContain("check Kleros");
+    expect(h.cases.find(row.caseId)?.status).toBe("filing_unknown");
+    expect(h.cases.events(row.caseId).at(-1)?.detail).toBe(textOf(out));
 
     const again = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: null });
-    expect(again.outcome).toBe("filed");
-    expect(kleros.calls.filter((c) => c.tool === "dispute_create")).toHaveLength(1);
+    expect(notSent(again)).toBe(true);
+    expect(kleros.calls).toEqual([]);
+  });
+
+  test("a create transaction on the row counts as a create marked as sent", async () => {
+    const h = setup();
+    const row = await h.contested();
+    atFiling(h, row, { startedAgo: 1_800 });
+    h.cases.patch(row.caseId, { createDisputeTx: CREATE_TX });
+    const { stage } = rehearsal();
+    const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: null });
+    expect(out).toMatchObject({ outcome: "filing_unknown", txHash: CREATE_TX });
+    expect(textOf(out)).toContain("its create was marked as sent");
+  });
+
+  test("a slow command before its create while another sees the row stale: the other freezes it, and one create in all", async () => {
+    const h = setup();
+    const row = await h.contested();
+    // The first command is held in its pin, after its move to filing and before its create.
+    let entered!: () => void;
+    const inPin = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    class SlowPin extends FakeDisputeService {
+      override async pin(p: { bytes: Uint8Array; extension: string }): Promise<PinOutcome> {
+        entered();
+        await gate;
+        return super.pin(p);
+      }
+    }
+    const first = new SlowPin({ script: "pay" });
+    const firstStage: KlerosStage = {
+      mode: "rehearsal",
+      service: first,
+      deployment: null,
+      cap: null,
+      flag: null,
+    };
+    const running = fileDispute(h.deps(firstStage), row.caseId, { confirmedFlag: null });
+    await inPin;
+
+    h.setClock(h.clock() + 31 * 60);
+    const second = rehearsal();
+    const frozen = await fileDispute(h.deps(second.stage), row.caseId, { confirmedFlag: null });
+    expect(frozen.outcome).toBe("filing_unknown");
+    expect(textOf(frozen)).toContain("no create was marked as sent");
+    expect(h.cases.find(row.caseId)?.status).toBe("filing_unknown");
+
+    const third = rehearsal();
+    expect(
+      notSent(await fileDispute(h.deps(third.stage), row.caseId, { confirmedFlag: null })),
+    ).toBe(true);
+
+    release();
+    await running;
+    const fourth = rehearsal();
+    expect(
+      notSent(await fileDispute(h.deps(fourth.stage), row.caseId, { confirmedFlag: null })),
+    ).toBe(true);
+
+    const creates = [first, second.kleros, third.kleros, fourth.kleros].flatMap((k) =>
+      k.calls.filter((c) => c.tool === "dispute_create"),
+    );
+    expect(creates).toHaveLength(1);
+    const done = h.cases.find(row.caseId)!;
+    // The row stays frozen for a human; the one dispute's ids are on it.
+    expect([done.status, done.coreDisputeId]).toEqual(["filing_unknown", "1000"]);
   });
 
   test("30 minutes old with a dispute id: filed with its evidence in doubt, an ops line, zero calls", async () => {
