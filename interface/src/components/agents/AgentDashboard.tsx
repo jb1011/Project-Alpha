@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, type ReactNode } from "react";
+import dynamic from "next/dynamic";
 import Link from "next/link";
 import { useQueryClient } from "@tanstack/react-query";
 import { AgentTabs } from "@/components/agents/AgentTabs";
@@ -33,6 +34,16 @@ import { ConnectAgentPanel } from "@/components/agents/ConnectAgentPanel";
 import { VouchDialog } from "@/components/agents/VouchDialog";
 import { NO_POCKET_COPY } from "@/lib/agentbook/failure";
 import { FormationCard } from "@/components/agents/FormationCard";
+import { agentMood } from "@/components/agents/persona";
+
+/** The portrait package breaks this page's server bundle, so it loads in the browser only. */
+const AgentPersona = dynamic(
+  () => import("@/components/agents/AgentPersona").then((mod) => mod.AgentPersona),
+  {
+    ssr: false,
+    loading: () => <span className="inline-block h-16 w-16 shrink-0" aria-hidden />,
+  },
+);
 import { AmberPill, Card, cx, ExternalIcon, ShieldIcon } from "@/components/onboarding/primitives";
 import { AgentConfig, formatUsdc, shortAddress } from "@/components/onboarding/types";
 
@@ -230,6 +241,11 @@ export function AgentDashboard({
             <span className="inline-block h-px w-6 bg-line-strong" />
           </div>
           <h1 className="mt-3 flex flex-wrap items-center gap-3 text-[30px] font-medium leading-tight tracking-[-0.02em] text-ink sm:text-[36px]">
+            <AgentPersona
+              seed={entityId}
+              mood={entity ? agentMood(entity.status) : "setting"}
+              className="h-16 w-16 shrink-0"
+            />
             {displayName}
             <span
               className={cx(
