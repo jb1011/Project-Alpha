@@ -21,6 +21,7 @@ import {
   fetchAgentSchema,
   fundEntity,
   getEntity,
+  getEntityExternalRecord,
   getEntityReputation,
   getEntityRuns,
   getCompany,
@@ -224,6 +225,28 @@ export function useEntityReputationQuery(entityId: string, refetchInterval = 500
     refetchInterval,
   });
 }
+
+/**
+ * The external track record for the guardian's settings screen (design 2026-10-23, section 4.6).
+ * Read every 60 s, the backend's own memo window: a faster poll would only read the memo.
+ * `enabled` is the caller's `/config.externalRecord.available`, so a deployment without a
+ * provider never asks.
+ */
+export function useEntityExternalRecordQuery(entityId: string, enabled: boolean) {
+  const token = useAuthToken();
+  return useQuery({
+    queryKey: apiKeys.entityExternalRecord(token ?? "", entityId),
+    queryFn: () => getEntityExternalRecord(token!, entityId),
+    enabled: !!token && enabled,
+    staleTime: EXTERNAL_RECORD_REFRESH_MS,
+    refetchInterval: EXTERNAL_RECORD_REFRESH_MS,
+    // A failed read is shown as one, with a retry button: no silent retries behind it.
+    retry: false,
+  });
+}
+
+/** The card's refresh, on the backend's memo window. */
+export const EXTERNAL_RECORD_REFRESH_MS = 60_000;
 
 export function useEntityJobsQuery(entityId: string, refetchInterval = 5000) {
   const token = useAuthToken();

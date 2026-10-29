@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { AgentTabs } from "@/components/agents/AgentTabs";
 import { AmendmentVetoCard } from "@/components/agents/AmendmentVetoCard";
+import { ExternalRecordCard } from "@/components/agents/ExternalRecordCard";
 import { usePublicClient, useReadContract, useWriteContract } from "wagmi";
 import {
   useEntityQuery,
@@ -34,6 +35,12 @@ import { formatUsdc, isAddress, shortAddress } from "@/components/onboarding/typ
 /** How often the timelock is re-read while a scheduled policy change is waiting. The delay is
  *  hours long; a second is close enough, and is what the other clocks in this interface tick at. */
 const TIMELOCK_TICK_MS = 1_000;
+
+/** How long to wait before asking the treasury again when restoring a scheduled change failed. */
+const RESTORE_RETRY_MS = 5_000;
+/** …a bounded number of times: a read that keeps failing (a wallet on another chain) must not
+ *  poll for as long as the record stands. A reload starts over. */
+const RESTORE_MAX_RETRIES = 6;
 
 type PendingPolicy = {
   policyId: `0x${string}`;
@@ -69,6 +76,13 @@ export function AgentSettings({ entityId }: { entityId: string }) {
   const [capSeeded, setCapSeeded] = useState(false);
   const [allowSeeded, setAllowSeeded] = useState(false);
   const [payoutSeeded, setPayoutSeeded] = useState(false);
+  /** The schedule record the chain has already been asked about, keyed by its transaction (a
+   *  policy id repeats when the same tuple is scheduled again), so each record is checked once
+   *  rather than on every refetch. Also set when this tab vetoes or executes the change, so a
+   *  node a block behind cannot bring it back. */
+  const [checkedScheduleKey, setCheckedScheduleKey] = useState<string | null>(null);
+  /** Bumped after a failed check, to ask the chain again a little later. */
+  const [restoreAttempt, setRestoreAttempt] = useState(0);
   /** The clock the timelock is read against, ticking only while a scheduled change waits. */
   const [now, setNow] = useState(() => Date.now());
 
@@ -160,6 +174,56 @@ export function AgentSettings({ entityId }: { entityId: string }) {
     };
   }, [pending, treasury, publicClient]);
 
+  // A change scheduled in another tab, or before a reload, is known to the backend (design
+  // 2026-10-23, section 4.5) but not to this page's state. It is shown only once the treasury says
+  // it is still pending, with every figure read from the chain: the backend's record is what was
+  // sent, and a veto leaves it standing.
+  const scheduled = entity?.scheduledPolicy ?? null;
+  const scheduledId = scheduled?.policyId ?? null;
+  const scheduledKey = scheduled ? `${scheduled.policyId}:${scheduled.txHash}` : null;
+  useEffect(() => {
+    if (!scheduledId || !scheduledKey || pending || !treasury || !publicClient) return;
+    if (checkedScheduleKey === scheduledKey) return;
+    let cancelled = false;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    void (async () => {
+      try {
+        const pp = await publicClient.readContract({
+          address: treasury,
+          abi: treasuryAbi,
+          functionName: "pendingPolicy",
+          args: [scheduledId],
+        });
+        if (cancelled) return;
+        setCheckedScheduleKey(scheduledKey);
+        if (pp[5])
+          setPending({
+            policyId: scheduledId,
+            cap: pp[0],
+            period: pp[1],
+            payoutAddress: pp[2],
+            allowlistEnabled: pp[3],
+            executableAt: pp[4],
+          });
+      } catch {
+        // Unchecked: ask again shortly, or a blip at load would hide the change (and its Veto
+        // button) until a full reload.
+        if (!cancelled && restoreAttempt < RESTORE_MAX_RETRIES)
+          retry = setTimeout(() => setRestoreAttempt((n) => n + 1), RESTORE_RETRY_MS);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (retry) clearTimeout(retry);
+    };
+  }, [scheduledId, scheduledKey, pending, treasury, publicClient, checkedScheduleKey, restoreAttempt]);
+
+  /** This tab just settled the change: its record must not be restored from a lagging read. */
+  function markScheduleSettled(policyId: `0x${string}`) {
+    if (scheduled && scheduled.policyId.toLowerCase() === policyId.toLowerCase())
+      setCheckedScheduleKey(`${scheduled.policyId}:${scheduled.txHash}`);
+  }
+
   async function runTx(
     fn: () => Promise<void>,
     fallback = "Transaction failed — is this the guardian wallet?",
@@ -234,6 +298,7 @@ export function AgentSettings({ entityId }: { entityId: string }) {
     if (!pending) return;
     await runTx(async () => {
       await executePolicyUpdate.mutateAsync(pending.policyId);
+      markScheduleSettled(pending.policyId);
       setPending(null);
     }, "Failed to execute policy update.");
   }
@@ -249,6 +314,7 @@ export function AgentSettings({ entityId }: { entityId: string }) {
         chainId: arcTestnet.id,
       });
       await publicClient.waitForTransactionReceipt({ hash });
+      markScheduleSettled(pending.policyId);
       setPending(null);
     });
   }
@@ -361,6 +427,10 @@ export function AgentSettings({ entityId }: { entityId: string }) {
           </div>
         </Callout>
       )}
+
+      {/* Right under the pending change, so the guardian reads the record as part of the
+          decision; shown with nothing pending too, so the record can be checked on its own. */}
+      <ExternalRecordCard entityId={entityId} agentId={entity.agentId} />
 
       {/* Beside the treasury's pending-policy card, and deliberately a different kind of thing:
           that one is scheduled through this platform and executed through it, while this one is

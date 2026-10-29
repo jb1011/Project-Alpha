@@ -10,6 +10,8 @@ export const apiKeys = {
   entityReputation: (token: string, id: string) =>
     [...apiKeys.all, "entityReputation", token, id] as const,
   entityJobs: (token: string, id: string) => [...apiKeys.all, "entityJobs", token, id] as const,
+  entityExternalRecord: (token: string, id: string) =>
+    [...apiKeys.all, "entityExternalRecord", token, id] as const,
   entityAgentBook: (token: string, id: string) =>
     [...apiKeys.all, "entityAgentBook", token, id] as const,
   apiKeys: (token: string) => [...apiKeys.all, "apiKeys", token] as const,

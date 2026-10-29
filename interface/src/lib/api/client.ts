@@ -21,6 +21,7 @@ import type {
   ComplianceView,
   ConnectionPackage,
   EntityView,
+  ExternalRecordView,
   FormationPartyInput,
   FormationPaymentView,
   FormationQuote,
@@ -437,6 +438,14 @@ export async function getEntityReputation(
   id: string,
 ): Promise<{ reputation: ReputationView }> {
   return request(`/entities/${encodeURIComponent(id)}/reputation`, { token });
+}
+
+/** The agent's record graded by the configured track-record provider (design 2026-10-23). */
+export async function getEntityExternalRecord(
+  token: string,
+  id: string,
+): Promise<ExternalRecordView> {
+  return request(`/entities/${encodeURIComponent(id)}/external-record`, { token });
 }
 
 export async function listEntityJobs(token: string, id: string): Promise<JobView[]> {
