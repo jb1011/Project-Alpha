@@ -45,3 +45,56 @@ export function submittedDeliverableOf(
     );
   return distinct[0];
 }
+
+/**
+ * The job contract's `JobCreated` event, as the deployed `AgenticCommerce` implementation (see
+ * {jobSubmittedEventAbi}) declares it:
+ * `JobCreated(uint256 indexed jobId, address indexed client, address indexed provider, address
+ * evaluator, uint256 expiredAt, address hook)`. The local mock emits a `JobCreated` of another
+ * shape (three indexed fields), which this definition never matches.
+ */
+export const jobCreatedEventAbi = [
+  {
+    type: "event",
+    name: "JobCreated",
+    inputs: [
+      { name: "jobId", type: "uint256", indexed: true },
+      { name: "client", type: "address", indexed: true },
+      { name: "provider", type: "address", indexed: true },
+      { name: "evaluator", type: "address", indexed: false },
+      { name: "expiredAt", type: "uint256", indexed: false },
+      { name: "hook", type: "address", indexed: false },
+    ],
+  },
+] as const;
+
+/**
+ * The id of the job a create made, read from its receipt's logs: the `jobId` of the one
+ * `JobCreated` log that `jobContract` emitted whose client, provider, evaluator and expiry are
+ * the ones given. Undefined when there is none (for example a contract that emits another
+ * shape); throws when two match, since the receipt then does not say which job is ours. No
+ * chain read: pass `receipt.logs`. A simulated id can name another job on a busy contract; this
+ * one is the job that was mined.
+ */
+export function createdJobIdOf(
+  logs: readonly Log[],
+  jobContract: string,
+  ours: { client: string; provider: string; evaluator: string; expiredAt: bigint },
+): bigint | undefined {
+  const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+  const ids = parseEventLogs({ abi: jobCreatedEventAbi, logs: [...logs] })
+    .filter(
+      (l) =>
+        same(l.address, jobContract) &&
+        same(l.args.client, ours.client) &&
+        same(l.args.provider, ours.provider) &&
+        same(l.args.evaluator, ours.evaluator) &&
+        l.args.expiredAt === ours.expiredAt,
+    )
+    .map((l) => l.args.jobId);
+  if (ids.length > 1)
+    throw new Error(
+      `the receipt holds ${ids.length} JobCreated logs that match this job: ids ${ids.join(", ")}`,
+    );
+  return ids[0];
+}

@@ -13,7 +13,12 @@ import {
   toEventSelector,
 } from "viem";
 import { describe, expect, test } from "vitest";
-import { jobSubmittedEventAbi, submittedDeliverableOf } from "../../src/pilot/jobEvents";
+import {
+  createdJobIdOf,
+  jobCreatedEventAbi,
+  jobSubmittedEventAbi,
+  submittedDeliverableOf,
+} from "../../src/pilot/jobEvents";
 
 const JOB_CONTRACT = "0x0000000000000000000000000000000000000004" as Address;
 const OTHER_CONTRACT = "0x0000000000000000000000000000000000000005" as Address;
@@ -99,5 +104,104 @@ describe("submittedDeliverableOf", () => {
     expect(() => submittedDeliverableOf(disagree, JOB_CONTRACT, 7n)).toThrow(
       /different deliverable hashes/,
     );
+  });
+});
+
+const CLIENT = "0x00000000000000000000000000000000000000c1" as Address;
+const EVALUATOR = "0x00000000000000000000000000000000000000e1" as Address;
+const HOOK = "0x0000000000000000000000000000000000000000" as Address;
+const EXPIRES = 1_800_000_000n;
+const OURS = { client: CLIENT, provider: PROVIDER, evaluator: EVALUATOR, expiredAt: EXPIRES };
+
+/** A `JobCreated` log as a receipt carries it, ours unless a field is overridden. */
+function jobCreatedLog(o: {
+  address?: Address;
+  jobId: bigint;
+  client?: Address;
+  provider?: Address;
+  evaluator?: Address;
+  expiredAt?: bigint;
+}): Log {
+  return {
+    address: o.address ?? JOB_CONTRACT,
+    topics: encodeEventTopics({
+      abi: jobCreatedEventAbi,
+      eventName: "JobCreated",
+      args: { jobId: o.jobId, client: o.client ?? CLIENT, provider: o.provider ?? PROVIDER },
+    }) as Log["topics"],
+    data: encodeAbiParameters(
+      [{ type: "address" }, { type: "uint256" }, { type: "address" }],
+      [o.evaluator ?? EVALUATOR, o.expiredAt ?? EXPIRES, HOOK],
+    ),
+    blockNumber: 1n,
+    blockHash: `0x${"11".repeat(32)}`,
+    transactionHash: `0x${"33".repeat(32)}`,
+    transactionIndex: 0,
+    logIndex: 0,
+    removed: false,
+  };
+}
+
+describe("the JobCreated event", () => {
+  test("its topic0 is the deployed contract's JobCreated(uint256,address,address,address,uint256,address)", () => {
+    const selector = toEventSelector(jobCreatedEventAbi[0]);
+    expect(selector).toBe(
+      keccak256(toBytes("JobCreated(uint256,address,address,address,uint256,address)")),
+    );
+    expect(selector).toBe("0xb0f0239bfdd96453e24733e18bfc24b70d8fadf123dd977473518dd577ee79b9");
+  });
+
+  test("the job id, the client and the provider are indexed; the rest are not", () => {
+    expect(jobCreatedEventAbi[0].inputs.map((i) => [i.name, i.indexed])).toEqual([
+      ["jobId", true],
+      ["client", true],
+      ["provider", true],
+      ["evaluator", false],
+      ["expiredAt", false],
+      ["hook", false],
+    ]);
+  });
+});
+
+describe("createdJobIdOf", () => {
+  test("returns the id of the job contract's log whose parties and expiry are ours", () => {
+    expect(createdJobIdOf([jobCreatedLog({ jobId: 9n })], JOB_CONTRACT, OURS)).toBe(9n);
+  });
+
+  test.each<[string, Parameters<typeof jobCreatedLog>[0]]>([
+    ["another contract", { address: OTHER_CONTRACT, jobId: 9n }],
+    ["another client", { jobId: 9n, client: EVALUATOR }],
+    ["another provider", { jobId: 9n, provider: EVALUATOR }],
+    ["another evaluator", { jobId: 9n, evaluator: CLIENT }],
+    ["another expiry", { jobId: 9n, expiredAt: EXPIRES + 1n }],
+  ])("ignores a log from %s", (_n, log) => {
+    expect(createdJobIdOf([jobCreatedLog(log)], JOB_CONTRACT, OURS)).toBeUndefined();
+  });
+
+  test("picks ours among others, matching addresses in any letter case", () => {
+    const logs = [
+      jobCreatedLog({ jobId: 8n, client: EVALUATOR }),
+      jobCreatedLog({ jobId: 9n }),
+      jobCreatedLog({ address: OTHER_CONTRACT, jobId: 10n }),
+    ];
+    const upper = {
+      client: CLIENT.toUpperCase(),
+      provider: PROVIDER.toUpperCase(),
+      evaluator: EVALUATOR.toUpperCase(),
+      expiredAt: EXPIRES,
+    };
+    expect(createdJobIdOf(logs, JOB_CONTRACT.toUpperCase(), upper)).toBe(9n);
+  });
+
+  test("returns undefined with no log and with a log of another shape", () => {
+    expect(createdJobIdOf([], JOB_CONTRACT, OURS)).toBeUndefined();
+    expect(
+      createdJobIdOf([jobSubmittedLog({ jobId: 9n, deliverable: HASH_A })], JOB_CONTRACT, OURS),
+    ).toBeUndefined();
+  });
+
+  test("throws when two logs match", () => {
+    const logs = [jobCreatedLog({ jobId: 9n }), jobCreatedLog({ jobId: 10n })];
+    expect(() => createdJobIdOf(logs, JOB_CONTRACT, OURS)).toThrow(/2 JobCreated logs/);
   });
 });

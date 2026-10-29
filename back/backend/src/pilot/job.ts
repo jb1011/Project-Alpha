@@ -11,7 +11,7 @@ import type { FileDocumentStore } from "../persistence/documentStore";
 import { publicErrorMessage } from "../workflow/publicError";
 import { type PilotCaseRepository, newCaseId } from "./casesRepository";
 import type { PilotChain } from "./composition";
-import { jobSubmittedEventAbi, submittedDeliverableOf } from "./jobEvents";
+import { createdJobIdOf, jobSubmittedEventAbi, submittedDeliverableOf } from "./jobEvents";
 import { type LookupClient, activeLegalName } from "./lookup";
 import type { PilotCaseRecord, PilotMode } from "./types";
 
@@ -253,11 +253,45 @@ export async function createPilotJob(
     d.cases.recordEvent(caseId, "create", "mined", txHash, null);
   });
   try {
-    const row = d.cases.patch(caseId, { createdBlockTime: await blockTimeOf(chain, txHash) });
+    const row = await settleCreate(d, d.cases.find(caseId) as PilotCaseRecord);
     return await continueCase(d, input, row);
   } catch (e) {
     throw withPilotCaseId(e, caseId);
   }
+}
+
+/**
+ * The create's receipt, read once the row exists: its block time, and the job id the deployed
+ * contract's `JobCreated` log names for our parties and expiry. A simulated id can name another
+ * job on a busy contract; when the log names a different one, the row takes the log's and an
+ * event says so. A receipt without such a log (the local mock emits another shape) keeps the
+ * simulated id. The row is inserted before this read, so a failure here leaves a case whose
+ * resume reads the receipt again.
+ */
+async function settleCreate(d: PilotJobDeps, row: PilotCaseRecord): Promise<PilotCaseRecord> {
+  const { chain, cases } = d;
+  const hash = row.createTxHash as Hex;
+  const receipt = await chain.publicClient.getTransactionReceipt({ hash });
+  const block = await chain.publicClient.getBlock({ blockNumber: receipt.blockNumber });
+  const logged = createdJobIdOf(receipt.logs, chain.jobContract, {
+    client: row.buyerAddress,
+    provider: row.sellerAddress,
+    evaluator: row.refereeAddress,
+    expiredAt: BigInt(row.expiredAt),
+  });
+  return cases.transaction(() => {
+    if (logged !== undefined && logged.toString() !== row.jobId) {
+      cases.recordEvent(
+        row.caseId,
+        "create",
+        "job_id_from_log",
+        hash,
+        `the simulation gave job ${row.jobId}; the JobCreated log of the create gives job ${logged}`,
+      );
+      cases.patch(row.caseId, { jobId: logged.toString() });
+    }
+    return cases.patch(row.caseId, { createdBlockTime: Number(block.timestamp) });
+  });
 }
 
 /** The row to resume, or a refusal: it must exist, be at created or funded, and be this mode's. */
@@ -302,12 +336,9 @@ async function resume(
   start: PilotCaseRecord,
 ): Promise<PilotCaseRecord> {
   let row = start;
-  // A run that stopped right after the create never read its block: read it now, so the case
-  // carries every time the later steps need.
-  if (row.createdBlockTime === null && row.createTxHash !== null)
-    row = d.cases.patch(row.caseId, {
-      createdBlockTime: await blockTimeOf(d.chain, row.createTxHash as Hex),
-    });
+  // A run that stopped right after the create never read its receipt: read it now, so the case
+  // carries the mined job id and the block time the later steps need.
+  if (row.createdBlockTime === null && row.createTxHash !== null) row = await settleCreate(d, row);
   const onChain = await chainStatusOf(d, row);
   if (onChain === OPEN || onChain === FUNDED) {
     const pre = await checks(

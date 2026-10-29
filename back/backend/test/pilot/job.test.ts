@@ -86,6 +86,8 @@ function setup(
     runSubmit?: boolean;
     omitSubmittedLog?: boolean;
     skewJobSubmittedLog?: { deliverable?: Hex; provider?: Address };
+    emitJobCreatedLog?: boolean;
+    skewJobCreatedId?: bigint;
   } = {},
 ) {
   /** The clock in seconds, shared by the node and the job; a test moves it with `setClock`. */
@@ -98,6 +100,8 @@ function setup(
     runSubmit: o.runSubmit,
     omitSubmittedLog: o.omitSubmittedLog,
     skewJobSubmittedLog: o.skewJobSubmittedLog,
+    emitJobCreatedLog: o.emitJobCreatedLog,
+    skewJobCreatedId: o.skewJobCreatedId,
     // A submit is adopted from its transaction, so the node answers what it accepted.
     answerTransactions: true,
     identityRegistry: REGISTRY,
@@ -998,4 +1002,49 @@ test("a failure after the row exists carries the case id; a failed createJob car
   expect(createErr).toBeInstanceOf(ChainTxRevertedError);
   expect(pilotCaseIdOf(createErr)).toBeUndefined();
   expect(failedCreate.cases.list()).toEqual([]);
+});
+
+// ── The job id comes from the create's own receipt ──────────────────────────────────────────────
+
+test("when other creates land between the simulation and the block, the row takes the id the JobCreated log names", async () => {
+  const { node, cases, deps } = setup({ emitJobCreatedLog: true, skewJobCreatedId: 2n });
+  const row = await createPilotJob(deps, input());
+  expect(row.jobId).toBe("3");
+  expect(row.status).toBe("submitted");
+  expect(node.chainJob(3n)).toMatchObject({ client: BUYER, provider: SELLER, status: 1 });
+  expect(node.chainJob(1n)).toBeUndefined();
+  expect(cases.events(row.caseId)).toContainEqual(
+    expect.objectContaining({
+      step: "create",
+      status: "job_id_from_log",
+      ref: row.createTxHash,
+      detail: "the simulation gave job 1; the JobCreated log of the create gives job 3",
+    }),
+  );
+});
+
+test("when the log names the simulated id, the row keeps it and records nothing about it", async () => {
+  const { cases, deps } = setup({ emitJobCreatedLog: true });
+  const row = await createPilotJob(deps, input());
+  expect(row.jobId).toBe("1");
+  expect(cases.events(row.caseId).some((e) => e.status === "job_id_from_log")).toBe(false);
+});
+
+test("a create whose receipt read failed takes the log's id on the resume", async () => {
+  const { cases, deps, chain, node } = setup({ emitJobCreatedLog: true, skewJobCreatedId: 2n });
+  const getBlock = chain.publicClient.getBlock.bind(chain.publicClient);
+  vi.spyOn(chain.publicClient, "getBlock").mockImplementationOnce(async () => {
+    throw new Error("the block read failed");
+  });
+  await expect(createPilotJob(deps, input())).rejects.toThrow(/block read failed/);
+  const [row] = cases.list();
+  // The row exists with the simulated id, so the case can be resumed.
+  expect(row).toMatchObject({ status: "created", jobId: "1", createdBlockTime: null });
+  vi.mocked(chain.publicClient.getBlock).mockImplementation(getBlock as never);
+  const sent = node.sends.length;
+
+  const done = await createPilotJob(deps, input(), row!.caseId);
+  expect(done).toMatchObject({ jobId: "3", status: "submitted", createdBlockTime: NOW });
+  expect(node.hashesOf("createJob")).toHaveLength(1);
+  expect(node.sends.length).toBeGreaterThan(sent);
 });

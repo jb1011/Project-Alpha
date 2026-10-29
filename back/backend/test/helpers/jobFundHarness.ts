@@ -47,7 +47,7 @@ import { type JobWorker, TrivialWorker } from "../../src/jobs/worker";
 import { withKeyedLock } from "../../src/payments/keyedMutex";
 import { migrate } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
-import { jobSubmittedEventAbi } from "../../src/pilot/jobEvents";
+import { jobCreatedEventAbi, jobSubmittedEventAbi } from "../../src/pilot/jobEvents";
 import { FAKE_PROVIDER_ADDRESS, makeFakeDocStore, seedBoundEntity } from "./runJobDeps";
 
 /** The two ERC-20 entry points this node implements, as `jobAdapter.ts` calls them. */
@@ -193,6 +193,16 @@ export interface UsdcJobNodeOptions {
    */
   skewJobSubmittedLog?: { deliverable?: Hex; provider?: Address };
   /**
+   * Give a mined `createJob` a receipt carrying a `JobCreated` log of the deployed contract's
+   * shape. Off by default, where a create's receipt carries no log, as before.
+   */
+  emitJobCreatedLog?: boolean;
+  /**
+   * Mine the first `createJob` this many ids past the one its simulation answered, as if other
+   * creates landed in between. Off by default, where the mined id is the simulated one.
+   */
+  skewJobCreatedId?: bigint;
+  /**
    * Answer `eth_getTransactionByHash` with the transaction the node accepted under that hash
    * (pending, with no block, while its receipt is withheld). Off by default, where the node
    * answers null to every hash, as before.
@@ -219,6 +229,11 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
   const logsOf = new Map<string, { jobId: bigint; provider: Address; deliverable: Hex }>();
   /** The `JobSubmitted` log of the transaction being executed, picked up when it is accepted. */
   let pendingLog: { jobId: bigint; provider: Address; deliverable: Hex } | undefined;
+  /** The `JobCreated` logs a receipt carries, by hash; only an opted-in create writes one. */
+  const createdLogsOf = new Map<string, ChainJob>();
+  /** The created job of the transaction being executed, for {emitJobCreatedLog}. */
+  let pendingCreated: ChainJob | undefined;
+  let createSkewed = false;
   /** The raw signed transaction accepted under each hash, for {answerTransactions}. */
   const rawOf = new Map<string, Hex>();
   const actions: NodeAction[] = [];
@@ -323,6 +338,10 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
     if (to.toLowerCase() !== opts.jobContract.toLowerCase())
       return { call: "other", from, status: "success" };
     if (decoded?.functionName === "createJob") {
+      if (opts.skewJobCreatedId !== undefined && !createSkewed) {
+        createSkewed = true;
+        jobCounter += opts.skewJobCreatedId;
+      }
       jobCounter += 1n;
       const [provider, evaluator, expiredAt, description, hook] = decoded.args as [
         Address,
@@ -344,6 +363,7 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
         status: 0,
         hook,
       });
+      if (opts.emitJobCreatedLog) pendingCreated = chainJobs.get(jobCounter.toString());
       return { call: "createJob", from, status: "success" };
     }
     if (decoded?.functionName === "fund") {
@@ -472,6 +492,8 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
         rawOf.set(hash, raw);
         if (pendingLog) logsOf.set(hash, pendingLog);
         pendingLog = undefined;
+        if (pendingCreated) createdLogsOf.set(hash, pendingCreated);
+        pendingCreated = undefined;
         if (opts.withholdReceipt === action.call && !withheld) {
           withheld = true;
           withheldReceipts.set(hash, action.status === "success" ? "0x1" : "0x0");
@@ -503,6 +525,28 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
           cumulativeGasUsed: "0x1",
           gasUsed: "0x1",
           logs: (() => {
+            const created = createdLogsOf.get(hash);
+            if (created)
+              return [
+                {
+                  address: opts.jobContract,
+                  topics: encodeEventTopics({
+                    abi: jobCreatedEventAbi,
+                    eventName: "JobCreated",
+                    args: { jobId: created.id, client: created.client, provider: created.provider },
+                  }),
+                  data: encodeAbiParameters(
+                    [{ type: "address" }, { type: "uint256" }, { type: "address" }],
+                    [created.evaluator, created.expiredAt, created.hook],
+                  ),
+                  blockNumber: "0x1",
+                  blockHash: `0x${"11".repeat(32)}`,
+                  transactionHash: hash,
+                  transactionIndex: "0x0",
+                  logIndex: "0x0",
+                  removed: false,
+                },
+              ];
             const l = logsOf.get(hash);
             if (!l) return [];
             return [
