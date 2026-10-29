@@ -10,5 +10,15 @@ export function AgentPersona({
   mood: AgentMood;
   className?: string;
 }) {
-  return <img src={agentPortrait(seed, mood)} alt="" className={className} />;
+  const svg = agentPortrait(seed, mood).replace(
+    'width="128" height="128"',
+    'width="100%" height="100%"',
+  );
+  return (
+    <span
+      className={`inline-block ${className ?? ""}`}
+      aria-hidden
+      dangerouslySetInnerHTML={{ __html: svg }}
+    />
+  );
 }

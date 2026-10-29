@@ -5,7 +5,8 @@ import type { AgentMood } from "@/components/agents/persona";
 /**
  * Voxel Bot by DiceBear, public domain (CC0).
  * The robot comes from the agent id, so a rename does not change who they are.
- * The eyes and mouth follow the status.
+ * The eyes and mouth follow the status. The face blinks and lifts.
+ * It stays still when reduced motion is requested.
  * Night Shift keeps the shell light on this dark page.
  */
 const VOXEL_BOT = new Style(voxelBot);
@@ -34,5 +35,6 @@ export function agentPortrait(seed: string, mood: AgentMood): string {
     bodyColor: ["e9ecef", "aeb8c2", "b6a6f5", "74c0fc"],
     screenColor: ["07070a"],
     glowColor: ["3bc9db", "69db7c", "ffd43b", "e599f7"],
-  }).toDataUri();
+    tags: ["animation"],
+  }).toString();
 }
