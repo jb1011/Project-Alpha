@@ -7,6 +7,7 @@ import { ExternalRecordCard } from "@/components/agents/ExternalRecordCard";
 import { usePublicClient, useReadContract, useWriteContract } from "wagmi";
 import {
   useEntityQuery,
+  useEntityTreasuryQuery,
   useExecutePolicyUpdateMutation,
   usePatchPerTxCapMutation,
   usePatchTrustPolicyMutation,
@@ -54,6 +55,7 @@ export function AgentSettings({ entityId }: { entityId: string }) {
   const publicClient = usePublicClient();
   const { writeContractAsync } = useWriteContract();
   const entityQuery = useEntityQuery(entityId);
+  const treasuryQuery = useEntityTreasuryQuery(entityId);
   const patchPerTxCap = usePatchPerTxCapMutation(entityId);
   const patchTrustPolicy = usePatchTrustPolicyMutation(entityId);
   const schedulePolicyUpdate = useSchedulePolicyUpdateMutation(entityId);
@@ -71,6 +73,9 @@ export function AgentSettings({ entityId }: { entityId: string }) {
   const [busy, setBusy] = useState(false);
   const [pending, setPending] = useState<PendingPolicy | null>(null);
   const [formInitialized, setFormInitialized] = useState(false);
+  const [capSeeded, setCapSeeded] = useState(false);
+  const [allowSeeded, setAllowSeeded] = useState(false);
+  const [payoutSeeded, setPayoutSeeded] = useState(false);
   /** The schedule record the chain has already been asked about, keyed by its transaction (a
    *  policy id repeats when the same tuple is scheduled again), so each record is checked once
    *  rather than on every refetch. Also set when this tab vetoes or executes the change, so a
@@ -100,6 +105,14 @@ export function AgentSettings({ entityId }: { entityId: string }) {
     query: { enabled: !!treasury },
   });
 
+  const { data: payoutOnChain } = useReadContract({
+    address: treasury,
+    abi: treasuryAbi,
+    functionName: "payoutAddress",
+    chainId: arcTestnet.id,
+    query: { enabled: !!treasury },
+  });
+
   const refreshEntity = entityQuery.refetch;
 
   // The form is seeded from the stored agent once, the first time it is on hand, and never again:
@@ -110,6 +123,23 @@ export function AgentSettings({ entityId }: { entityId: string }) {
     if (entity.perTxCap) setPerTxCap(String(Number(entity.perTxCap) / 1e6));
     setTrustPolicy(entity.trustPolicy ?? "inherit");
     setFormInitialized(true);
+  }
+
+  // Same once-only seed for the timelocked fields. They live on the treasury, not the entity, so
+  // they arrive on their own reads. A later refetch must not wipe a cap the guardian is editing.
+  const treasuryView = treasuryQuery.data ?? null;
+  if (treasuryView && !capSeeded) {
+    setCapSeeded(true);
+    setDailyCap(String(Number(treasuryView.cap) / 1e6));
+    setPeriodHours(String(Math.round(Number(treasuryView.period) / 3600)));
+  }
+  if (onChainAllowlist !== undefined && !allowSeeded) {
+    setAllowSeeded(true);
+    setAllowlistOn(onChainAllowlist);
+  }
+  if (payoutOnChain && !payoutSeeded) {
+    setPayoutSeeded(true);
+    setPayout(payoutOnChain);
   }
 
   // The timelock clock, alive only while a scheduled change is waiting. A poll whose answer has
@@ -456,7 +486,8 @@ export function AgentSettings({ entityId }: { entityId: string }) {
       <Card className="p-5">
         <SectionTitle>Period cap (timelocked)</SectionTitle>
         <p className="mt-1 text-[12px] text-muted-2">
-          Manager-signed on-chain change — schedule now, execute after the timelock.
+          Manager-signed on-chain change — schedule now, execute after the timelock. The fields
+          start as the rule on chain now.
         </p>
         <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
           <Field label="Rolling cap (USDC)">

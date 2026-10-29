@@ -92,24 +92,23 @@ function AgentRow({ entity }: { entity: EntityView }) {
         : "border-line-strong text-muted-2";
 
   return (
-    <li>
-      <Link
-        href={`/agents/${encodeURIComponent(entity.id)}`}
-        className="block rounded-2xl border hairline bg-paper-2/30 px-5 py-4 transition-colors hover:border-accent/25 hover:bg-paper-2/60"
-      >
+    <li className="relative rounded-2xl border hairline bg-paper-2/30 transition-colors hover:border-accent/25 hover:bg-paper-2/60">
+      <div className="px-5 py-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="min-w-0">
-            <div className="text-[15px] font-medium text-ink">
+            <Link
+              href={`/agents/${encodeURIComponent(entity.id)}`}
+              className="text-[15px] font-medium text-ink after:absolute after:inset-0"
+            >
               {entity.name}
-            </div>
+            </Link>
             <div className="mt-1 font-mono text-[11.5px] text-muted-2">
               {entity.treasury ? (
                 <a
                   href={addressUrl(entity.treasury)}
                   target="_blank"
                   rel="noreferrer"
-                  onClick={(ev) => ev.stopPropagation()}
-                  className="hover:text-accent-soft"
+                  className="relative z-10 hover:text-accent-soft"
                 >
                   {shortAddress(entity.treasury)}
                 </a>
@@ -128,7 +127,7 @@ function AgentRow({ entity }: { entity: EntityView }) {
             {entity.status}
           </span>
         </div>
-      </Link>
+      </div>
     </li>
   );
 }
