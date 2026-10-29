@@ -216,7 +216,7 @@ describe("GET /pilot/cases", () => {
     expect(body.cases.map((v: Json) => v.caseId)).toEqual(ids.slice(5).reverse());
   });
 
-  test("memoised for 15 seconds, per filter; the case route is not", async () => {
+  test("memoised for 15 seconds, per filter; the case route keeps its own memo", async () => {
     const app = makeApp();
     const first = freshCase("testnet");
     expect((await getJson(app, "/pilot/cases")).body.cases).toHaveLength(1);
@@ -230,7 +230,7 @@ describe("GET /pilot/cases", () => {
     expect((await getJson(app, "/pilot/cases?mode=testnet")).body.cases).toHaveLength(1);
     // Another filter is another answer, read now.
     expect((await getJson(app, "/pilot/cases?mode=live")).body.cases).toHaveLength(0);
-    // The case route reads the row on every request.
+    // The case route keeps its own memo, apart from the list's: its first request reads the row.
     expect((await getJson(app, `/pilot/cases/${first.caseId}`)).body.jobId).toBe("7");
     clock += 1;
     expect((await getJson(app, "/pilot/cases")).body.cases).toHaveLength(2);
@@ -291,7 +291,7 @@ describe("GET /pilot/cases", () => {
       error: "unavailable",
       message: "could not check right now; try again shortly",
     });
-    expect(opsOf("pilot_cases_read_failed")).toEqual([{ errorName: "Error" }]);
+    expect(opsOf("pilot_cases_read_failed")).toEqual([{ caseId: bad.caseId, errorName: "Error" }]);
   });
 
   test("a list whose rows can all be shown logs no skip", async () => {
@@ -586,7 +586,7 @@ describe("the stored files: the pilot's own, found by their file name in the sto
   });
 });
 
-describe("GET /pilot/cases/:caseId: the memo", () => {
+describe("GET /pilot/cases/:caseId: the memo and the 503's ops line", () => {
   test("a case's 200 is memoised for 15 seconds, per case: a change inside the window is not seen", async () => {
     const row = fullCase("testnet");
     const other = fullCase("testnet");
@@ -636,6 +636,34 @@ describe("GET /pilot/cases/:caseId: the memo", () => {
     expect(again.res.status).toBe(200);
     expect(again.body.caseId).toBe(later.caseId);
     expect(find).toHaveBeenCalledTimes(2);
+  });
+
+  test("the case route's 503 ops line names the case asked for; the list's names none", async () => {
+    const opsOf = captureOps();
+    const app = makeApp();
+    // A row the view cannot show: a budget that is not a decimal number.
+    const bad = cases.insert(
+      newCase({ caseId: nextCaseId(), mode: "testnet", budgetAtomic: "2.00" }),
+    );
+    const shown = await getJson(app, `/pilot/cases/${bad.caseId}`);
+    expect(shown.res.status).toBe(503);
+    expect(shown.body).toEqual({
+      error: "unavailable",
+      message: "could not check right now; try again shortly",
+    });
+    // A failed database read, for a case and for the list.
+    const busy = () => {
+      throw new Error(`SQLITE_BUSY at ${dataDir}/novi.db`);
+    };
+    vi.spyOn(cases, "find").mockImplementationOnce(busy);
+    vi.spyOn(cases, "list").mockImplementationOnce(busy);
+    expect((await getJson(app, "/pilot/cases/pc_00000000ffff")).res.status).toBe(503);
+    expect((await getJson(app, "/pilot/cases")).res.status).toBe(503);
+    expect(opsOf("pilot_cases_read_failed")).toEqual([
+      { caseId: bad.caseId, errorName: "Error" },
+      { caseId: "pc_00000000ffff", errorName: "Error" },
+      { errorName: "Error" },
+    ]);
   });
 });
 

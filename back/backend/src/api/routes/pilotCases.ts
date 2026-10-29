@@ -147,9 +147,10 @@ export function mountPilotCaseRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     return c.json(body, status);
   };
   /** The table could not be read (or the one case asked for could not be shown): the flat 503 of
-   *  the public routes, never memoised, with the error's name only in the ops line. */
-  const unavailable = (c: Context, e: unknown) => {
-    opsLog("pilot_cases_read_failed", { errorName: errorNameOf(e) });
+   *  the public routes, never memoised, with the error's name only in the ops line, beside the
+   *  case asked for (its id is public), so a case that cannot be shown is found by its own route. */
+  const unavailable = (c: Context, e: unknown, caseId?: string) => {
+    opsLog("pilot_cases_read_failed", { ...(caseId ? { caseId } : {}), errorName: errorNameOf(e) });
     c.header("Cache-Control", NO_STORE);
     return c.json(UNAVAILABLE_BODY, 503);
   };
@@ -211,7 +212,7 @@ export function mountPilotCaseRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
         records,
       };
     } catch (e) {
-      return unavailable(c, e);
+      return unavailable(c, e, caseId);
     }
     caseMemo.set(caseId, answer);
     c.header("Cache-Control", FRESH_CACHE_CONTROL);
