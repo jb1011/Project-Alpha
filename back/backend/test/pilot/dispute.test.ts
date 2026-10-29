@@ -1686,6 +1686,81 @@ describe("a filing that stopped part way", () => {
     expect([done.status, done.filingStartedAt]).toEqual(["filed", othersFiling.filingStartedAt]);
   });
 
+  test("a slow command whose pin fails after another command re-filed its row leaves that filing untouched", async () => {
+    const h = setup();
+    const row = await h.contested();
+    /** A fake held in its pin until released; `fails` makes the pin refuse once released. */
+    const heldInPin = (fails: boolean) => {
+      let entered!: () => void;
+      const inPin = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      class SlowPin extends FakeDisputeService {
+        override async pin(p: { bytes: Uint8Array; extension: string }): Promise<PinOutcome> {
+          entered();
+          await gate;
+          if (fails) throw new KlerosRefusal("evidence_pin", "FILE_TOO_LARGE: over the limit");
+          return super.pin(p);
+        }
+      }
+      const kleros = new SlowPin({ script: "pay" });
+      const stage: KlerosStage = {
+        mode: "rehearsal",
+        service: kleros,
+        deployment: null,
+        cap: null,
+        flag: null,
+      };
+      return { kleros, stage, inPin, release };
+    };
+    const slow = heldInPin(true);
+    const slowRunning = fileDispute(h.deps(slow.stage), row.caseId, { confirmedFlag: null });
+    await slow.inPin;
+
+    // An outside hand moves the row back, and another command starts filing it again.
+    h.cases.advance(row.caseId, "filing", "contested");
+    h.setClock(h.clock() + 60);
+    const other = heldInPin(false);
+    const otherRunning = fileDispute(h.deps(other.stage), row.caseId, { confirmedFlag: null });
+    await other.inPin;
+    const othersFiling = h.cases.find(row.caseId)!;
+
+    slow.release();
+    const out = await slowRunning;
+    expect(out).toMatchObject({ outcome: "not_sent", code: "FILE_TOO_LARGE" });
+    expect(textOf(out)).toContain("no longer this command's filing");
+    const untouched = h.cases.find(row.caseId)!;
+    expect([untouched.status, untouched.filingStartedAt]).toEqual([
+      "filing",
+      othersFiling.filingStartedAt,
+    ]);
+    expect(h.cases.events(row.caseId).at(-1)).toMatchObject({
+      step: "filing",
+      status: "not_its_own",
+    });
+
+    // A command now finds the other's filing in progress and waits: it creates nothing.
+    const fourth = rehearsal();
+    expect(
+      await fileDispute(h.deps(fourth.stage), row.caseId, { confirmedFlag: null }),
+    ).toMatchObject({
+      outcome: "not_sent",
+      code: "filing_in_progress",
+    });
+
+    other.release();
+    expect((await otherRunning).outcome).toBe("filed");
+    const creates = [slow.kleros, other.kleros, fourth.kleros].flatMap((k) =>
+      k.calls.filter((c) => c.tool === "dispute_create"),
+    );
+    expect(creates).toHaveLength(1);
+    expect(h.cases.find(row.caseId)?.status).toBe("filed");
+  });
+
   test("30 minutes old with a dispute id: filed with its evidence in doubt, an ops line, zero calls", async () => {
     const h = setup();
     const row = await h.contested();

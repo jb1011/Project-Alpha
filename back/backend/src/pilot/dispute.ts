@@ -231,10 +231,10 @@ export async function fileDispute(
       const detail = klerosTextOf(e);
       cases.recordEvent(caseId, "pin", refusedOrFailed(e), null, detail);
       const never = neverRanCodeOf(e);
-      if (never) return backToContested(d, caseId, never, neverRanTextOf(never));
+      if (never) return backToContested(d, moved, never, neverRanTextOf(never));
       return backToContested(
         d,
-        caseId,
+        moved,
         e instanceof KlerosRefusal ? e.code : null,
         `the delivered file was not pinned, so nothing was filed: ${detail}`,
       );
@@ -249,7 +249,7 @@ export async function fileDispute(
       );
       return backToContested(
         d,
-        caseId,
+        moved,
         PIN_CHECKED_ONLY,
         "the key only checked the delivered file and published nothing, so nothing was filed: read the key's instructions with pilot:kleros check",
       );
@@ -294,13 +294,13 @@ export async function fileDispute(
     const never = neverRanCodeOf(e);
     if (never) {
       cases.recordEvent(caseId, "create", "refused", null, detail);
-      return backToContested(d, caseId, never, neverRanTextOf(never));
+      return backToContested(d, moved, never, neverRanTextOf(never));
     }
     if (e instanceof KlerosRefusal && sentOf("dispute_create", e.code) === "no") {
       cases.recordEvent(caseId, "create", "refused", null, detail);
       return backToContested(
         d,
-        caseId,
+        moved,
         e.code,
         `Kleros refused the filing and nothing was sent: ${detail}`,
       );
@@ -318,7 +318,7 @@ export async function fileDispute(
     // A documented status of the service that neither key should give: nothing exists.
     const text = `${PRESET_SIMULATES}: the key simulated the filing; nothing was sent and no dispute exists. Read the key's instructions with pilot:kleros check`;
     cases.recordEvent(caseId, "create", "simulated", null, text);
-    return backToContested(d, caseId, PRESET_SIMULATES, text);
+    return backToContested(d, moved, PRESET_SIMULATES, text);
   }
   if (created.status === "unknown") {
     const text = klerosTextOf(created.text, KLEROS_FILING_TEXT_MAX);
@@ -787,15 +787,36 @@ function stoppedFiling(d: FileDisputeDeps, row: PilotCaseRecord): FileOutcome {
   };
 }
 
-/** Nothing was sent: the row goes back to `contested`, its attempt left on it as history. */
+/**
+ * Nothing was sent: the row goes back to `contested`, its attempt left on it as history, but only
+ * while it is still this command's filing (at `filing`, with this command's start). A row another
+ * command froze or is filing again is left as it is, with an event saying so: a filing that sent
+ * nothing never undoes another command's filing.
+ */
 function backToContested(
   d: FileDisputeDeps,
-  caseId: string,
+  own: PilotCaseRecord,
   code: string | null,
   text: string,
 ): FileOutcome {
-  const back = d.cases.advance(caseId, "filing", "contested");
-  return notSent(code, back ? text : `${text} (the case had moved and was left as it is)`);
+  const { cases } = d;
+  const back = cases.transaction(() => {
+    const now = cases.find(own.caseId);
+    if (now?.status === "filing" && now.filingStartedAt === own.filingStartedAt)
+      return cases.advance(own.caseId, "filing", "contested") !== undefined;
+    cases.recordEvent(
+      own.caseId,
+      "filing",
+      "not_its_own",
+      null,
+      `the case was no longer this command's filing (it is now ${now?.status ?? "missing"}), so it was not moved back to contested`,
+    );
+    return false;
+  });
+  return notSent(
+    code,
+    back ? text : `${text} (the case was no longer this command's filing and was left as it is)`,
+  );
 }
 
 /** The create may have been sent: the row freezes, with the hash when there is one. */
