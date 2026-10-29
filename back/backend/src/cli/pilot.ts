@@ -34,7 +34,7 @@ import {
   linkVerifyTypes,
 } from "../legalBody/link";
 import { PILOT_FILED_OR_LATER_STATUSES, PILOT_FILED_STATUSES } from "../pilot/casesRepository";
-import { DEFAULT_SCRIPT, buildPilotChain } from "../pilot/composition";
+import { buildPilotChain } from "../pilot/composition";
 import { type PilotContext, openPilotContext } from "../pilot/context";
 import {
   type CreatePilotJobInput,
@@ -391,6 +391,8 @@ const PILOT_NOTE = "test data: two test agents and test USDC on Arc testnet";
 
 /** The most a free text (a contest reason or reply, a description, a note) may hold, in UTF-8 bytes. */
 const MAX_TEXT_BYTES = 4096;
+/** The most a case label may hold, in UTF-8 bytes: a short name, printed in every case list. */
+const MAX_LABEL_BYTES = 64;
 /** USDC's decimals. */
 const USDC_DECIMALS = 6;
 const DAY_SECONDS = 86_400;
@@ -411,22 +413,20 @@ function hasControl(text: string, singleLine: boolean): boolean {
 }
 
 /**
- * The first invisible format character in `text`, as `U+XXXX`: zero-width characters and
- * marks, the line and paragraph separators, the bidirectional embeddings and overrides, the
- * invisible operators and the byte order mark. The description goes on chain for good and the
- * texts are served publicly, where a right-to-left override would reorder what a reader sees.
+ * The first invisible character in `text`, as `U+XXXX`: every Unicode format character (zero-width
+ * characters and marks, the bidirectional embeddings, overrides and isolates, the invisible
+ * operators, the soft hyphen, the tag characters, the byte order mark), the line and paragraph
+ * separators, and the Hangul fillers, which render blank. The description goes on chain for
+ * good and the texts are served publicly, where such a character would hide or reorder text.
  */
+const FORMAT_CHARACTER = /\p{Cf}/u;
+const BLANK_FILLERS: ReadonlySet<number> = new Set([
+  0x115f, 0x1160, 0x3164, 0xffa0, 0x2028, 0x2029,
+]);
 function formatCharacterOf(text: string): string | undefined {
   for (const ch of text) {
     const c = ch.codePointAt(0) as number;
-    if (
-      (c >= 0x200b && c <= 0x200f) ||
-      c === 0x2028 ||
-      c === 0x2029 ||
-      (c >= 0x202a && c <= 0x202e) ||
-      (c >= 0x2060 && c <= 0x2064) ||
-      c === 0xfeff
-    )
+    if (FORMAT_CHARACTER.test(ch) || BLANK_FILLERS.has(c))
       return `U+${c.toString(16).toUpperCase().padStart(4, "0")}`;
   }
   return undefined;
@@ -593,6 +593,9 @@ function parseJob(opts: JobOptions, cfg: Config): ParsedJob {
     );
   const mode = pilot.mode;
   const label = checkText("--label", opts.label, { singleLine: true });
+  const labelBytes = Buffer.byteLength(label, "utf8");
+  if (labelBytes > MAX_LABEL_BYTES)
+    refuse(`--label is over ${MAX_LABEL_BYTES} bytes (${labelBytes})`);
   const budgetAtomic = parseBudget(opts.budget);
   const expirySeconds = parseExpiry(mode, opts.expiryDays, opts.expirySeconds);
   const resume = opts.resume === undefined ? undefined : parseCaseId("--resume", opts.resume);
@@ -648,10 +651,7 @@ async function job(
     now: deps.now,
     maxBudgetAtomic: ctx.cfg.maxJobBudget,
   };
-  const stage = {
-    mode: p.mode,
-    klerosScript: p.mode === "rehearsal" ? DEFAULT_SCRIPT : null,
-  };
+  const stage = { mode: p.mode };
   const { bytes, extension } = p.input.deliverable;
   const deliverable = {
     path: p.deliverablePath,

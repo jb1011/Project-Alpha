@@ -324,6 +324,12 @@ test.each<[string, Parameters<typeof setup>[0], Partial<CreatePilotJobInput>, Re
   ["a live expiry under a day", {}, { mode: "live", expirySeconds: 3_600 }, /expiry/],
   ["a live expiry over thirty days", {}, { mode: "live", expirySeconds: 2_592_001 }, /expiry/],
   ["a rehearsal expiry under two minutes", {}, { mode: "rehearsal", expirySeconds: 119 }, /expiry/],
+  [
+    "a rehearsal expiry over thirty days",
+    {},
+    { mode: "rehearsal", expirySeconds: 2_592_001 },
+    /expiry must be between 120 and 2592000 seconds in rehearsal mode/,
+  ],
 ])("pre-flight refuses when %s, and nothing is sent", async (_name, o, over, problem) => {
   const { node, cases, deps } = setup(o);
   const pre = await preflightPilotJob(deps, input(over));
@@ -341,6 +347,7 @@ test("the expiry bounds are inclusive, and rehearsal accepts two minutes", async
     ["testnet", 2_592_000],
     ["live", 86_400],
     ["rehearsal", 120],
+    ["rehearsal", 2_592_000],
   ] as const)
     expect((await preflightPilotJob(deps, input({ mode, expirySeconds }))).ok).toBe(true);
 });
@@ -702,20 +709,21 @@ test("a resume whose chain reads Open checks the balance and the time the job ha
   vi.spyOn(chain.job, "usdcBalanceOf").mockResolvedValueOnce(BUDGET + 499_999n);
   await expect(createPilotJob(deps, input(), row.caseId)).rejects.toThrow(/balance/);
 
-  setClock(row.expiredAt - 86_399);
+  setClock(row.expiredAt - 3_599);
   await expect(createPilotJob(deps, input(), row.caseId)).rejects.toThrow(/expiry/);
   expect(node.sends).toHaveLength(sent);
 
-  setClock(row.expiredAt - 86_400);
+  // A job with an hour left resumes, although an hour is under the minimum to create one.
+  setClock(row.expiredAt - 3_600);
   expect((await createPilotJob(deps, input(), row.caseId)).status).toBe("submitted");
 });
 
 test("a resume refuses a job with less time left than the minimum in words about the time left", async () => {
   const { node, deps, setClock, row } = await createdAfterRevertedFund();
   const sent = node.sends.length;
-  setClock(row.expiredAt - 86_399);
+  setClock(row.expiredAt - 3_599);
   await expect(createPilotJob(deps, input(), row.caseId)).rejects.toThrow(
-    `refusing to resume pilot case ${row.caseId}: job 1 has 86399 seconds left, under the minimum of 86400 for testnet mode; it waits for expiry and a refund`,
+    `refusing to resume pilot case ${row.caseId}: job 1 has 3599 seconds left, under the resume minimum of 3600 for testnet mode; it waits for expiry and a refund`,
   );
   expect(node.sends).toHaveLength(sent);
 });
@@ -1047,4 +1055,24 @@ test("a create whose receipt read failed takes the log's id on the resume", asyn
   expect(done).toMatchObject({ jobId: "3", status: "submitted", createdBlockTime: NOW });
   expect(node.hashesOf("createJob")).toHaveLength(1);
   expect(node.sends.length).toBeGreaterThan(sent);
+});
+
+test("a resume refused before the case is shown resumable carries no case id; one refused after does", async () => {
+  const { deps, cases, setClock } = setup({ stealAllowanceOnFund: true });
+  await expect(createPilotJob(deps, input())).rejects.toBeInstanceOf(JobFundRevertedError);
+  const [row] = cases.list();
+
+  const unknown = await createPilotJob(deps, input(), "pc_000000000000").catch((e) => e);
+  expect(unknown.message).toMatch(/no pilot case pc_000000000000/);
+  expect(pilotCaseIdOf(unknown)).toBeUndefined();
+  const otherMode = await createPilotJob(deps, input({ mode: "live" }), row!.caseId).catch(
+    (e) => e,
+  );
+  expect(otherMode.message).toMatch(/created in testnet mode/);
+  expect(pilotCaseIdOf(otherMode)).toBeUndefined();
+
+  setClock(row!.expiredAt - 60);
+  const late = await createPilotJob(deps, input(), row!.caseId).catch((e) => e);
+  expect(late.message).toMatch(/seconds left/);
+  expect(pilotCaseIdOf(late)).toBe(row!.caseId);
 });

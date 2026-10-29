@@ -256,13 +256,13 @@ const inputOf = (m: ReturnType<typeof vi.fn>, call = 0) =>
   m.mock.calls[call]?.[1] as CreatePilotJobInput;
 
 describe("pilot:job: the dry run", () => {
-  test("prints the pre-flight (mode, script, names, balance, expiry, hash) and creates nothing", async () => {
+  test("prints the pre-flight (mode, names, balance, expiry, hash) and creates nothing", async () => {
     const fake = makeFake();
     const out = await run(fake, jobArgs());
     const printed = JSON.parse(out);
     expect(printed.dryRun).toBe(true);
     expect(printed.mode).toBe("rehearsal");
-    expect(printed.klerosScript).toBe("pay");
+    expect(printed).not.toHaveProperty("klerosScript");
     expect(printed.buyer).toEqual({
       agentId: "11",
       address: ADDR.buyer,
@@ -315,11 +315,11 @@ describe("pilot:job: the dry run", () => {
     expect(fake.closed()).toBe(1);
   });
 
-  test("in testnet mode the output names the mode and no fake script", async () => {
+  test("in testnet mode the output names the mode and no script", async () => {
     const fake = makeFake({ mode: "testnet" });
     const printed = JSON.parse(await run(fake, jobArgs()));
     expect(printed.mode).toBe("testnet");
-    expect(printed.klerosScript).toBeNull();
+    expect(printed).not.toHaveProperty("klerosScript");
   });
 
   test("--resume in the dry run reads the case and sends nothing", async () => {
@@ -466,14 +466,14 @@ describe("pilot:job: options", () => {
 });
 
 describe("pilot:job --yes", () => {
-  test("creates the job and prints the row with the mode and the script", async () => {
+  test("creates the job and prints the row with the mode and no script", async () => {
     const fake = makeFake();
     const printed = JSON.parse(await run(fake, jobArgs(["--yes"])));
     expect(fake.createJob).toHaveBeenCalledTimes(1);
     expect(fake.createJob.mock.calls[0]?.[2]).toBeUndefined();
     expect(inputOf(fake.createJob).budgetAtomic).toBe(2_000_000n);
     expect(printed.mode).toBe("rehearsal");
-    expect(printed.klerosScript).toBe("pay");
+    expect(printed).not.toHaveProperty("klerosScript");
     expect(printed.case.status).toBe("submitted");
     expect(printed.note).toContain("Arc testnet");
   });
@@ -1305,5 +1305,73 @@ describe("pilot:case fail --force on a case whose filing started", () => {
     const forced = "forced: x (the case keeps its slot in the live cap count)";
     expect(fake.cases.events(row.caseId).at(-1)?.detail).toBe(forced);
     expect(printed.note).toContain(forced);
+  });
+});
+
+describe("free texts refuse every format character and the Hangul fillers", () => {
+  test.each([
+    ["the first-strong isolate", 0x2068],
+    ["the left-to-right isolate", 0x2066],
+    ["the pop directional isolate", 0x2069],
+    ["the soft hyphen", 0x00ad],
+    ["a Unicode tag character", 0xe0041],
+    ["the Hangul choseong filler", 0x115f],
+    ["the Hangul jungseong filler", 0x1160],
+    ["the Hangul filler", 0x3164],
+    ["the halfwidth Hangul filler", 0xffa0],
+  ])("%s in --label is refused by its code point", async (_n, c) => {
+    const fake = makeFake();
+    const args = jobArgs();
+    args[2] = `test${String.fromCodePoint(c)}case`;
+    const named = `U+${c.toString(16).toUpperCase().padStart(4, "0")}`;
+    await expect(run(fake, args)).rejects.toThrow(
+      `refusing: --label holds the invisible format character ${named}`,
+    );
+    expect(fake.opened()).toBe(0);
+  });
+
+  test("an isolate in a contest reason file is refused", async () => {
+    const fake = makeFake();
+    const bad = tempFile("bad.txt", `a text${String.fromCodePoint(0x2067)}b\n`);
+    await expect(
+      run(fake, ["pilot:contest", "--case", "pc_000000000000", "--reason-file", bad, "--yes"]),
+    ).rejects.toThrow(/--reason-file .* U\+2067/);
+  });
+});
+
+describe("pilot:job: the label limit and the resume hint", () => {
+  test("a label over 64 bytes is refused before the context opens; 64 bytes is accepted", async () => {
+    const fake = makeFake();
+    const args = jobArgs();
+    args[2] = "x".repeat(65);
+    await expect(run(fake, args)).rejects.toThrow("refusing: --label is over 64 bytes (65)");
+    expect(fake.opened()).toBe(0);
+    // Multibyte: 22 three-byte characters are 66 bytes.
+    args[2] = "\u20ac".repeat(22);
+    await expect(run(fake, args)).rejects.toThrow("refusing: --label is over 64 bytes (66)");
+    args[2] = "x".repeat(64);
+    await run(fake, args);
+    expect(fake.preflight).toHaveBeenCalledTimes(1);
+  });
+
+  test("a resume of an unknown case prints no resume hint", async () => {
+    const fake = makeFake();
+    // The real job creation: it refuses the unknown case before any chain read.
+    const { createJob: _stubbed, ...deps } = fake.deps;
+    fake.deps = deps;
+    const logs: string[] = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((m) => logs.push(String(m)));
+    const program = new Command();
+    program.exitOverride();
+    registerPilotCommands(program, fake.open, fake.deps);
+    try {
+      await expect(
+        program.parseAsync(["node", "cli", ...jobArgs(["--yes", "--resume", "pc_000000000000"])]),
+      ).rejects.toThrow(/no pilot case pc_000000000000/);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(logs.join("\n")).not.toContain("--resume");
+    expectNothingSent(fake);
   });
 });

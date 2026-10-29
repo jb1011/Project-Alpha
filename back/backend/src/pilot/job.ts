@@ -59,6 +59,11 @@ const MIN_EXPIRY_SECONDS = DAY;
 const MAX_EXPIRY_SECONDS = 30 * DAY;
 /** rehearsal: short enough to watch an expiry happen. */
 const MIN_REHEARSAL_EXPIRY_SECONDS = 120;
+/**
+ * testnet and live, on a resume: the job must have an hour left, so a step sent now lands well
+ * before the expiry. A day is the minimum to create a job, not to finish one.
+ */
+const MIN_RESUME_SECONDS_LEFT = 3_600;
 /** The job contract's status numbers. */
 const OPEN = 0;
 const FUNDED = 1;
@@ -162,10 +167,11 @@ async function checks(
 
 function expiryProblemOf(mode: PilotMode, seconds: number): string | undefined {
   if (!Number.isSafeInteger(seconds)) return "the expiry must be a whole number of seconds";
+  // Thirty days at most in every mode: a rehearsal job is a real job on Arc testnet too.
   if (mode === "rehearsal")
-    return seconds >= MIN_REHEARSAL_EXPIRY_SECONDS
+    return seconds >= MIN_REHEARSAL_EXPIRY_SECONDS && seconds <= MAX_EXPIRY_SECONDS
       ? undefined
-      : `the expiry must be at least ${MIN_REHEARSAL_EXPIRY_SECONDS} seconds in rehearsal (got ${seconds})`;
+      : `the expiry must be between ${MIN_REHEARSAL_EXPIRY_SECONDS} and ${MAX_EXPIRY_SECONDS} seconds in rehearsal mode (got ${seconds})`;
   return seconds >= MIN_EXPIRY_SECONDS && seconds <= MAX_EXPIRY_SECONDS
     ? undefined
     : `the expiry must be between ${MIN_EXPIRY_SECONDS} and ${MAX_EXPIRY_SECONDS} seconds in ${mode} mode (got ${seconds})`;
@@ -177,16 +183,19 @@ function timeLeftProblemOf(
   secondsLeft: number,
   jobId: bigint,
 ): string | undefined {
-  const minimum = mode === "rehearsal" ? MIN_REHEARSAL_EXPIRY_SECONDS : MIN_EXPIRY_SECONDS;
-  if (Number.isSafeInteger(secondsLeft) && secondsLeft < minimum)
-    return `job ${jobId} has ${Math.max(secondsLeft, 0)} seconds left, under the minimum of ${minimum} for ${mode} mode; it waits for expiry and a refund`;
-  return expiryProblemOf(mode, secondsLeft);
+  const minimum = mode === "rehearsal" ? MIN_REHEARSAL_EXPIRY_SECONDS : MIN_RESUME_SECONDS_LEFT;
+  if (!Number.isSafeInteger(secondsLeft)) return "the time left must be a whole number of seconds";
+  if (secondsLeft < minimum)
+    return `job ${jobId} has ${Math.max(secondsLeft, 0)} seconds left, under the resume minimum of ${minimum} for ${mode} mode; it waits for expiry and a refund`;
+  if (secondsLeft > MAX_EXPIRY_SECONDS)
+    return `job ${jobId} has ${secondsLeft} seconds left, over the maximum of ${MAX_EXPIRY_SECONDS}`;
+  return undefined;
 }
 
 /**
  * The case an error belongs to, once a row exists: `createPilotJob` sets it on whatever it
- * rethrows after the insert, and on every failure of a resume, so the caller can name the case
- * to resume. The error itself is the original, with its class and its hash.
+ * rethrows after the insert, and on every failure of a resume of a case shown resumable, so the
+ * caller can name the case to resume. The error itself is the original, with its class and its hash.
  */
 export function pilotCaseIdOf(e: unknown): string | undefined {
   const id = (e as { pilotCaseId?: unknown } | null)?.pilotCaseId;
@@ -207,8 +216,11 @@ export async function createPilotJob(
   resumeCaseId?: string,
 ): Promise<PilotCaseRecord> {
   if (resumeCaseId !== undefined) {
+    // The case id is attached only once the case is shown to exist, be resumable and be this
+    // mode's: a hint to resume an unknown or a finished case would send the operator in a loop.
+    const row = resumable(d, input, resumeCaseId);
     try {
-      return await resume(d, input, resumable(d, input, resumeCaseId));
+      return await resume(d, input, row);
     } catch (e) {
       throw withPilotCaseId(e, resumeCaseId);
     }
