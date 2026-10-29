@@ -33,7 +33,7 @@ import { mountMetadataRoutes } from "./routes/metadata";
 import { mountProtectedRoutes } from "./routes/onboard";
 import { mountPasskeyRoutes } from "./routes/passkey";
 import { mountPerTxCapRoutes } from "./routes/perTxCap";
-import { mountPilotCaseRoutes } from "./routes/pilotCases";
+import { type PilotCaseDeps, mountPilotCaseRoutes } from "./routes/pilotCases";
 import { mountPolicyRoutes } from "./routes/policy";
 import { mountProfileRoutes } from "./routes/profile";
 import { mountReputationRoutes } from "./routes/reputation";
@@ -304,7 +304,7 @@ export interface ApiDeps extends EntityViewDeps {
    * `GET /pilot/cases/:caseId`. Present only on a box with the pilot block or the Kleros block;
    * absent, neither route is mounted (404).
    */
-  pilotCases?: import("./routes/pilotCases").PilotCaseDeps;
+  pilotCases?: PilotCaseDeps;
   /**
    * The Hedera rail (design 2026-09-10). Present exactly when `HEDERA_ENABLED` produced a whole
    * `cfg.hedera` block; absent, the three MCP tools are NOT REGISTERED at all — not registered

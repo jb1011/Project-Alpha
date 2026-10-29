@@ -1,3 +1,4 @@
+import { basename } from "node:path";
 import type { Context, Hono } from "hono";
 import type { AuthVars } from "../../auth/middleware";
 import { opsLog } from "../../observability/opsLog";
@@ -26,9 +27,10 @@ import type { ByAgentAnswer } from "./legalBodyStatements";
  * (`pilot/views.ts`), which serves no key, no file path, no error text and no local dispute id.
  *
  * Mounted only where the deps exist (a box with the pilot block or the Kleros block); elsewhere
- * both routes are a 404. Both answers carry the statement routes' 15-second freshness, and the
- * list is memoised for the same window, so a page refreshing in a loop costs one read of the table
- * per window and filter. Every refusal is a short fixed sentence, `no-store`.
+ * both routes are a 404. Both answers carry the statement routes' 15-second freshness, and both
+ * are memoised for the same window (the list per filter, a case per case id, a case only once it
+ * has been served), so a page refreshing in a loop costs one read of the table and of the stored
+ * files per window, filter and case. Every refusal is a short fixed sentence, `no-store`.
  */
 export interface PilotCaseDeps {
   cases: PilotCaseRepository;
@@ -63,6 +65,10 @@ export type PilotCaseDetail = Omit<PilotCaseView, "evidence"> & {
 const CASES_LISTED = 100;
 /** One answer per filter: every mode, and each of the three. */
 const LIST_MEMO_ENTRIES = PILOT_MODES.length + 1;
+/** The most cases memoised at once; the pilot holds a handful. */
+const CASE_MEMO_ENTRIES = 128;
+/** The prefix of every file the pilot stores; this surface serves no other. */
+const PILOT_FILE_PREFIX = "pilot-";
 /** The case id `newCaseId` mints, and nothing else. */
 const CASE_ID = /^pc_[0-9a-f]{12}$/;
 
@@ -81,14 +87,24 @@ export function mountPilotCaseRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
   if (!pc) return;
   const now = () => (pc.now ?? deps.now ?? Date.now)();
   const memo = new AnswerMemo<PilotCaseList>(MEMO_TTL_MS, LIST_MEMO_ENTRIES, now);
+  const caseMemo = new AnswerMemo<PilotCaseDetail>(MEMO_TTL_MS, CASE_MEMO_ENTRIES, now);
   const viewOpts = { explorerBase: pc.explorerBase, lookupBase: pc.lookupBase };
 
-  /** A stored file's text; null when the row names none or it cannot be read. The reason never
-   *  reaches an answer: it would carry the path. */
+  /**
+   * A stored file's text; null when the row names none, names a file that is not the pilot's, or
+   * the file cannot be read. The reason never reaches an answer: it would carry the path.
+   *
+   * The store is flat, so a file is found by its name alone: a row holding the absolute path of a
+   * file in the store, or a value with `../` segments, names the file of that name in the store
+   * and never one outside it. Only a name that starts with `pilot-` is read: this surface is
+   * public and serves the pilot's own files, never another document the store holds.
+   */
   const readStored = async (id: string | null): Promise<string | null> => {
     if (id === null) return null;
+    const name = basename(id);
+    if (!name.startsWith(PILOT_FILE_PREFIX)) return null;
     try {
-      return (await pc.docStore.getBytesAsync(id)).toString("utf8");
+      return (await pc.docStore.getBytesAsync(name)).toString("utf8");
     } catch {
       return null;
     }
@@ -175,6 +191,11 @@ export function mountPilotCaseRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     const caseId = c.req.param("caseId");
     if (!CASE_ID.test(caseId)) return refuse(c, INVALID_CASE_ID, 400);
 
+    const hit = caseMemo.get(caseId);
+    if (hit !== undefined) {
+      c.header("Cache-Control", FRESH_CACHE_CONTROL);
+      return c.json(hit);
+    }
     let answer: PilotCaseDetail;
     try {
       const row = pc.cases.find(caseId);
@@ -192,6 +213,7 @@ export function mountPilotCaseRoutes(app: Hono<{ Variables: AuthVars }>, deps: A
     } catch (e) {
       return unavailable(c, e);
     }
+    caseMemo.set(caseId, answer);
     c.header("Cache-Control", FRESH_CACHE_CONTROL);
     return c.json(answer);
   });

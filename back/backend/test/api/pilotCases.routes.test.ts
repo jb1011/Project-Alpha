@@ -471,6 +471,174 @@ describe("GET /pilot/cases/:caseId", () => {
   });
 });
 
+describe("the stored files: the pilot's own, found by their file name in the store", () => {
+  /** Points a row's three stored-file columns at `values`. */
+  const pointAt = (caseId: string, values: { evidence: string; buyer: string; seller: string }) =>
+    cases.patch(caseId, {
+      evidencePath: values.evidence,
+      buyerRecordPath: values.buyer,
+      sellerRecordPath: values.seller,
+    });
+
+  test("an absolute path to a pilot file in the store is served exactly like its flat id", async () => {
+    const row = fullCase("testnet");
+    const ids = storedIdsOf(row.caseId);
+    // The flat ids the row holds.
+    const flat = await getJson(makeApp(), `/pilot/cases/${row.caseId}`);
+    expect(flat.res.status).toBe(200);
+    expect(flat.body.evidence.description).toBe(EVIDENCE_TEXT);
+    expect(flat.body.records).toEqual(RECORDS);
+    expect(flat.body.buyer.legalName).toBe(BUYER_NAME);
+    expect(flat.body.seller.standingAtFiling).toBe("active");
+
+    // The absolute paths the store's own writes answer, as a writer that kept them would store.
+    pointAt(row.caseId, {
+      evidence: docStore.put(ids.evidence, EVIDENCE_TEXT).path,
+      buyer: docStore.put(ids.buyerRecord, JSON.stringify(RECORDS.buyer)).path,
+      seller: docStore.put(ids.sellerRecord, JSON.stringify(RECORDS.seller)).path,
+    });
+    expect((cases.find(row.caseId) as PilotCaseRecord).evidencePath).toContain(dataDir);
+    const app = makeApp();
+    const absolute = await getJson(app, `/pilot/cases/${row.caseId}`);
+    expect(absolute.res.status).toBe(200);
+    expect(absolute.body).toEqual(flat.body);
+    const list = (await getJson(app, "/pilot/cases")).body;
+    expect(list.cases).toEqual([viewOf(cases.find(row.caseId) as PilotCaseRecord, RECORDS)]);
+    for (const answer of [absolute.body, list])
+      expect(JSON.stringify(answer)).not.toContain(dataDir);
+  });
+
+  test("a file whose name does not start with pilot-, though the store holds it, is served as absent", async () => {
+    const row = fullCase("testnet");
+    const OTHER_TEXT = "a document of another kind, never public";
+    const OTHER_NAME = "Other DAO LLC";
+    const otherAnswer = JSON.stringify(answerFor(BUYER_AGENT, OTHER_NAME));
+    const stored = {
+      evidence: docStore.put(`tenant-${row.caseId}-evidence.txt`, OTHER_TEXT),
+      buyer: docStore.put(`PILOT-${row.caseId}-buyer-record.json`, otherAnswer),
+      seller: docStore.put(`x-pilot-${row.caseId}-seller-record.json`, otherAnswer),
+    };
+    for (const by of ["id", "path"] as const) {
+      pointAt(row.caseId, {
+        evidence: stored.evidence[by],
+        buyer: stored.buyer[by],
+        seller: stored.seller[by],
+      });
+      const app = makeApp();
+      const { res, body } = await getJson(app, `/pilot/cases/${row.caseId}`);
+      expect(res.status, by).toBe(200);
+      expect(body.evidence.description, by).toBeNull();
+      expect(body.records, by).toEqual({ buyer: null, seller: null });
+      expect(body.buyer, by).toMatchObject({ legalName: null, standingAtFiling: null });
+      expect(body.seller, by).toMatchObject({ legalName: null, standingAtFiling: null });
+      const list = (await getJson(app, "/pilot/cases")).body;
+      expect(list.cases[0].buyer.legalName, by).toBeNull();
+      expect(list.cases[0].seller.legalName, by).toBeNull();
+      for (const answer of [body, list]) {
+        const text = JSON.stringify(answer);
+        for (const absent of [OTHER_TEXT, OTHER_NAME, dataDir])
+          expect(text, by).not.toContain(absent);
+      }
+    }
+  });
+
+  test("a value with ../ segments, or a path outside the store, serves only the pilot file of that name in the store, never a file outside it", async () => {
+    const row = fullCase("testnet");
+    const ids = storedIdsOf(row.caseId);
+    // Beside the store, not in it: files under the case's own names, and one the store lacks.
+    const OUTSIDE_TEXT = "a text outside the store";
+    const OUTSIDE_NAME = "Outside DAO LLC";
+    const beside = new FileDocumentStore(join(dataDir, "elsewhere"));
+    const evidence = beside.put(ids.evidence, OUTSIDE_TEXT);
+    const buyer = beside.put(
+      `pilot-${row.caseId}-not-in-the-store.json`,
+      JSON.stringify(answerFor(BUYER_AGENT, OUTSIDE_NAME)),
+    );
+    const seller = beside.put(
+      ids.sellerRecord,
+      JSON.stringify(answerFor(SELLER_AGENT, OUTSIDE_NAME)),
+    );
+    for (const values of [
+      {
+        evidence: `../elsewhere/${evidence.id}`,
+        buyer: `../elsewhere/${buyer.id}`,
+        seller: `../../${seller.id}`,
+      },
+      { evidence: evidence.path, buyer: buyer.path, seller: seller.path },
+    ]) {
+      pointAt(row.caseId, values);
+      const app = makeApp();
+      const { res, body } = await getJson(app, `/pilot/cases/${row.caseId}`);
+      expect(res.status, values.evidence).toBe(200);
+      // The store's own evidence text and seller record, under the names the values end in.
+      expect(body.evidence.description, values.evidence).toBe(EVIDENCE_TEXT);
+      expect(body.records, values.evidence).toEqual({ buyer: null, seller: RECORDS.seller });
+      expect(body.buyer.legalName, values.evidence).toBeNull();
+      expect(body.seller.legalName, values.evidence).toBe(SELLER_NAME);
+      const list = (await getJson(app, "/pilot/cases")).body;
+      expect(list.cases[0].seller.legalName, values.evidence).toBe(SELLER_NAME);
+      for (const answer of [body, list]) {
+        const text = JSON.stringify(answer);
+        for (const absent of [OUTSIDE_TEXT, OUTSIDE_NAME, dataDir, "elsewhere"])
+          expect(text, values.evidence).not.toContain(absent);
+      }
+    }
+  });
+});
+
+describe("GET /pilot/cases/:caseId: the memo", () => {
+  test("a case's 200 is memoised for 15 seconds, per case: a change inside the window is not seen", async () => {
+    const row = fullCase("testnet");
+    const other = fullCase("testnet");
+    const ids = storedIdsOf(row.caseId);
+    const app = makeApp();
+    const first = await getJson(app, `/pilot/cases/${row.caseId}`);
+    expect(first.res.status).toBe(200);
+    expect(first.body.evidence.description).toBe(EVIDENCE_TEXT);
+    // The stored file and the row change after the first answer.
+    docStore.put(ids.evidence, "a changed evidence text");
+    cases.patch(row.caseId, { jobId: "7" });
+    clock += 14_999;
+    const find = vi.spyOn(cases, "find");
+    const kept = await getJson(app, `/pilot/cases/${row.caseId}`);
+    expect(kept.res.status).toBe(200);
+    expect(kept.res.headers.get("cache-control")).toBe(FRESH);
+    expect(kept.body).toEqual(first.body);
+    expect(find).not.toHaveBeenCalled();
+    // Another case is its own entry, read now.
+    expect((await getJson(app, `/pilot/cases/${other.caseId}`)).body.caseId).toBe(other.caseId);
+    expect(find).toHaveBeenCalledTimes(1);
+    // Once the window has passed, the case is read again.
+    clock += 1;
+    const fresh = await getJson(app, `/pilot/cases/${row.caseId}`);
+    expect(fresh.res.headers.get("cache-control")).toBe(FRESH);
+    expect(fresh.body.evidence.description).toBe("a changed evidence text");
+    expect(fresh.body.jobId).toBe("7");
+    expect(find).toHaveBeenCalledTimes(2);
+  });
+
+  test("a 404 and a 503 are not memoised: the next read inside the window reads again", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const app = makeApp();
+    const caseId = "pc_00000000ffff";
+    expect((await getJson(app, `/pilot/cases/${caseId}`)).res.status).toBe(404);
+    cases.insert(newCase({ caseId, mode: "testnet" }));
+    const found = await getJson(app, `/pilot/cases/${caseId}`);
+    expect(found.res.status).toBe(200);
+    expect(found.body.caseId).toBe(caseId);
+
+    const later = freshCase("rehearsal");
+    const find = vi.spyOn(cases, "find").mockImplementationOnce(() => {
+      throw new Error("SQLITE_BUSY");
+    });
+    expect((await getJson(app, `/pilot/cases/${later.caseId}`)).res.status).toBe(503);
+    const again = await getJson(app, `/pilot/cases/${later.caseId}`);
+    expect(again.res.status).toBe(200);
+    expect(again.body.caseId).toBe(later.caseId);
+    expect(find).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe("both routes", () => {
   test("Cache-Control public, max-age=15 on every answer of both", async () => {
     const row = fullCase("testnet");
