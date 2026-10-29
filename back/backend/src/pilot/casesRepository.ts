@@ -49,7 +49,7 @@ export interface PilotCaseRepository {
    * dispute exists or may exist whatever the row says, so failing one frees no slot.
    */
   countFiled(mode: PilotMode): number;
-  /** Testnet rows at filed or later that carry a `seen_in_court` event: the live gate of design section 5.5 reads it. */
+  /** Testnet rows at filed or later that carry a `seen_in_court` event: the gate before a live filing reads it. */
   countSeenInCourt(mode: PilotMode): number;
   transaction<T>(fn: () => T): T;
 }
@@ -124,7 +124,7 @@ const COLUMN_OF = {
 const IDENTITY_FIELDS: ReadonlySet<string> = new Set(["mode", "chainId", "jobContract"]);
 
 /** The Kleros deployment of the case, written together by the `contested` to `filing` advance.
- *  Once `kleros_chain` is set, none of the three changes (design section 5.2). */
+ *  Once `kleros_chain` is set, none of the three changes: the deployment a case was filed on is part of its identity. */
 const KLEROS_DEPLOYMENT_FIELDS = ["klerosChain", "klerosCourtId", "klerosPolicyUri"] as const;
 
 /** The row as SQLite returns it: one property per column, snake_case. */
