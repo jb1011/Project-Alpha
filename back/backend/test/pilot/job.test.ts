@@ -1042,7 +1042,7 @@ test("when the log names the simulated id, the row keeps it and records nothing 
   expect(cases.events(row.caseId).some((e) => e.status === "job_id_from_log")).toBe(false);
 });
 
-test("a create whose receipt read failed takes the log's id on the resume", async () => {
+test("a create whose block read failed takes the log's id on the resume", async () => {
   const { cases, deps, chain, node } = setup({ emitJobCreatedLog: true, skewJobCreatedId: 2n });
   const getBlock = chain.publicClient.getBlock.bind(chain.publicClient);
   vi.spyOn(chain.publicClient, "getBlock").mockImplementationOnce(async () => {
@@ -1195,4 +1195,27 @@ test("a create that fails without a hash is marked as possibly sent; a refused p
   expect(createMayHaveBeenSent(await createPilotJob(reverted.deps, input()).catch((e) => e))).toBe(
     false,
   );
+});
+
+test("a resume given --submit-tx while the job is Open refuses before anything is sent", async () => {
+  const { node, deps, cases, row } = await createdAfterRevertedFund();
+  expect(node.chainJob(1n)?.status).toBe(0);
+  const sent = node.sends.length;
+  await expect(
+    createPilotJob(deps, input({ givenTx: { submit: `0x${"ab".repeat(32)}` as Hex } }), row.caseId),
+  ).rejects.toThrow(
+    `refusing to continue pilot case ${row.caseId}: job 1 is Open on chain, not Submitted, so a submit cannot be adopted for it: run the resume without --submit-tx`,
+  );
+  expect(node.sends).toHaveLength(sent);
+  expect(cases.find(row.caseId)?.status).toBe("created");
+});
+
+test("a resume given --submit-tx while the job is Funded refuses before anything is sent", async () => {
+  const { node, deps, row } = await createdAfterRevertedFund();
+  node.chainJob(1n)!.status = 1;
+  const sent = node.sends.length;
+  await expect(
+    createPilotJob(deps, input({ givenTx: { submit: `0x${"ab".repeat(32)}` as Hex } }), row.caseId),
+  ).rejects.toThrow(/job 1 is Funded on chain, not Submitted, so a submit cannot be adopted/);
+  expect(node.sends).toHaveLength(sent);
 });

@@ -874,6 +874,8 @@ function failCase(
   reason: string,
   force: boolean,
   yes: boolean,
+  /** Unix seconds: the filing time a guarded row without one is given. */
+  now: number,
 ): Record<string, unknown> {
   const row = findCase(ctx, caseId);
   if (row.status === "settled") refuse(`pilot case ${caseId} is settled, which is final`);
@@ -881,7 +883,7 @@ function failCase(
   const guarded = FILED.has(row.status) && row.mode !== "rehearsal";
   if (guarded && !force)
     refuse(
-      `pilot case ${caseId} is at ${row.status} in ${row.mode} mode, so its dispute exists or may exist on Kleros (${klerosIdsOf(row)}); marking the row failed changes nothing there${row.filingStartedAt === null ? " and takes the case out of the mode's cap count" : ""}: pass --force to mark it failed anyway`,
+      `pilot case ${caseId} is at ${row.status} in ${row.mode} mode, so its dispute exists or may exist on Kleros (${klerosIdsOf(row)}); marking the row failed changes nothing there: pass --force to mark it failed anyway`,
     );
   if (!yes)
     return {
@@ -898,14 +900,17 @@ function failCase(
     : null;
   // A forced fail leaves a trace: the event says the guard was overridden and what it cost.
   const stated = escrow === null ? reason : `${reason}; ${escrow}`;
-  // A case whose filing started keeps its slot in the cap count after a fail (`countFiled`).
-  const capEffect =
-    row.filingStartedAt === null
-      ? `the case leaves the ${row.mode} cap count, since its filing never started`
-      : `the case keeps its slot in the ${row.mode} cap count`;
-  const detail = guarded ? `forced: ${stated} (${capEffect})` : stated;
+  // A failed case whose filing started keeps its slot in the cap count (`countFiled`). A guarded
+  // row is filed or later, so its filing did start: a missing time is stamped with the fail.
+  const detail = guarded
+    ? `forced: ${stated} (the case keeps its slot in the ${row.mode} cap count)`
+    : stated;
+  const filingStamp = guarded && row.filingStartedAt === null ? { filingStartedAt: now } : {};
   const next = ctx.cases.transaction(() => {
-    const moved = ctx.cases.advance(caseId, row.status, "failed", { error: reason });
+    const moved = ctx.cases.advance(caseId, row.status, "failed", {
+      error: reason,
+      ...filingStamp,
+    });
     if (!moved) refuse(`pilot case ${caseId} moved from ${row.status} while this command ran`);
     ctx.cases.recordEvent(caseId, "failed", "ok", null, detail);
     return moved;
@@ -1110,7 +1115,7 @@ export function registerPilotCommands(
       const id = parseCaseId("the case id", caseId);
       const reason = checkText("--reason", opts.reason);
       await withPilot(open, async (ctx) =>
-        print(failCase(ctx, id, reason, !!opts.force, !!opts.yes)),
+        print(failCase(ctx, id, reason, !!opts.force, !!opts.yes, deps.now())),
       );
     });
 }

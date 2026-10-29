@@ -463,16 +463,14 @@ async function continueCase(
   while (row.status !== "submitted") {
     const onChain = await chainStatusOf(d, row);
     // A hash given for a step the chain says has not happened names nothing to adopt, and the
-    // step would be sent again: refuse rather than send beside it.
-    const unlanded =
-      row.status === "created" && onChain === OPEN && input.givenTx?.fund !== undefined
-        ? "fund"
-        : row.status === "funded" && onChain === FUNDED && input.givenTx?.submit !== undefined
-          ? "submit"
-          : undefined;
-    if (unlanded)
+    // steps before it would be sent: refuse before anything is sent.
+    if (input.givenTx?.fund !== undefined && onChain === OPEN)
       throw new Error(
-        `refusing to continue pilot case ${row.caseId}: job ${jobId} is ${onChain === OPEN ? "Open" : "Funded"} on chain, so no ${unlanded} landed: run the resume without --${unlanded}-tx`,
+        `refusing to continue pilot case ${row.caseId}: job ${jobId} is Open on chain, so no fund landed: run the resume without --fund-tx`,
+      );
+    if (input.givenTx?.submit !== undefined && onChain < SUBMITTED)
+      throw new Error(
+        `refusing to continue pilot case ${row.caseId}: job ${jobId} is ${onChain === OPEN ? "Open" : "Funded"} on chain, not Submitted, so a submit cannot be adopted for it: run the resume without --submit-tx`,
       );
     if (row.status === "created" && onChain === OPEN) row = await budgetAndFund(d, row, jobId);
     else if (row.status === "created" && onChain === FUNDED)

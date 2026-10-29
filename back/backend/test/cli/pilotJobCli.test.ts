@@ -888,7 +888,10 @@ describe("pilot:case fail: the cap's statuses need --force to fail", () => {
           await run(fake, ["pilot:case", "fail", row.caseId, "--reason", "x", "--force", "--yes"]),
         );
         expect(fake.cases.find(row.caseId)?.status).toBe("failed");
-        const forced = `forced: x (the case leaves the ${mode} cap count, since its filing never started)`;
+        // The row had no filing time: the forced fail stamps one, so the slot stays used.
+        expect(fake.cases.countFiled(mode)).toBe(before);
+        expect(fake.cases.find(row.caseId)?.filingStartedAt).toBe(NOW);
+        const forced = `forced: x (the case keeps its slot in the ${mode} cap count)`;
         expect(fake.cases.events(row.caseId).at(-1)?.detail).toBe(forced);
         expect(printed.note).toContain(forced);
       },
@@ -1418,5 +1421,28 @@ describe("pilot:job --yes: a create that failed without a hash", () => {
       spy.mockRestore();
     }
     expect(logs).toEqual([]);
+  });
+});
+
+describe("pilot:case fail --force on a filed live case with no filing time", () => {
+  test("keeps countFiled unchanged and says the slot stays used", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { mode: "live", status: "filed", patch: FILED_LIVE });
+    expect(row.filingStartedAt).toBeNull();
+    expect(fake.cases.countFiled("live")).toBe(1);
+    await run(fake, ["pilot:case", "fail", row.caseId, "--reason", "x", "--force", "--yes"]);
+    expect(fake.cases.countFiled("live")).toBe(1);
+    expect(fake.cases.events(row.caseId).at(-1)?.detail).toBe(
+      "forced: x (the case keeps its slot in the live cap count)",
+    );
+    expect(fake.cases.events(row.caseId).at(-1)?.detail).not.toContain("never started");
+  });
+
+  test("a case that is not guarded gets no filing time", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { mode: "testnet", status: "contested" });
+    await run(fake, ["pilot:case", "fail", row.caseId, "--reason", "x", "--yes"]);
+    expect(fake.cases.find(row.caseId)?.filingStartedAt).toBeNull();
+    expect(fake.cases.countFiled("testnet")).toBe(0);
   });
 });
