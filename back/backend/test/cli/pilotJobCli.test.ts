@@ -880,7 +880,7 @@ describe("pilot:case fail: the cap's statuses need --force to fail", () => {
           await run(fake, ["pilot:case", "fail", row.caseId, "--reason", "x", "--force", "--yes"]),
         );
         expect(fake.cases.find(row.caseId)?.status).toBe("failed");
-        const forced = `forced: x (the case leaves the ${mode} cap count)`;
+        const forced = `forced: x (the case leaves the ${mode} cap count, since its filing never started)`;
         expect(fake.cases.events(row.caseId).at(-1)?.detail).toBe(forced);
         expect(printed.note).toContain(forced);
       },
@@ -1276,5 +1276,34 @@ describe("pilot:job --resume with the hash of a step the case lost", () => {
       /pass them with --resume/,
     );
     expect(fake.opened()).toBe(0);
+  });
+});
+
+describe("pilot:case fail --force on a case whose filing started", () => {
+  test("a forced live fail keeps the case's slot in the cap count, and says so", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, {
+      mode: "live",
+      status: "filed",
+      patch: { ...FILED_LIVE, filingStartedAt: NOW },
+    });
+    expect(fake.cases.countFiled("live")).toBe(1);
+    const refusal = await run(fake, [
+      "pilot:case",
+      "fail",
+      row.caseId,
+      "--reason",
+      "x",
+      "--yes",
+    ]).catch((e) => e as Error);
+    expect(String((refusal as Error).message)).toMatch(/changes nothing there: pass --force/);
+    const printed = JSON.parse(
+      await run(fake, ["pilot:case", "fail", row.caseId, "--reason", "x", "--force", "--yes"]),
+    );
+    expect(fake.cases.find(row.caseId)?.status).toBe("failed");
+    expect(fake.cases.countFiled("live")).toBe(1);
+    const forced = "forced: x (the case keeps its slot in the live cap count)";
+    expect(fake.cases.events(row.caseId).at(-1)?.detail).toBe(forced);
+    expect(printed.note).toContain(forced);
   });
 });

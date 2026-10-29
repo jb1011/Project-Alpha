@@ -43,7 +43,11 @@ export interface PilotCaseRepository {
     detail: string | null;
     createdAt: string;
   }[];
-  /** Rows of `mode` that count against that mode's cap: status in filing, filed, ruled, settling, settled, filing_unknown, evidence_unknown. */
+  /**
+   * Rows of `mode` that count against that mode's cap: status in filing, filed, ruled, settling,
+   * settled, filing_unknown, evidence_unknown, and failed rows whose filing started, since their
+   * dispute exists or may exist whatever the row says, so failing one frees no slot.
+   */
   countFiled(mode: PilotMode): number;
   /** Testnet rows at filed or later that carry a `seen_in_court` event: the live gate of design section 5.5 reads it. */
   countSeenInCourt(mode: PilotMode): number;
@@ -192,7 +196,7 @@ export class SqlitePilotCaseRepository implements PilotCaseRepository {
       ),
       countFiled: db
         .prepare(
-          `SELECT COUNT(*) FROM pilot_cases WHERE mode = ? AND status IN ${FILED_STATUSES_SQL}`,
+          `SELECT COUNT(*) FROM pilot_cases WHERE mode = ? AND (status IN ${FILED_STATUSES_SQL} OR (status = 'failed' AND filing_started_at IS NOT NULL))`,
         )
         .pluck(),
       countSeenInCourt: db

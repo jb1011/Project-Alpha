@@ -870,7 +870,7 @@ function failCase(
   const guarded = FILED.has(row.status) && row.mode !== "rehearsal";
   if (guarded && !force)
     refuse(
-      `pilot case ${caseId} is at ${row.status} in ${row.mode} mode, so its dispute exists or may exist on Kleros (${klerosIdsOf(row)}); marking the row failed changes nothing there and takes the case out of the mode's cap count: pass --force to mark it failed anyway`,
+      `pilot case ${caseId} is at ${row.status} in ${row.mode} mode, so its dispute exists or may exist on Kleros (${klerosIdsOf(row)}); marking the row failed changes nothing there${row.filingStartedAt === null ? " and takes the case out of the mode's cap count" : ""}: pass --force to mark it failed anyway`,
     );
   if (!yes)
     return {
@@ -887,7 +887,12 @@ function failCase(
     : null;
   // A forced fail leaves a trace: the event says the guard was overridden and what it cost.
   const stated = escrow === null ? reason : `${reason}; ${escrow}`;
-  const detail = guarded ? `forced: ${stated} (the case leaves the ${row.mode} cap count)` : stated;
+  // A case whose filing started keeps its slot in the cap count after a fail (`countFiled`).
+  const capEffect =
+    row.filingStartedAt === null
+      ? `the case leaves the ${row.mode} cap count, since its filing never started`
+      : `the case keeps its slot in the ${row.mode} cap count`;
+  const detail = guarded ? `forced: ${stated} (${capEffect})` : stated;
   const next = ctx.cases.transaction(() => {
     const moved = ctx.cases.advance(caseId, row.status, "failed", { error: reason });
     if (!moved) refuse(`pilot case ${caseId} moved from ${row.status} while this command ran`);
