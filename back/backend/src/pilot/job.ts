@@ -1,5 +1,12 @@
 import { Buffer } from "node:buffer";
-import { type Hex, decodeFunctionData, keccak256, parseEventLogs } from "viem";
+import {
+  BaseError,
+  ContractFunctionRevertedError,
+  type Hex,
+  decodeFunctionData,
+  keccak256,
+  parseEventLogs,
+} from "viem";
 import { iErc8183JobAbi, iIdentityRegistryAbi } from "../abis/generated";
 import {
   ChainTxRevertedError,
@@ -140,13 +147,31 @@ async function checks(
         functionName: "ownerOf",
         args: [BigInt(agentId)],
       })) as string;
-    } catch {
-      return refuse(`the ${role}'s agent ${agentId} has no owner in the identity registry`);
+    } catch (e) {
+      // A revert is the registry's answer (no such agent); anything else is a failed read.
+      if (isRevert(e))
+        return refuse(`the ${role}'s agent ${agentId} has no owner in the identity registry`);
+      return refuse(
+        `the ${role}'s agent ${agentId}'s owner could not be read from the identity registry: ${publicErrorMessage(e)}`,
+      );
     }
     if (owner.toLowerCase() !== expected.toLowerCase())
       return refuse(
         `the ${role}'s agent ${agentId} is owned by ${owner}, not by the ${role}'s address ${expected}`,
       );
+  }
+
+  // The seller sends setBudget and submit, and the referee settles later: each needs gas.
+  for (const role of ["seller", "referee"] as const) {
+    const address = d.chain.addresses[role];
+    let gas: bigint;
+    try {
+      gas = await d.chain.publicClient.getBalance({ address });
+    } catch (e) {
+      return refuse(`the ${role}'s gas balance could not be read: ${publicErrorMessage(e)}`);
+    }
+    if (gas === 0n)
+      return refuse(`the ${role}'s address ${address} holds no gas to send its transactions`);
   }
 
   if (!o.balance)
@@ -163,6 +188,14 @@ async function checks(
       `the buyer's USDC balance ${buyerBalance} is below the budget plus 0.5 USDC (${needed}, atomic)`,
     );
   return { ok: true, buyerBalance, buyerName: names.buyer, sellerName: names.seller };
+}
+
+/** A contract call the chain answered with a revert, as opposed to a read that failed. */
+function isRevert(e: unknown): boolean {
+  if (!(e instanceof BaseError)) return false;
+  if (e.walk((x) => x instanceof ContractFunctionRevertedError)) return true;
+  // A node that reports the revert only in its message, as some RPC proxies do.
+  return /execution reverted/i.test(e.message);
 }
 
 function expiryProblemOf(mode: PilotMode, seconds: number): string | undefined {
@@ -209,6 +242,23 @@ export function withPilotCaseId<E>(e: E, caseId: string): E {
   return e;
 }
 
+/**
+ * Whether `e` is a create that failed without a hash after the pre-flight passed: the
+ * transaction may have been sent, and no row records it, so the caller warns before a re-run.
+ */
+export function createMayHaveBeenSent(e: unknown): boolean {
+  return (
+    (e as { pilotCreateMayHaveBeenSent?: unknown } | null)?.pilotCreateMayHaveBeenSent === true
+  );
+}
+
+/** Marks `e` as a create that may have been sent (see `createMayHaveBeenSent`) and returns it. */
+export function withCreateMayHaveBeenSent<E>(e: E): E {
+  if (typeof e === "object" && e !== null && Object.isExtensible(e))
+    Object.defineProperty(e, "pilotCreateMayHaveBeenSent", { value: true, enumerable: false });
+  return e;
+}
+
 /** Pre-flight, then create, budget and fund, submit; resumable from created and funded. */
 export async function createPilotJob(
   d: PilotJobDeps,
@@ -233,13 +283,20 @@ export async function createPilotJob(
   const caseId = newCaseId();
   const expiredAt = (d.now ?? unixNow)() + input.expirySeconds;
   // No row exists before the job does: a failed createJob leaves nothing to resume, and its
-  // error carries the hash when one was sent.
-  const { jobId, txHash } = await chain.job.createJob({
-    provider: chain.addresses.seller,
-    evaluator: chain.addresses.referee,
-    expiredAt: BigInt(expiredAt),
-    description: input.description,
-  });
+  // error carries the hash when one was sent. One without a hash may still have been sent.
+  let created: { jobId: bigint; txHash: Hex };
+  try {
+    created = await chain.job.createJob({
+      provider: chain.addresses.seller,
+      evaluator: chain.addresses.referee,
+      expiredAt: BigInt(expiredAt),
+      description: input.description,
+    });
+  } catch (e) {
+    const hashed = e instanceof ChainTxRevertedError || e instanceof ChainTxUnconfirmedError;
+    throw hashed ? e : withCreateMayHaveBeenSent(e);
+  }
+  const { jobId, txHash } = created;
   // The row and its hash are written before anything else is read, so a failure after this point
   // leaves a case to resume rather than a job nobody recorded.
   d.cases.transaction(() => {

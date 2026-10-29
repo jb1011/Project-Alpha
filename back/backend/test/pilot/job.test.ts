@@ -31,6 +31,7 @@ import type { PilotContext } from "../../src/pilot/context";
 import {
   type CreatePilotJobInput,
   type PilotJobDeps,
+  createMayHaveBeenSent,
   createPilotJob,
   pilotCaseIdOf,
   preflightPilotJob,
@@ -88,6 +89,7 @@ function setup(
     skewJobSubmittedLog?: { deliverable?: Hex; provider?: Address };
     emitJobCreatedLog?: boolean;
     skewJobCreatedId?: bigint;
+    gas?: Record<string, bigint>;
   } = {},
 ) {
   /** The clock in seconds, shared by the node and the job; a test moves it with `setClock`. */
@@ -101,6 +103,8 @@ function setup(
     omitSubmittedLog: o.omitSubmittedLog,
     skewJobSubmittedLog: o.skewJobSubmittedLog,
     emitJobCreatedLog: o.emitJobCreatedLog,
+    // Every party holds gas unless a test says otherwise.
+    nativeBalanceOf: (a) => o.gas?.[a.toLowerCase()] ?? 10n ** 18n,
     skewJobCreatedId: o.skewJobCreatedId,
     // A submit is adopted from its transaction, so the node answers what it accepted.
     answerTransactions: true,
@@ -1129,4 +1133,66 @@ test("a recorded submit hash that submits another job is refused, naming both jo
     new RegExp(`${other} submits job 2, not job 1`),
   );
   expect(cases.find(row.caseId)?.status).toBe("funded");
+});
+
+// ── Gas, owners and a create that may have been sent ────────────────────────────────────────────
+
+test.each([
+  ["seller", SELLER],
+  ["referee", REFEREE],
+] as const)(
+  "pre-flight refuses when the %s holds no gas, naming the address",
+  async (role, address) => {
+    const { node, deps } = setup({ gas: { [address.toLowerCase()]: 0n } });
+    const pre = await preflightPilotJob(deps, input());
+    expect(pre).toEqual({
+      ok: false,
+      problem: `the ${role}'s address ${address} holds no gas to send its transactions`,
+    });
+    expect(node.sends).toEqual([]);
+  },
+);
+
+test("pre-flight returns a problem when a gas balance cannot be read", async () => {
+  const { chain, deps } = setup();
+  vi.spyOn(chain.publicClient, "getBalance").mockRejectedValueOnce(new Error("fetch failed"));
+  const pre = await preflightPilotJob(deps, input());
+  expect(pre.ok === false && pre.problem).toMatch(/^the seller's gas balance could not be read/);
+});
+
+test("an ownerOf that reverts reads as no owner; one that fails on the network does not", async () => {
+  const { chain, deps } = setup({ owners: { [BUYER_AGENT]: BUYER } });
+  const reverted = await preflightPilotJob(deps, input());
+  expect(reverted.ok === false && reverted.problem).toBe(
+    `the seller's agent ${SELLER_AGENT} has no owner in the identity registry`,
+  );
+
+  vi.spyOn(chain.publicClient, "readContract").mockRejectedValueOnce(new Error("fetch failed"));
+  const network = await preflightPilotJob(deps, input());
+  expect(network.ok === false && network.problem).toMatch(
+    new RegExp(
+      `^the buyer's agent ${BUYER_AGENT}'s owner could not be read from the identity registry`,
+    ),
+  );
+});
+
+test("a create that fails without a hash is marked as possibly sent; a refused pre-flight is not", async () => {
+  const { chain, deps, cases } = setup();
+  vi.spyOn(chain.job, "createJob").mockRejectedValueOnce(new Error("the node dropped the request"));
+  const failed = await createPilotJob(deps, input()).catch((e) => e);
+  expect(createMayHaveBeenSent(failed)).toBe(true);
+  expect(cases.list()).toEqual([]);
+
+  const refused = await createPilotJob(deps, input({ budgetAtomic: 0n })).catch((e) => e);
+  expect(refused.message).toMatch(/refusing to create the pilot job/);
+  expect(createMayHaveBeenSent(refused)).toBe(false);
+
+  const reverted = setup();
+  vi.spyOn(reverted.chain.job, "createJob").mockRejectedValueOnce(
+    new ChainTxRevertedError("createJob", `0x${"57".repeat(32)}` as Hex),
+  );
+  // An error with a hash is reported by its hash, not by this mark.
+  expect(createMayHaveBeenSent(await createPilotJob(reverted.deps, input()).catch((e) => e))).toBe(
+    false,
+  );
 });

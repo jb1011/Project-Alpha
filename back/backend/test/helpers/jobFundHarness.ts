@@ -203,6 +203,11 @@ export interface UsdcJobNodeOptions {
    */
   skewJobCreatedId?: bigint;
   /**
+   * Answer `eth_getBalance` with the address's native (gas) balance. Off by default, where the
+   * node refuses the call as one it does not expect, as before.
+   */
+  nativeBalanceOf?: (address: Address) => bigint;
+  /**
    * Answer `eth_getTransactionByHash` with the transaction the node accepted under that hash
    * (pending, with no block, while its receipt is withheld). Off by default, where the node
    * answers null to every hash, as before.
@@ -468,6 +473,11 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
       case "eth_call": {
         const [{ to, data }] = params as [{ to?: Address; data?: Hex }];
         return call(to, data);
+      }
+      case "eth_getBalance": {
+        if (!opts.nativeBalanceOf) throw new Error(`unexpected RPC call ${method}`);
+        const [address] = params as [Address];
+        return `0x${opts.nativeBalanceOf(address).toString(16)}`;
       }
       case "eth_getTransactionCount": {
         const address = ((params as string[])[0] ?? "").toLowerCase();

@@ -140,6 +140,16 @@ test("the buyer creates and funds, the seller submits, and the Submitted log car
     sellerName: "Seller Agent DAO LLC",
   });
 
+  // A real revert of ownerOf (no such agent) reads as no owner, not as a read failure.
+  const unknownAgent = await preflightPilotJob(
+    { ...deps, agentIds: { ...agentIds, seller: "999" } },
+    input,
+  );
+  expect(unknownAgent).toEqual({
+    ok: false,
+    problem: "the seller's agent 999 has no owner in the identity registry",
+  });
+
   const before = await env.usdcBalanceOf(env.clientAddr);
   const row = await createPilotJob(deps, input);
 

@@ -39,6 +39,7 @@ import { type PilotContext, openPilotContext } from "../pilot/context";
 import {
   type CreatePilotJobInput,
   type PilotJobDeps,
+  createMayHaveBeenSent,
   createPilotJob,
   pilotCaseIdOf,
   preflightPilotJob,
@@ -728,7 +729,17 @@ async function job(
             : `wait until the transaction is mined or dropped, then ${resume}`,
         note: PILOT_NOTE,
       });
-    } else if (txHash !== undefined)
+    } else if (txHash === undefined && createMayHaveBeenSent(e))
+      // No hash and no row: nothing records whether the create reached the chain.
+      print({
+        failed: true,
+        ...stage,
+        caseId: null,
+        error,
+        warning: "it may have been sent: check the buyer's latest transactions before re-running",
+        note: PILOT_NOTE,
+      });
+    else if (txHash !== undefined)
       // A failed createJob leaves no row, so its hash is printed here or nowhere.
       print({
         failed: true,

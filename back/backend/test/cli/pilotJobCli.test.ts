@@ -39,7 +39,11 @@ import {
   newCaseId,
 } from "../../src/pilot/casesRepository";
 import type { PilotContext } from "../../src/pilot/context";
-import { type CreatePilotJobInput, withPilotCaseId } from "../../src/pilot/job";
+import {
+  type CreatePilotJobInput,
+  withCreateMayHaveBeenSent,
+  withPilotCaseId,
+} from "../../src/pilot/job";
 import type { PilotCaseRecord, PilotMode, PilotStatus } from "../../src/pilot/types";
 
 // Anvil's well-known throwaway keys (accounts 1, 2, 3): never real.
@@ -120,7 +124,11 @@ function makeFake(
       sellerAgentId: o.agentIds?.seller,
     },
   } as unknown as Config;
-  const pub = { readContract: vi.fn(), getTransactionReceipt: vi.fn() };
+  const pub = {
+    readContract: vi.fn(),
+    getTransactionReceipt: vi.fn(),
+    getBalance: vi.fn(async () => 10n ** 18n),
+  };
   let closes = 0;
   const ctx = {
     cfg,
@@ -1376,5 +1384,39 @@ describe("pilot:job: the label limit and the resume hint", () => {
     }
     expect(logs.join("\n")).not.toContain("--resume");
     expectNothingSent(fake);
+  });
+});
+
+describe("pilot:job --yes: a create that failed without a hash", () => {
+  test("prints a warning to check the buyer's latest transactions before re-running", async () => {
+    const fake = makeFake();
+    const { printed } = await failingJob(
+      fake,
+      withCreateMayHaveBeenSent(new Error("the node dropped the request")),
+    );
+    expect(printed).toMatchObject({
+      failed: true,
+      caseId: null,
+      warning: "it may have been sent: check the buyer's latest transactions before re-running",
+    });
+    expect(printed).not.toHaveProperty("txHash");
+  });
+
+  test("a refusal before anything was sent prints nothing", async () => {
+    const fake = makeFake();
+    fake.createJob.mockRejectedValueOnce(new Error("refusing to create the pilot job: x"));
+    const logs: string[] = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((m) => logs.push(String(m)));
+    const program = new Command();
+    program.exitOverride();
+    registerPilotCommands(program, fake.open, fake.deps);
+    try {
+      await expect(program.parseAsync(["node", "cli", ...jobArgs(["--yes"])])).rejects.toThrow(
+        /refusing to create/,
+      );
+    } finally {
+      spy.mockRestore();
+    }
+    expect(logs).toEqual([]);
   });
 });
