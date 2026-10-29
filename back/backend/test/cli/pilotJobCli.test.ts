@@ -141,8 +141,8 @@ function makeFake(
       o.preflight ?? {
         ok: true,
         buyerBalance: 5_250_000n,
-        buyerName: "Buyer Test Agent LLC",
-        sellerName: "Seller Test Agent LLC",
+        buyerName: "Buyer Test Agent DAO LLC",
+        sellerName: "Seller Test Agent DAO LLC",
       },
   );
   const createJob = vi.fn(async (_d: unknown, input: CreatePilotJobInput) =>
@@ -266,9 +266,9 @@ describe("pilot:job: the dry run", () => {
     expect(printed.buyer).toEqual({
       agentId: "11",
       address: ADDR.buyer,
-      legalName: "Buyer Test Agent LLC",
+      legalName: "Buyer Test Agent DAO LLC",
     });
-    expect(printed.seller.legalName).toBe("Seller Test Agent LLC");
+    expect(printed.seller.legalName).toBe("Seller Test Agent DAO LLC");
     expect(printed.buyerBalanceAtomic).toBe("5250000");
     expect(printed.budgetAtomic).toBe("2000000");
     expect(printed.expirySeconds).toBe(7 * 86_400);
@@ -710,11 +710,11 @@ describe("pilot:case seen-in-court", () => {
     const fake = makeFake();
     const row = insertCase(fake.cases, { mode: "testnet", status: "filed", patch: FILED_TESTNET });
     const printed = JSON.parse(
-      await run(fake, ["pilot:case", "seen-in-court", row.caseId, "--by", "Alex", "--yes"]),
+      await run(fake, ["pilot:case", "seen-in-court", row.caseId, "--by", "operator", "--yes"]),
     );
     expect(printed.courtUrl).toBe(COURT_URL);
     expect(fake.cases.events(row.caseId)).toMatchObject([
-      { step: "seen_in_court", status: "ok", ref: COURT_URL, detail: "by Alex" },
+      { step: "seen_in_court", status: "ok", ref: COURT_URL, detail: "by operator" },
     ]);
     expect(fake.cases.countSeenInCourt("testnet")).toBe(1);
   });
@@ -993,11 +993,11 @@ describe("agent ids, resume, sends and the Court", () => {
       patch: { klerosChain: "arbitrum-one", coreDisputeId: "287", localDisputeId: "1" },
     });
     const printed = JSON.parse(
-      await run(fake, ["pilot:case", "seen-in-court", row.caseId, "--by", "Martin", "--yes"]),
+      await run(fake, ["pilot:case", "seen-in-court", row.caseId, "--by", "operator", "--yes"]),
     );
     expect(printed.courtUrl).toBe("https://v2.kleros.builders/#/cases/287/overview");
     expect(fake.cases.events(row.caseId)).toMatchObject([
-      { step: "seen_in_court", status: "ok", detail: "by Martin" },
+      { step: "seen_in_court", status: "ok", detail: "by operator" },
     ]);
     expect(fake.cases.countSeenInCourt("live")).toBe(1);
   });
@@ -1009,7 +1009,10 @@ describe("pilot:job: the default pre-flight wiring", () => {
     // Only the pre-flight is left at its default: the chain and the lookup are built from ctx.
     const { preflight: _stubbed, ...deps } = fake.deps;
     fake.deps = deps;
-    const names: Record<string, string> = { "11": "Buyer Wired LLC", "12": "Seller Wired LLC" };
+    const names: Record<string, string> = {
+      "11": "Buyer Wired DAO LLC",
+      "12": "Seller Wired DAO LLC",
+    };
     const fetched: string[] = [];
     vi.stubGlobal(
       "fetch",
@@ -1041,8 +1044,8 @@ describe("pilot:job: the default pre-flight wiring", () => {
       "https://api.example.com/legal-bodies/by-agent/11",
       "https://api.example.com/legal-bodies/by-agent/12",
     ]);
-    expect(printed.buyer.legalName).toBe("Buyer Wired LLC");
-    expect(printed.seller.legalName).toBe("Seller Wired LLC");
+    expect(printed.buyer.legalName).toBe("Buyer Wired DAO LLC");
+    expect(printed.seller.legalName).toBe("Seller Wired DAO LLC");
     expect(printed.buyerBalanceAtomic).toBe("5250000");
     expect(fake.createJob).not.toHaveBeenCalled();
     expectNothingSent(fake);

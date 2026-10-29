@@ -33,7 +33,7 @@ const active: ByAgentAnswer = {
   network: "testnet",
   links: { transparency: `${BASE}/transparency`, statement: `${BASE}/statement` },
   checkedAt: "2026-10-28T00:00:00.000Z",
-  statement: { message: { legalName: "Buyer Agent LLC" } } as unknown as SignedStatementJson,
+  statement: { message: { legalName: "Buyer Agent DAO LLC" } } as unknown as SignedStatementJson,
 };
 
 const jsonResponse = (body: unknown, status = 200) =>
@@ -98,10 +98,13 @@ test("the three answer kinds come back as sent, and only the active one names a 
   }
   expect(activeLegalName(none)).toBeUndefined();
   expect(activeLegalName(unknown)).toBeUndefined();
-  expect(activeLegalName(active)).toEqual({ legalName: "Buyer Agent LLC", standing: "active" });
+  expect(activeLegalName(active)).toEqual({ legalName: "Buyer Agent DAO LLC", standing: "active" });
 });
 
 test("activeLegalName returns the name and the standing whatever the standing is", () => {
   const pending = { ...active, standing: "pending" } as ByAgentAnswer;
-  expect(activeLegalName(pending)).toEqual({ legalName: "Buyer Agent LLC", standing: "pending" });
+  expect(activeLegalName(pending)).toEqual({
+    legalName: "Buyer Agent DAO LLC",
+    standing: "pending",
+  });
 });

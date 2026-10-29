@@ -144,8 +144,8 @@ function setup(
       receiptTimeoutMs: 300,
     });
   const answers: Record<string, ByAgentAnswer | Error> = o.answers ?? {
-    [BUYER_AGENT]: activeAnswer(BUYER_AGENT, "Buyer Agent LLC"),
-    [SELLER_AGENT]: activeAnswer(SELLER_AGENT, "Seller Agent LLC"),
+    [BUYER_AGENT]: activeAnswer(BUYER_AGENT, "Buyer Agent DAO LLC"),
+    [SELLER_AGENT]: activeAnswer(SELLER_AGENT, "Seller Agent DAO LLC"),
   };
   const lookup: LookupClient = {
     byAgent: async (id) => {
@@ -245,13 +245,13 @@ test("pre-flight passes with both bodies active, both owners right, the balance 
   expect(pre).toEqual({
     ok: true,
     buyerBalance: 10_000_000n,
-    buyerName: "Buyer Agent LLC",
-    sellerName: "Seller Agent LLC",
+    buyerName: "Buyer Agent DAO LLC",
+    sellerName: "Seller Agent DAO LLC",
   });
   expect(node.sends).toEqual([]);
 });
 
-const pending = { ...activeAnswer(SELLER_AGENT, "Seller Agent LLC"), standing: "pending" };
+const pending = { ...activeAnswer(SELLER_AGENT, "Seller Agent DAO LLC"), standing: "pending" };
 const noBody: ByAgentAnswer = {
   agentId: BUYER_AGENT,
   legalBody: false,
@@ -733,7 +733,7 @@ test("a resume whose chain reads Funded skips only the balance check", async () 
   answers[BUYER_AGENT] = noBody;
   await expect(createPilotJob(deps, input(), row.caseId)).rejects.toThrow(/buyer.*no legal body/);
 
-  answers[BUYER_AGENT] = activeAnswer(BUYER_AGENT, "Buyer Agent LLC");
+  answers[BUYER_AGENT] = activeAnswer(BUYER_AGENT, "Buyer Agent DAO LLC");
   const balance = vi.spyOn(chain.job, "usdcBalanceOf").mockResolvedValue(0n);
   expect((await createPilotJob(deps, input(), row.caseId)).status).toBe("submitted");
   expect(balance).not.toHaveBeenCalled();
@@ -1075,4 +1075,58 @@ test("a resume refused before the case is shown resumable carries no case id; on
   const late = await createPilotJob(deps, input(), row!.caseId).catch((e) => e);
   expect(late.message).toMatch(/seconds left/);
   expect(pilotCaseIdOf(late)).toBe(row!.caseId);
+});
+
+// ── What a recorded submit hash must be ─────────────────────────────────────────────────────────
+
+/** A case at funded whose submit landed but was never confirmed, and whose receipt stays withheld. */
+async function submittedUnconfirmed() {
+  const h = setup({ runSubmit: true, withholdReceipt: "submit" });
+  await expect(createPilotJob(h.deps, input())).rejects.toBeInstanceOf(ChainTxUnconfirmedError);
+  const [row] = h.cases.list();
+  expect(h.node.chainJob(1n)?.status).toBe(2);
+  return { ...h, row: row! };
+}
+
+test("a recorded submit hash whose transaction went to another contract is refused, naming the recipient", async () => {
+  const { node, cases, deps, row } = await submittedUnconfirmed();
+  const approve = node.hashesOf("approve")[0]!;
+  cases.recordEvent(row.caseId, "submit", "mined", approve, null);
+  await expect(createPilotJob(deps, input(), row.caseId)).rejects.toThrow(
+    new RegExp(`${approve} has recipient ${USDC}, not the job contract ${JOB_CONTRACT}`, "i"),
+  );
+  expect(cases.find(row.caseId)?.status).toBe("funded");
+});
+
+test("a recorded submit hash whose call is not submit is refused, naming the call", async () => {
+  const { node, cases, deps, row } = await submittedUnconfirmed();
+  // The seller's setBudget: right contract and right sender, another call.
+  const setBudget = node.sendsFrom(SELLER)[0]!.hash;
+  cases.recordEvent(row.caseId, "submit", "mined", setBudget, null);
+  await expect(createPilotJob(deps, input(), row.caseId)).rejects.toThrow(
+    new RegExp(`${setBudget} calls setBudget, not submit`),
+  );
+  expect(cases.find(row.caseId)?.status).toBe("funded");
+});
+
+test("a recorded submit hash that submits another job is refused, naming both job ids", async () => {
+  const { node, cases, deps, chain, row } = await submittedUnconfirmed();
+  // The seller's submit of a second, funded job: the right call, for another job.
+  node.seedChainJob({
+    id: 2n,
+    client: BUYER,
+    provider: SELLER,
+    evaluator: REFEREE,
+    description: "another job",
+    budget: BUDGET,
+    expiredAt: BigInt(NOW + 86_400),
+    status: 1,
+    hook: "0x0000000000000000000000000000000000000000",
+  });
+  const other = await chain.job.submit(2n, keccak256(DELIVERABLE), chain.wallets.seller);
+  cases.recordEvent(row.caseId, "submit", "mined", other, null);
+  await expect(createPilotJob(deps, input(), row.caseId)).rejects.toThrow(
+    new RegExp(`${other} submits job 2, not job 1`),
+  );
+  expect(cases.find(row.caseId)?.status).toBe("funded");
 });

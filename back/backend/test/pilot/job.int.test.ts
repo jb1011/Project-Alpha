@@ -112,7 +112,9 @@ test("the buyer creates and funds, the seller submits, and the Submitted log car
   } as unknown as PilotContext;
   const lookup: LookupClient = {
     byAgent: async (id) =>
-      id === agentIds.buyer ? active(id, "Buyer Agent LLC") : active(id, "Seller Agent LLC"),
+      id === agentIds.buyer
+        ? active(id, "Buyer Agent DAO LLC")
+        : active(id, "Seller Agent DAO LLC"),
   };
   const deps: PilotJobDeps = {
     chain: buildPilotChain(ctx),
@@ -134,8 +136,8 @@ test("the buyer creates and funds, the seller submits, and the Submitted log car
   const pre = await preflightPilotJob(deps, input);
   expect(pre).toMatchObject({
     ok: true,
-    buyerName: "Buyer Agent LLC",
-    sellerName: "Seller Agent LLC",
+    buyerName: "Buyer Agent DAO LLC",
+    sellerName: "Seller Agent DAO LLC",
   });
 
   const before = await env.usdcBalanceOf(env.clientAddr);

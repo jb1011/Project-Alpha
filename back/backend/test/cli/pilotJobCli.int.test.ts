@@ -81,8 +81,8 @@ function stubLookups(): string[] {
   const realFetch = globalThis.fetch;
   const looked: string[] = [];
   const names: Record<string, string> = {
-    [agentIds.buyer]: "Buyer Agent LLC",
-    [agentIds.seller]: "Seller Agent LLC",
+    [agentIds.buyer]: "Buyer Agent DAO LLC",
+    [agentIds.seller]: "Seller Agent DAO LLC",
   };
   vi.stubGlobal(
     "fetch",
