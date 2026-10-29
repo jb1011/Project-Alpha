@@ -125,6 +125,7 @@ const KLEROS_FILING_TEXT_MAX = 4_500;
 const UNAUTHORIZED = "unauthorized";
 const PIN_CHECKED_ONLY = "pin_checked_only";
 const FILING_IN_PROGRESS = "filing_in_progress";
+const FILING_MOVED = "filing_moved";
 const UNAUTHORIZED_TEXT =
   "the Dispute Service refused the key of this stage (HTTP 401): it is wrong or revoked; nothing was sent";
 /** The alias slot keys of the preset when no Kleros config is set (a rehearsal box). */
@@ -261,8 +262,11 @@ export async function fileDispute(
     attachment = { fileUri: published.fileUri, cid: published.cid };
   }
 
-  // 2. The dispute, created once. Each call is marked as sending first, so a filing that stops
-  //    without that mark provably never sent a create.
+  // 2. The dispute, created once. Each call is marked as sending first, in a transaction that
+  //    checks the row is still this command's filing (at `filing`, with this command's start): a
+  //    row another command froze or filed again since is not this command's to create on, and a
+  //    freeze never hides a dispute started after it. Only the window between the mark and the
+  //    request remains, and the mark records it.
   const aliases: Record<string, Address> = {
     [d.klerosCfg?.aliasClient ?? DEFAULT_ALIAS_CLIENT]: moved.buyerAddress as Address,
     [d.klerosCfg?.aliasProvider ?? DEFAULT_ALIAS_PROVIDER]: moved.sellerAddress as Address,
@@ -270,10 +274,22 @@ export async function fileDispute(
   let created: CreateOutcome;
   try {
     created = await write("create", () => {
-      cases.recordEvent(caseId, "create", "sending", null, null);
+      const current = cases.transaction(() => {
+        const now = cases.find(caseId);
+        if (now?.status === "filing" && now.filingStartedAt === moved.filingStartedAt)
+          cases.recordEvent(caseId, "create", "sending", null, null);
+        return now;
+      });
+      if (current?.status !== "filing" || current.filingStartedAt !== moved.filingStartedAt)
+        throw new FilingMovedError(current?.status ?? "missing");
       return stage.service.createDispute({ aliases });
     });
   } catch (e) {
+    if (e instanceof FilingMovedError) {
+      const text = `pilot case ${caseId} moved from this command's filing before its create (it is now ${e.status}, or filed again by another command): nothing was sent; read pilot:case show ${caseId}`;
+      cases.recordEvent(caseId, "create", FILING_MOVED, null, text);
+      return notSent(FILING_MOVED, text);
+    }
     const detail = klerosTextOf(e, KLEROS_FILING_TEXT_MAX);
     const never = neverRanCodeOf(e);
     if (never) {
@@ -887,6 +903,14 @@ function neverRanTextOf(code: string): string {
   return code === UNAUTHORIZED
     ? UNAUTHORIZED_TEXT
     : `the Dispute Service refused the call before it ran (HTTP ${code.slice("http_".length)}), so nothing was sent`;
+}
+
+/** The row stopped being this command's filing before its create: nothing is sent. */
+class FilingMovedError extends Error {
+  constructor(readonly status: string) {
+    super(`the case moved from this command's filing (it is now ${status})`);
+    this.name = "FilingMovedError";
+  }
 }
 
 const refusedOrFailed = (e: unknown) =>

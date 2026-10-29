@@ -1561,7 +1561,7 @@ describe("a filing that stopped part way", () => {
     expect(textOf(out)).toContain("its create was marked as sent");
   });
 
-  test("a slow command before its create while another sees the row stale: the other freezes it, and one create in all", async () => {
+  test("a slow command before its create while another sees the row stale: the other freezes it, and no create at all", async () => {
     const h = setup();
     const row = await h.contested();
     // The first command is held in its pin, after its move to filing and before its create.
@@ -1604,7 +1604,10 @@ describe("a filing that stopped part way", () => {
     ).toBe(true);
 
     release();
-    await running;
+    // The slow command finds the row no longer its own before its create: it sends nothing.
+    const slow = await running;
+    expect(slow).toMatchObject({ outcome: "not_sent", code: "filing_moved" });
+    expect(textOf(slow)).toContain("filing_unknown");
     const fourth = rehearsal();
     expect(
       notSent(await fileDispute(h.deps(fourth.stage), row.caseId, { confirmedFlag: null })),
@@ -1613,10 +1616,74 @@ describe("a filing that stopped part way", () => {
     const creates = [first, second.kleros, third.kleros, fourth.kleros].flatMap((k) =>
       k.calls.filter((c) => c.tool === "dispute_create"),
     );
-    expect(creates).toHaveLength(1);
+    expect(creates).toEqual([]);
     const done = h.cases.find(row.caseId)!;
-    // The row stays frozen for a human; the one dispute's ids are on it.
-    expect([done.status, done.coreDisputeId]).toEqual(["filing_unknown", "1000"]);
+    // The row is left as the other command froze it: no dispute behind the freeze.
+    expect([done.status, done.coreDisputeId, done.createDisputeTx]).toEqual([
+      "filing_unknown",
+      null,
+      null,
+    ]);
+    expect(done.error).toContain("no create was marked as sent");
+    const trailNow = h.cases.events(row.caseId);
+    expect(trailNow.filter((e) => e.step === "create" && e.status === "sending")).toEqual([]);
+    expect(trailNow.at(-1)).toMatchObject({ step: "create", status: "filing_moved" });
+  });
+
+  test("a slow command whose row another command is filing again (a new filing start) sends nothing", async () => {
+    const h = setup();
+    const row = await h.contested();
+    /** A fake held in its pin until released, with a signal once it is there. */
+    const heldInPin = () => {
+      let entered!: () => void;
+      const inPin = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      class SlowPin extends FakeDisputeService {
+        override async pin(p: { bytes: Uint8Array; extension: string }): Promise<PinOutcome> {
+          entered();
+          await gate;
+          return super.pin(p);
+        }
+      }
+      const kleros = new SlowPin({ script: "pay" });
+      const stage: KlerosStage = {
+        mode: "rehearsal",
+        service: kleros,
+        deployment: null,
+        cap: null,
+        flag: null,
+      };
+      return { kleros, stage, inPin, release };
+    };
+    const first = heldInPin();
+    const running = fileDispute(h.deps(first.stage), row.caseId, { confirmedFlag: null });
+    await first.inPin;
+
+    // The row goes back to contested by a hand outside this module, and another command starts
+    // filing it: the row is at filing again, with the other command's start.
+    h.cases.advance(row.caseId, "filing", "contested");
+    h.setClock(h.clock() + 60);
+    const other = heldInPin();
+    const otherRunning = fileDispute(h.deps(other.stage), row.caseId, { confirmedFlag: null });
+    await other.inPin;
+    const othersFiling = h.cases.find(row.caseId)!;
+    expect(othersFiling.status).toBe("filing");
+
+    first.release();
+    const slow = await running;
+    expect(slow).toMatchObject({ outcome: "not_sent", code: "filing_moved" });
+    expect(first.kleros.calls.filter((c) => c.tool === "dispute_create")).toEqual([]);
+
+    other.release();
+    expect((await otherRunning).outcome).toBe("filed");
+    expect(other.kleros.calls.filter((c) => c.tool === "dispute_create")).toHaveLength(1);
+    const done = h.cases.find(row.caseId)!;
+    expect([done.status, done.filingStartedAt]).toEqual(["filed", othersFiling.filingStartedAt]);
   });
 
   test("30 minutes old with a dispute id: filed with its evidence in doubt, an ops line, zero calls", async () => {

@@ -1099,6 +1099,8 @@ function nextAfter(outcome: Exclude<FileOutcome, { outcome: "filed" }>, caseId: 
     return `the dispute may exist on Kleros: do not file it again; find it in the Court interface by the alias addresses and the time, then record its ids, or mark the case failed once Kleros confirms none exists (pilot:case show ${caseId} has the trail)`;
   if (outcome.code === "filing_in_progress")
     return `another command is filing this case: nothing was sent; wait for it to end, then read pilot:case show ${caseId}`;
+  if (outcome.code === "filing_moved")
+    return `another command took the case over before this one's create: nothing was sent; read pilot:case show ${caseId}`;
   return "nothing was sent: fix the cause, then run the same command again; the row is contested and keeps its attachment";
 }
 

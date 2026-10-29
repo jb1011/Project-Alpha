@@ -530,6 +530,23 @@ describe("pilot:dispute: the filing", () => {
     expect(String(out.next)).toContain("do not submit again without deciding with Kleros");
   });
 
+  test("filing_moved: the next step says another command has the case, and the command fails", async () => {
+    const fake = makeFake();
+    fake.file.mockResolvedValue({
+      outcome: "not_sent",
+      code: "filing_moved",
+      text: "the case moved before this command's create",
+    });
+    const lines: string[] = [];
+    await expect(runFake(fake, disputeArgs(fake, ["--yes"]), lines)).rejects.toThrow(
+      "the case moved before this command's create",
+    );
+    const out = resultOf(lines);
+    expect(out).toMatchObject({ failed: true, outcome: "not_sent", code: "filing_moved" });
+    expect(String(out.next)).toContain("another command took the case over");
+    expect(String(out.next)).not.toContain("the row is contested");
+  });
+
   test("not_sent: the outcome is printed and the command fails", async () => {
     const fake = makeFake();
     fake.file.mockResolvedValue({
