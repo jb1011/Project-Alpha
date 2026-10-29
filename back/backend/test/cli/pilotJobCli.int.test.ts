@@ -5,7 +5,7 @@
  * over a context built from the anvil clients and a SQLite file in a temp directory. Only the
  * config is given, since the default reads the process environment.
  */
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Command } from "commander";
@@ -200,7 +200,7 @@ test("pilot:job --yes on anvil writes a submitted case with three hashes, and pi
   for (const h of [row.createTxHash, row.fundTxHash, row.submitTxHash])
     expect(h).toMatch(/^0x[0-9a-f]{64}$/);
   expect(new Set([row.createTxHash, row.fundTxHash, row.submitTxHash]).size).toBe(3);
-  expect(readFileSync(row.deliverablePath, "utf8")).toBe(DELIVERABLE);
+  expect(new FileDocumentStore(join(dir, "docs")).get(row.deliverablePath)).toBe(DELIVERABLE);
 
   // The chain agrees: the mock holds the job at Submitted, with the deliverable's hash.
   const jobId = BigInt(row.jobId);

@@ -1235,3 +1235,46 @@ describe("free texts refuse invisible format characters, naming the code point",
     expect(fake.opened()).toBe(0);
   });
 });
+
+describe("pilot:job --resume with the hash of a step the case lost", () => {
+  const HASH = `0x${"ab".repeat(32)}`;
+
+  test("--fund-tx and --submit-tx reach the job creation with the resume", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { status: "created", patch: { jobId: "7" } });
+    await run(
+      fake,
+      jobArgs(["--yes", "--resume", row.caseId, "--fund-tx", HASH, "--submit-tx", HASH]),
+    );
+    expect(fake.createJob.mock.calls[0]?.[2]).toBe(row.caseId);
+    expect(inputOf(fake.createJob).givenTx).toEqual({ fund: HASH, submit: HASH });
+  });
+
+  test("without them the input carries no given hash", async () => {
+    const fake = makeFake();
+    const row = insertCase(fake.cases, { status: "created", patch: { jobId: "7" } });
+    await run(fake, jobArgs(["--yes", "--resume", row.caseId]));
+    expect(inputOf(fake.createJob).givenTx).toBeUndefined();
+  });
+
+  test.each([
+    ["--fund-tx", "0x1234"],
+    ["--submit-tx", `0x${"ab".repeat(31)}`],
+    ["--fund-tx", "ab".repeat(32)],
+    ["--submit-tx", `0x${"zz".repeat(32)}`],
+  ])("%s %s is refused before the context opens", async (option, value) => {
+    const fake = makeFake();
+    await expect(
+      run(fake, jobArgs(["--yes", "--resume", "pc_000000000000", option, value])),
+    ).rejects.toThrow(`refusing: ${option} must be a transaction hash (0x and 64 hex digits)`);
+    expect(fake.opened()).toBe(0);
+  });
+
+  test("a hash without --resume is refused before the context opens", async () => {
+    const fake = makeFake();
+    await expect(run(fake, jobArgs(["--yes", "--fund-tx", HASH]))).rejects.toThrow(
+      /pass them with --resume/,
+    );
+    expect(fake.opened()).toBe(0);
+  });
+});

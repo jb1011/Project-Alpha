@@ -32,6 +32,12 @@ export interface CreatePilotJobInput {
   expirySeconds: number;
   /** The mode of the command that creates the job; the case is filed and settled in it only. */
   mode: PilotMode;
+  /**
+   * On a resume: the hash of a fund or a submit that landed when the case lost it (the run
+   * failed between the send and the receipt). It is tried before any recorded hash, through the
+   * same proof, and refused with the proof's reason when it does not match.
+   */
+  givenTx?: { fund?: Hex; submit?: Hex };
 }
 
 export interface PilotJobDeps {
@@ -293,8 +299,15 @@ function resumable(d: PilotJobDeps, input: CreatePilotJobInput, caseId: string):
 async function resume(
   d: PilotJobDeps,
   input: CreatePilotJobInput,
-  row: PilotCaseRecord,
+  start: PilotCaseRecord,
 ): Promise<PilotCaseRecord> {
+  let row = start;
+  // A run that stopped right after the create never read its block: read it now, so the case
+  // carries every time the later steps need.
+  if (row.createdBlockTime === null && row.createTxHash !== null)
+    row = d.cases.patch(row.caseId, {
+      createdBlockTime: await blockTimeOf(d.chain, row.createTxHash as Hex),
+    });
   const onChain = await chainStatusOf(d, row);
   if (onChain === OPEN || onChain === FUNDED) {
     const pre = await checks(
@@ -349,8 +362,21 @@ async function continueCase(
   const jobId = BigInt(row.jobId as string);
   while (row.status !== "submitted") {
     const onChain = await chainStatusOf(d, row);
+    // A hash given for a step the chain says has not happened names nothing to adopt, and the
+    // step would be sent again: refuse rather than send beside it.
+    const unlanded =
+      row.status === "created" && onChain === OPEN && input.givenTx?.fund !== undefined
+        ? "fund"
+        : row.status === "funded" && onChain === FUNDED && input.givenTx?.submit !== undefined
+          ? "submit"
+          : undefined;
+    if (unlanded)
+      throw new Error(
+        `refusing to continue pilot case ${row.caseId}: job ${jobId} is ${onChain === OPEN ? "Open" : "Funded"} on chain, so no ${unlanded} landed: run the resume without --${unlanded}-tx`,
+      );
     if (row.status === "created" && onChain === OPEN) row = await budgetAndFund(d, row, jobId);
-    else if (row.status === "created" && onChain === FUNDED) row = adoptFund(d, row);
+    else if (row.status === "created" && onChain === FUNDED)
+      row = await adoptFund(d, input, row, jobId);
     else if (row.status === "funded" && onChain === FUNDED)
       row = await submitDeliverable(d, input, row, jobId);
     else if (row.status === "funded" && onChain === SUBMITTED)
@@ -384,18 +410,33 @@ async function budgetAndFund(
 
 /**
  * The row says created and the chain says Funded: a fund this process sent has landed after the
- * run stopped (unconfirmed in time, or mined and the run died before the row moved). The row
- * takes the hash of the last fund event; the block time stays unknown.
+ * run stopped (unconfirmed in time, or mined and the run died before the row moved). The fund is
+ * adopted only once a transaction is proven to be the buyer's `fund` of this job with a successful
+ * receipt; the hash and block time come from it. Nothing proven, nothing adopted.
  */
-function adoptFund(d: PilotJobDeps, row: PilotCaseRecord): PilotCaseRecord {
-  const sent =
-    d.cases
-      .events(row.caseId)
-      .filter((e) => e.step === "fund" && e.ref !== null && SENT_STATUSES.has(e.status))
-      .at(-1)?.ref ?? null;
+async function adoptFund(
+  d: PilotJobDeps,
+  input: CreatePilotJobInput,
+  row: PilotCaseRecord,
+  jobId: bigint,
+): Promise<PilotCaseRecord> {
+  const proven = await provenSent(d, row, "fund", input.givenTx?.fund, async (hash) => {
+    const p = await callProofOf(d, hash, {
+      fn: "fund",
+      verb: "funds",
+      jobId,
+      sender: row.buyerAddress,
+      role: "buyer",
+    });
+    return typeof p === "string" ? p : { blockNumber: p.receipt.blockNumber };
+  });
+  const block = await d.chain.publicClient.getBlock({ blockNumber: proven.blockNumber });
   return d.cases.transaction(() => {
-    d.cases.recordEvent(row.caseId, "fund", "observed_on_chain", sent, null);
-    return moved(d, row, "funded", { fundTxHash: sent });
+    d.cases.recordEvent(row.caseId, "fund", "observed_on_chain", proven.hash, null);
+    return moved(d, row, "funded", {
+      fundTxHash: proven.hash,
+      fundedBlockTime: Number(block.timestamp),
+    });
   });
 }
 
@@ -403,14 +444,50 @@ function adoptFund(d: PilotJobDeps, row: PilotCaseRecord): PilotCaseRecord {
 const SENT_STATUSES: ReadonlySet<string> = new Set(["mined", "unconfirmed"]);
 
 /**
+ * The first transaction proven to be this case's `step`: the hash given on the resume when there
+ * is one (refused outright when it does not prove), else the case's sent hashes for the step,
+ * newest first. A refusal names the case and how to give the hash.
+ */
+async function provenSent(
+  d: PilotJobDeps,
+  row: PilotCaseRecord,
+  step: "fund" | "submit",
+  given: Hex | undefined,
+  prove: (hash: Hex) => Promise<{ blockNumber: bigint } | string>,
+): Promise<{ hash: Hex; blockNumber: bigint }> {
+  const refuse = (what: string) =>
+    new Error(`refusing to adopt the ${step} of pilot case ${row.caseId}: ${what}`);
+  if (given !== undefined) {
+    const proof = await prove(given);
+    if (typeof proof === "string") throw refuse(`${given} ${proof}`);
+    return { hash: given, blockNumber: proof.blockNumber };
+  }
+  const hint = `if you know its hash, run the same command with --resume ${row.caseId} --${step}-tx <hash> --yes`;
+  const sent = d.cases
+    .events(row.caseId)
+    .filter((e) => e.step === step && e.ref !== null && SENT_STATUSES.has(e.status))
+    .map((e) => e.ref as Hex);
+  const newestFirst = [...new Set(sent.reverse())];
+  if (newestFirst.length === 0)
+    throw refuse(
+      `job ${row.jobId} is ${step === "fund" ? "Funded" : "Submitted"} on chain but this case recorded no ${step} transaction; ${hint}`,
+    );
+  const misses: string[] = [];
+  for (const hash of newestFirst) {
+    const proof = await prove(hash);
+    if (typeof proof !== "string") return { hash, blockNumber: proof.blockNumber };
+    misses.push(`${hash} ${proof}`);
+  }
+  throw refuse(`${misses.join("; ")}; ${hint}`);
+}
+
+/**
  * The row says funded and the chain says Submitted: a submit this process sent landed after the
- * run stopped (unconfirmed in time, or mined and the block read after it failed). The case's sent
- * submits are tried newest first, and the first one proven to be this case's submit is adopted:
- * a transaction to the job contract from the seller whose calldata is `submit` of this job with
- * the hash of the bytes given now, with a successful receipt. A `JobSubmitted` log, when the
- * contract emits one, must agree on the deliverable and the provider; its absence is not a
- * refusal, since a contract may emit another shape (the local mock does). The hash and block time come
- * from the adopted transaction's receipt.
+ * run stopped (unconfirmed in time, or mined and the block read after it failed). It is adopted
+ * once a transaction is proven to be the seller's `submit` of this job with the hash of the bytes
+ * given now and a successful receipt. A `JobSubmitted` log, when the contract emits one, must
+ * agree on the deliverable and the provider; its absence is not a refusal, since a contract may
+ * emit another shape (the local mock does). The hash and block time come from the receipt.
  */
 async function adoptSubmit(
   d: PilotJobDeps,
@@ -419,55 +496,50 @@ async function adoptSubmit(
   jobId: bigint,
 ): Promise<PilotCaseRecord> {
   const { chain, cases } = d;
-  const refuse = (what: string) =>
-    new Error(`refusing to adopt the submit of pilot case ${row.caseId}: ${what}`);
-  const sent = cases
-    .events(row.caseId)
-    .filter((e) => e.step === "submit" && e.ref !== null && SENT_STATUSES.has(e.status))
-    .map((e) => e.ref as Hex);
-  const newestFirst = [...new Set(sent.reverse())];
-  if (newestFirst.length === 0)
-    throw refuse(`job ${jobId} is Submitted on chain but this case recorded no submit transaction`);
   const { bytes, extension } = input.deliverable;
   const deliverableHash = keccak256(bytes);
-  const misses: string[] = [];
-  for (const hash of newestFirst) {
-    const proof = await submitProofOf(d, row, jobId, hash, deliverableHash);
-    if (typeof proof === "string") {
-      misses.push(`${hash} ${proof}`);
-      continue;
-    }
-    const block = await chain.publicClient.getBlock({ blockNumber: proof.blockNumber });
-    const stored = d.docStore.putBytes(
-      `pilot-${row.caseId}-deliverable.${extension}`,
-      Buffer.from(bytes),
-    );
-    return cases.transaction(() => {
-      cases.recordEvent(row.caseId, "submit", "observed_on_chain", hash, null);
-      return moved(d, row, "submitted", {
-        deliverablePath: stored.path,
-        deliverableHash,
-        deliverableExtension: extension,
-        submitTxHash: hash,
-        submittedBlockTime: Number(block.timestamp),
-      });
+  const proven = await provenSent(d, row, "submit", input.givenTx?.submit, (hash) =>
+    submitProofOf(d, row, jobId, hash, deliverableHash),
+  );
+  const block = await chain.publicClient.getBlock({ blockNumber: proven.blockNumber });
+  const stored = d.docStore.putBytes(
+    `pilot-${row.caseId}-deliverable.${extension}`,
+    Buffer.from(bytes),
+  );
+  return cases.transaction(() => {
+    cases.recordEvent(row.caseId, "submit", "observed_on_chain", proven.hash, null);
+    return moved(d, row, "submitted", {
+      deliverablePath: stored.id,
+      deliverableHash,
+      deliverableExtension: extension,
+      submitTxHash: proven.hash,
+      submittedBlockTime: Number(block.timestamp),
     });
-  }
-  throw refuse(misses.join("; "));
+  });
 }
 
 /**
- * Whether one sent transaction is this case's submit: its receipt's block number when it is, or
- * what did not match (recipient, sender, call, job id, deliverable hash, receipt or log). Hashes
- * and addresses only; never the calldata or the deliverable's bytes.
+ * Whether one sent transaction is the `fn` call of this job by `sender`: the decoded arguments
+ * and the receipt when it is, or what did not match (recipient, sender, call, job id or receipt).
+ * Hashes and addresses only; never the calldata.
  */
-async function submitProofOf(
+async function callProofOf(
   d: PilotJobDeps,
-  row: PilotCaseRecord,
-  jobId: bigint,
   hash: Hex,
-  deliverableHash: Hex,
-): Promise<{ blockNumber: bigint } | string> {
+  want: {
+    fn: "fund" | "submit";
+    verb: string;
+    jobId: bigint;
+    sender: string;
+    role: "buyer" | "seller";
+  },
+): Promise<
+  | {
+      args: readonly unknown[];
+      receipt: Awaited<ReturnType<PilotChain["publicClient"]["getTransactionReceipt"]>>;
+    }
+  | string
+> {
   const { chain } = d;
   let tx: Awaited<ReturnType<typeof chain.publicClient.getTransaction>>;
   try {
@@ -477,19 +549,17 @@ async function submitProofOf(
   }
   if (tx.to === null || tx.to === undefined || !sameAddress(tx.to, chain.jobContract))
     return `has recipient ${tx.to ?? "none"}, not the job contract ${chain.jobContract}`;
-  if (!sameAddress(tx.from, row.sellerAddress))
-    return `has sender ${tx.from}, not the seller ${row.sellerAddress}`;
+  if (!sameAddress(tx.from, want.sender))
+    return `has sender ${tx.from}, not the ${want.role} ${want.sender}`;
   let call: ReturnType<typeof decodeFunctionData<typeof iErc8183JobAbi>>;
   try {
     call = decodeFunctionData({ abi: iErc8183JobAbi, data: tx.input });
   } catch {
-    return "is not a call of the job contract's submit";
+    return `is not a call of the job contract's ${want.fn}`;
   }
-  if (call.functionName !== "submit") return `calls ${call.functionName}, not submit`;
-  const [calledJob, calledDeliverable] = call.args;
-  if (calledJob !== jobId) return `submits job ${calledJob}, not job ${jobId}`;
-  if (calledDeliverable.toLowerCase() !== deliverableHash.toLowerCase())
-    return `submits deliverable hash ${calledDeliverable}, and the deliverable given hashes to ${deliverableHash}`;
+  if (call.functionName !== want.fn) return `calls ${call.functionName}, not ${want.fn}`;
+  const calledJob = (call.args as readonly unknown[])[0];
+  if (calledJob !== want.jobId) return `${want.verb} job ${calledJob}, not job ${want.jobId}`;
   let receipt: Awaited<ReturnType<typeof chain.publicClient.getTransactionReceipt>>;
   try {
     receipt = await chain.publicClient.getTransactionReceipt({ hash });
@@ -497,6 +567,33 @@ async function submitProofOf(
     return "has a receipt that could not be read yet; resume again once it is mined";
   }
   if (receipt.status !== "success") return "has a receipt that says it reverted on chain";
+  return { args: call.args as readonly unknown[], receipt };
+}
+
+/**
+ * Whether one sent transaction is this case's submit: the shared call proof, then the
+ * deliverable hash in the calldata and, when the contract emits one, the `JobSubmitted` log.
+ */
+async function submitProofOf(
+  d: PilotJobDeps,
+  row: PilotCaseRecord,
+  jobId: bigint,
+  hash: Hex,
+  deliverableHash: Hex,
+): Promise<{ blockNumber: bigint } | string> {
+  const { chain } = d;
+  const proof = await callProofOf(d, hash, {
+    fn: "submit",
+    verb: "submits",
+    jobId,
+    sender: row.sellerAddress,
+    role: "seller",
+  });
+  if (typeof proof === "string") return proof;
+  const { args, receipt } = proof;
+  const calledDeliverable = args[1] as Hex;
+  if (calledDeliverable.toLowerCase() !== deliverableHash.toLowerCase())
+    return `submits deliverable hash ${calledDeliverable}, and the deliverable given hashes to ${deliverableHash}`;
   let logged: Hex | undefined;
   try {
     logged = submittedDeliverableOf(receipt.logs, chain.jobContract, jobId);
@@ -535,7 +632,7 @@ async function submitDeliverable(
   cases.recordEvent(row.caseId, "submit", "mined", submitHash, null);
   const submittedBlockTime = await blockTimeOf(chain, submitHash);
   return moved(d, row, "submitted", {
-    deliverablePath: stored.path,
+    deliverablePath: stored.id,
     deliverableHash,
     deliverableExtension: extension,
     submitTxHash: submitHash,

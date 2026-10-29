@@ -7,7 +7,7 @@
  * job, from the node's options), so the signers and the order are asserted here and submit's
  * effect on the contract is proven on anvil (`job.int.test.ts`).
  */
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Address, type Hex, keccak256, parseEventLogs } from "viem";
@@ -163,7 +163,7 @@ function setup(
   const setClock = (t: number) => {
     clock = t;
   };
-  return { node, cases, deps, chain, answers, setClock };
+  return { node, cases, deps, chain, answers, setClock, docStore };
 }
 
 const input = (over: Partial<CreatePilotJobInput> = {}): CreatePilotJobInput => ({
@@ -177,7 +177,7 @@ const input = (over: Partial<CreatePilotJobInput> = {}): CreatePilotJobInput => 
 });
 
 test("the four steps, in order, with the right signers; the row ends at submitted with every hash", async () => {
-  const { node, cases, deps } = setup();
+  const { node, cases, deps, docStore } = setup();
   const row = await createPilotJob(deps, input());
 
   expect(node.actions.map((a) => [a.call, a.from])).toEqual([
@@ -222,8 +222,9 @@ test("the four steps, in order, with the right signers; the row ends at submitte
 
   expect(row.deliverableHash).toBe(keccak256(DELIVERABLE));
   expect(row.deliverableExtension).toBe("csv");
-  expect(row.deliverablePath).toMatch(new RegExp(`pilot-${row.caseId}-deliverable\\.csv$`));
-  expect(new Uint8Array(readFileSync(row.deliverablePath!))).toEqual(DELIVERABLE);
+  // The store's id, which is what the store reads by; not a path on disk.
+  expect(row.deliverablePath).toBe(`pilot-${row.caseId}-deliverable.csv`);
+  expect(new Uint8Array(docStore.getBytes(row.deliverablePath!))).toEqual(DELIVERABLE);
 
   expect(cases.events(row.caseId).map((e) => [e.step, e.status, e.ref])).toEqual([
     ["create", "mined", row.createTxHash],
@@ -438,9 +439,18 @@ test("an unconfirmed fund that landed: the resume reads Funded on chain, adopts 
   });
   expect(node.chainJob(1n)?.status).toBe(1);
 
+  // Without its receipt the fund is not proven, and the row stays at created.
+  await expect(createPilotJob(deps, input(), row!.caseId)).rejects.toThrow(
+    /has a receipt that could not be read yet/,
+  );
+  expect(cases.find(row!.caseId)?.status).toBe("created");
+
+  node.releaseWithheld();
   const done = await createPilotJob(deps, input(), row!.caseId);
   expect(done.status).toBe("submitted");
   expect(done.fundTxHash).toBe(fundHash);
+  // The block time comes from the adopted fund's receipt, as for a fund this run saw mined.
+  expect(done.fundedBlockTime).toBe(NOW);
   expect(node.hashesOf("fund")).toHaveLength(1);
 });
 
@@ -468,7 +478,10 @@ test("resuming refuses a row that is not at created or funded, an unknown case a
 // ── A submit that landed while the row stayed at funded ─────────────────────────────────────────
 
 test("an unconfirmed submit that landed: the resume reads the JobSubmitted log, checks the hash and adopts it", async () => {
-  const { node, cases, deps, chain } = setup({ runSubmit: true, withholdReceipt: "submit" });
+  const { node, cases, deps, chain, docStore } = setup({
+    runSubmit: true,
+    withholdReceipt: "submit",
+  });
   await expect(createPilotJob(deps, input())).rejects.toBeInstanceOf(ChainTxUnconfirmedError);
   const [row] = cases.list();
   expect(row?.status).toBe("funded");
@@ -501,7 +514,7 @@ test("an unconfirmed submit that landed: the resume reads the JobSubmitted log, 
   expect(done.submitTxHash).toBe(submitHash);
   expect(done.submittedBlockTime).toBe(NOW);
   expect(done.deliverableHash).toBe(keccak256(DELIVERABLE));
-  expect(new Uint8Array(readFileSync(done.deliverablePath!))).toEqual(DELIVERABLE);
+  expect(new Uint8Array(docStore.getBytes(done.deliverablePath!))).toEqual(DELIVERABLE);
   expect(node.sends).toHaveLength(sends);
   expect(cases.events(row!.caseId).at(-1)).toMatchObject({
     step: "submit",
@@ -770,18 +783,117 @@ test("the resume refuses a Funded job whose budget is not the case's", async () 
   expect(node.sends).toHaveLength(sent);
 });
 
-test("adopting a fund ignores a reverted fund's hash", async () => {
+test("a job at Funded whose only recorded fund reverted is not adopted: the resume asks for the hash", async () => {
   const { node, cases, deps, row } = await createdAfterRevertedFund();
-  const reverted = node.hashesOf("fund")[0];
-  // The job reads Funded although this case's only fund reverted: the hash must not be adopted.
+  // The job reads Funded although this case's only fund reverted: nothing proves a fund.
   node.chainJob(1n)!.status = 1;
-  const done = await createPilotJob(deps, input(), row.caseId);
-  expect(done.fundTxHash).toBeNull();
-  expect(done.fundTxHash).not.toBe(reverted);
+  const sent = node.sends.length;
+  await expect(createPilotJob(deps, input(), row.caseId)).rejects.toThrow(
+    `refusing to adopt the fund of pilot case ${row.caseId}: job 1 is Funded on chain but this case recorded no fund transaction; if you know its hash, run the same command with --resume ${row.caseId} --fund-tx <hash> --yes`,
+  );
+  expect(cases.find(row.caseId)).toMatchObject({ status: "created", fundTxHash: null });
+  expect(cases.events(row.caseId).some((e) => e.status === "observed_on_chain")).toBe(false);
+  expect(node.sends).toHaveLength(sent);
+});
+
+test("a recorded fund hash that is not the buyer's fund of this job is not adopted", async () => {
+  const { node, cases, deps, row } = await createdAfterRevertedFund();
+  node.chainJob(1n)!.status = 1;
+  // The newest "fund" the case holds is the seller's setBudget: right contract, wrong sender.
+  const setBudget = node.sendsFrom(SELLER)[0]!.hash;
+  cases.recordEvent(row.caseId, "fund", "mined", setBudget, null);
+  await expect(createPilotJob(deps, input(), row.caseId)).rejects.toThrow(
+    new RegExp(`${setBudget} has sender ${SELLER}, not the buyer ${BUYER}.*--fund-tx <hash>`, "i"),
+  );
+  expect(cases.find(row.caseId)?.status).toBe("created");
+});
+
+// ── Hashes the case lost, given on the resume ───────────────────────────────────────────────────
+
+/** A fund or submit that landed, whose hash the run lost: the RPC failed after the send. */
+async function lostHash(step: "fund" | "submit") {
+  const h = setup({ runSubmit: true });
+  const real = step === "fund" ? h.chain.job.approveAndFund : h.chain.job.submit;
+  const spy = vi
+    .spyOn(h.chain.job, step === "fund" ? "approveAndFund" : "submit")
+    .mockImplementationOnce(async (...args: unknown[]) => {
+      await (real as (...a: unknown[]) => Promise<Hex>).apply(h.chain.job, args);
+      throw new Error("the connection to the node dropped");
+    });
+  await expect(createPilotJob(h.deps, input())).rejects.toThrow(/connection to the node dropped/);
+  spy.mockRestore();
+  const [row] = h.cases.list();
+  expect(h.cases.events(row!.caseId).at(-1)).toMatchObject({ step, status: "failed", ref: null });
+  const hash = h.node.hashesOf(step)[0]!;
+  return { ...h, row: row!, hash };
+}
+
+test("a fund whose hash was lost is adopted from the hash given on the resume, with its block time", async () => {
+  const { node, cases, deps, row, hash } = await lostHash("fund");
+  expect(row.status).toBe("created");
+  expect(node.chainJob(1n)?.status).toBe(1);
+  await expect(createPilotJob(deps, input(), row.caseId)).rejects.toThrow(/--fund-tx <hash>/);
+
+  const done = await createPilotJob(deps, input({ givenTx: { fund: hash } }), row.caseId);
+  expect(done.status).toBe("submitted");
+  expect(done.fundTxHash).toBe(hash);
+  expect(done.fundedBlockTime).toBe(NOW);
+  expect(node.hashesOf("fund")).toEqual([hash]);
   expect(cases.events(row.caseId).find((e) => e.status === "observed_on_chain")).toMatchObject({
     step: "fund",
-    ref: null,
+    ref: hash,
   });
+});
+
+test("a submit whose hash was lost is adopted from the hash given on the resume", async () => {
+  const { node, deps, row, hash } = await lostHash("submit");
+  expect(row.status).toBe("funded");
+  expect(node.chainJob(1n)?.status).toBe(2);
+  await expect(createPilotJob(deps, input(), row.caseId)).rejects.toThrow(/--submit-tx <hash>/);
+
+  const done = await createPilotJob(deps, input({ givenTx: { submit: hash } }), row.caseId);
+  expect(done.status).toBe("submitted");
+  expect(done.submitTxHash).toBe(hash);
+  expect(done.submittedBlockTime).toBe(NOW);
+  expect(node.hashesOf("submit")).toEqual([hash]);
+});
+
+test("a given hash that does not prove is refused with the reason, before any recorded hash is tried", async () => {
+  const { deps, row, cases } = await lostHash("fund");
+  const create = row.createTxHash as Hex;
+  await expect(
+    createPilotJob(deps, input({ givenTx: { fund: create } }), row.caseId),
+  ).rejects.toThrow(
+    `refusing to adopt the fund of pilot case ${row.caseId}: ${create} calls createJob, not fund`,
+  );
+  expect(cases.find(row.caseId)?.status).toBe("created");
+});
+
+test("a given hash for a step the chain says has not happened is refused, and nothing is sent", async () => {
+  const { node, deps, row } = await createdAfterRevertedFund();
+  const sent = node.sends.length;
+  await expect(
+    createPilotJob(deps, input({ givenTx: { fund: `0x${"ab".repeat(32)}` as Hex } }), row.caseId),
+  ).rejects.toThrow(/job 1 is Open on chain, so no fund landed: run the resume without --fund-tx/);
+  expect(node.sends).toHaveLength(sent);
+});
+
+// ── The create's block time, filled on a resume ─────────────────────────────────────────────────
+
+test("a create whose block read failed gets its block time on the resume", async () => {
+  const { cases, deps, chain } = setup();
+  const getBlock = chain.publicClient.getBlock.bind(chain.publicClient);
+  vi.spyOn(chain.publicClient, "getBlock").mockImplementationOnce(async () => {
+    throw new Error("the block read failed");
+  });
+  await expect(createPilotJob(deps, input())).rejects.toThrow(/block read failed/);
+  const [row] = cases.list();
+  expect(row).toMatchObject({ status: "created", createdBlockTime: null });
+  vi.mocked(chain.publicClient.getBlock).mockImplementation(getBlock as never);
+
+  const done = await createPilotJob(deps, input(), row!.caseId);
+  expect(done.createdBlockTime).toBe(NOW);
+  expect(done.status).toBe("submitted");
 });
 
 // ── Pre-flight errors and boundaries ────────────────────────────────────────────────────────────

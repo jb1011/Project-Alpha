@@ -438,6 +438,13 @@ const FILED_OR_LATER: ReadonlySet<PilotStatus> = new Set(PILOT_FILED_OR_LATER_ST
 /** The statuses a mode's cap counts: the dispute exists or may exist on Kleros. */
 const FILED: ReadonlySet<PilotStatus> = new Set(PILOT_FILED_STATUSES);
 
+/** A transaction hash: 0x and 64 hex digits. */
+function parseTxHash(option: string, value: string): Hex {
+  if (!/^0x[0-9a-fA-F]{64}$/.test(value))
+    refuse(`${option} must be a transaction hash (0x and 64 hex digits)`);
+  return value.toLowerCase() as Hex;
+}
+
 function parseCaseId(option: string, value: string): string {
   if (!CASE_ID.test(value)) refuse(`${option} must be a pilot case id (pc_ and 12 hex digits)`);
   return value;
@@ -562,6 +569,8 @@ interface JobOptions {
   expiryDays?: string;
   expirySeconds?: string;
   resume?: string;
+  fundTx?: string;
+  submitTx?: string;
   buyerAgent?: string;
   sellerAgent?: string;
   yes?: boolean;
@@ -587,6 +596,14 @@ function parseJob(opts: JobOptions, cfg: Config): ParsedJob {
   const budgetAtomic = parseBudget(opts.budget);
   const expirySeconds = parseExpiry(mode, opts.expiryDays, opts.expirySeconds);
   const resume = opts.resume === undefined ? undefined : parseCaseId("--resume", opts.resume);
+  const givenTx = {
+    fund: opts.fundTx === undefined ? undefined : parseTxHash("--fund-tx", opts.fundTx),
+    submit: opts.submitTx === undefined ? undefined : parseTxHash("--submit-tx", opts.submitTx),
+  };
+  if (resume === undefined && (givenTx.fund !== undefined || givenTx.submit !== undefined))
+    refuse(
+      "--fund-tx and --submit-tx name a transaction of a recorded case: pass them with --resume",
+    );
   const agentIds = {
     buyer: agentIdOf("buyer", opts.buyerAgent, pilot.buyerAgentId),
     seller: agentIdOf("seller", opts.sellerAgent, pilot.sellerAgentId),
@@ -606,6 +623,7 @@ function parseJob(opts: JobOptions, cfg: Config): ParsedJob {
       budgetAtomic,
       expirySeconds,
       mode,
+      ...(givenTx.fund === undefined && givenTx.submit === undefined ? {} : { givenTx }),
     },
     agentIds,
     resume,
@@ -992,6 +1010,14 @@ export function registerPilotCommands(
     .option("--buyer-agent <id>", "the buyer's agent id (default PILOT_BUYER_AGENT_ID)")
     .option("--seller-agent <id>", "the seller's agent id (default PILOT_SELLER_AGENT_ID)")
     .option("--resume <caseId>", "continue a case left at created or funded")
+    .option(
+      "--fund-tx <hash>",
+      "with --resume: the hash of a fund that landed when the case did not record it",
+    )
+    .option(
+      "--submit-tx <hash>",
+      "with --resume: the hash of a submit that landed when the case did not record it",
+    )
     .option("--yes", "confirm: send the transactions")
     .action(async (opts: JobOptions) => {
       // Options are parsed before the context opens, so a bad one never opens the database.

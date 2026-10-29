@@ -144,7 +144,7 @@ test("the buyer creates and funds, the seller submits, and the Submitted log car
   expect(row.status).toBe("submitted");
   expect(keccak256(DELIVERABLE)).toBe(DELIVERABLE_HASH);
   expect(row.deliverableHash).toBe(DELIVERABLE_HASH);
-  expect(new Uint8Array(readFileSync(row.deliverablePath!))).toEqual(DELIVERABLE);
+  expect(new Uint8Array(deps.docStore.getBytes(row.deliverablePath!))).toEqual(DELIVERABLE);
   for (const h of [row.createTxHash, row.fundTxHash, row.submitTxHash])
     expect(h).toMatch(/^0x[0-9a-f]{64}$/);
   expect(row.createdBlockTime).toBeGreaterThan(0);
