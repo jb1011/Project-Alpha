@@ -17,6 +17,7 @@ import {
 import { iIdentityRegistryAbi } from "../abis/generated";
 import { awaitSuccessfulReceipt } from "../adapters/arc/receipts";
 import { klerosCaseUrl } from "../adapters/kleros/deployments";
+import type { FakeScript } from "../adapters/kleros/fakeDisputeService";
 import { type Config, loadConfig } from "../config/env";
 import {
   ChainTxRevertedError,
@@ -34,8 +35,20 @@ import {
   linkVerifyTypes,
 } from "../legalBody/link";
 import { PILOT_FILED_OR_LATER_STATUSES, PILOT_FILED_STATUSES } from "../pilot/casesRepository";
-import { buildPilotChain } from "../pilot/composition";
+import {
+  DEFAULT_SCRIPT,
+  type KlerosStage,
+  buildKlerosService,
+  buildPilotChain,
+} from "../pilot/composition";
 import { type PilotContext, openPilotContext } from "../pilot/context";
+import {
+  type FileDisputeDeps,
+  type FileOutcome,
+  type Preflight,
+  fileDispute,
+  preflightDispute,
+} from "../pilot/dispute";
 import {
   type CreatePilotJobInput,
   type PilotJobDeps,
@@ -45,6 +58,7 @@ import {
   preflightPilotJob,
   withoutEmDash,
 } from "../pilot/job";
+import { checkKleros } from "../pilot/klerosCheck";
 import { httpLookupClient } from "../pilot/lookup";
 import {
   PILOT_MODES,
@@ -375,6 +389,13 @@ export interface PilotCommandDeps {
   createJob: typeof createPilotJob;
   /** Unix seconds. */
   now: () => number;
+  /** The Kleros stage the mode selects: the fake, or the HTTP client of the mode's key. */
+  buildStage: typeof buildKlerosService;
+  preflightDispute: typeof preflightDispute;
+  fileDispute: typeof fileDispute;
+  checkKleros: typeof checkKleros;
+  /** The banner's wait before a filing, and the filing's own waits. */
+  sleep: (ms: number) => Promise<void>;
 }
 
 const defaultDeps: PilotCommandDeps = {
@@ -385,6 +406,11 @@ const defaultDeps: PilotCommandDeps = {
   preflight: preflightPilotJob,
   createJob: createPilotJob,
   now: () => Math.floor(Date.now() / 1000),
+  buildStage: buildKlerosService,
+  preflightDispute,
+  fileDispute,
+  checkKleros,
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 };
 
 /** Shown on every job and case output: these are test agents moving test USDC on Arc testnet. */
@@ -936,6 +962,208 @@ function klerosIdsOf(row: PilotCaseRecord): string {
   return known.length > 0 ? known.join(", ") : "no dispute id recorded yet";
 }
 
+// --- THE FILING: pilot:dispute and pilot:kleros check ---
+
+/** How long the banner stays on screen before the first write. */
+const BANNER_WAIT_MS = 1_000;
+/** A legal body's standing, as the lookup words it. */
+const STANDING_WORD = /^[a-z][a-z_]{0,31}$/;
+
+interface DisputeOptions {
+  case: string;
+  script?: string;
+  allowStanding?: string;
+  testnet?: boolean;
+  live?: boolean;
+  yes?: boolean;
+}
+
+interface ParsedDispute {
+  caseId: string;
+  mode: PilotMode;
+  flag: "--testnet" | "--live" | null;
+  script: FakeScript | undefined;
+  allowStanding: string | undefined;
+  yes: boolean;
+}
+
+/** Every option of `pilot:dispute`, checked against the mode before the context opens. */
+function parseDispute(opts: DisputeOptions, cfg: Config): ParsedDispute {
+  const caseId = parseCaseId("--case", opts.case);
+  const pilot = cfg.pilot;
+  if (!pilot)
+    refuse(
+      "the pilot keys are not set on this box (PILOT_BUYER_PRIVATE_KEY, PILOT_SELLER_PRIVATE_KEY, PILOT_REFEREE_PRIVATE_KEY)",
+    );
+  const mode = pilot.mode;
+  if (opts.testnet && opts.live) refuse("--testnet and --live cannot both be given");
+  if (opts.live && mode !== "live")
+    refuse(`--live is accepted in live mode only, and this box runs in ${mode} mode`);
+  if (opts.testnet && mode !== "testnet")
+    refuse(`--testnet is accepted in testnet mode only, and this box runs in ${mode} mode`);
+  if (opts.script !== undefined && mode !== "rehearsal")
+    refuse(`--script is accepted in rehearsal mode only, and this box runs in ${mode} mode`);
+  if (opts.allowStanding !== undefined && !STANDING_WORD.test(opts.allowStanding))
+    refuse("--allow-standing must be a standing as the lookup words it, for example pending");
+  return {
+    caseId,
+    mode,
+    flag: opts.testnet ? "--testnet" : opts.live ? "--live" : null,
+    script: opts.script as FakeScript | undefined,
+    allowStanding: opts.allowStanding,
+    yes: !!opts.yes,
+  };
+}
+
+/** The stage as the operator reads it: never a key, only the key's name. */
+function stageView(stage: KlerosStage, script: FakeScript | undefined): Record<string, unknown> {
+  return {
+    mode: stage.mode,
+    chain: stage.deployment?.chain ?? "fake",
+    courtId: stage.deployment?.courtId ?? null,
+    key: stage.mode === "rehearsal" ? null : stage.mode,
+    flag: stage.flag,
+    ...(stage.mode === "rehearsal" ? { script: script ?? DEFAULT_SCRIPT } : {}),
+  };
+}
+
+/** What the pre-flight read, printable: the evidence in full, the clock, the escrow, the cap. */
+function preflightView(pre: Extract<Preflight, { ok: true }>): Record<string, unknown> {
+  const [evidenceSeconds, commitSeconds, voteSeconds, appealSeconds] = pre.court.timesPerPeriod;
+  const expiredAt = Number(pre.escrow.expiredAt);
+  return {
+    evidence: {
+      name: pre.evidence.name,
+      sha256: pre.evidence.sha256,
+      byteLength: pre.evidence.byteLength,
+      description: pre.evidence.description,
+    },
+    instructions: pre.instructions,
+    court: {
+      courtId: pre.court.courtId,
+      evidenceSeconds,
+      commitSeconds,
+      voteSeconds,
+      appealSeconds,
+      hiddenVotes: pre.court.hiddenVotes,
+    },
+    escrow: {
+      status: pre.escrow.status,
+      budgetAtomic: pre.escrow.budget.toString(),
+      expiredAt,
+      expiresAt: isoOf(expiredAt),
+      client: pre.escrow.client,
+      evaluator: pre.escrow.evaluator,
+    },
+    filedCount: pre.filedCount,
+    cap: pre.cap,
+  };
+}
+
+/** The court's juror count, when its payload carries one. */
+function jurorCountOf(raw: unknown): number | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  for (const field of ["jurors", "jurorCount"]) {
+    const v = (raw as Record<string, unknown>)[field];
+    const n = typeof v === "string" && /^[1-9][0-9]*$/.test(v) ? Number(v) : v;
+    if (typeof n === "number" && Number.isSafeInteger(n) && n > 0) return n;
+  }
+  return undefined;
+}
+
+/** The block a testnet or live filing prints before its writes. */
+function bannerOf(
+  stage: KlerosStage,
+  pre: Extract<Preflight, { ok: true }>,
+  row: PilotCaseRecord,
+  policyUri: string | undefined,
+): string {
+  const jurors = jurorCountOf(pre.court.raw);
+  return [
+    `FILING A KLEROS DISPUTE IN ${stage.mode.toUpperCase()} MODE: what is sent is public and cannot be withdrawn.`,
+    `  stage: ${stage.mode}`,
+    `  chain: ${stage.deployment?.chain ?? "fake"}`,
+    `  court id: ${stage.deployment?.courtId ?? "none"}`,
+    `  juror count: ${jurors ?? "as the preset sets it"}`,
+    `  key: ${stage.mode}`,
+    `  policy URI: ${policyUri ?? "none configured"}`,
+    `  cap: ${pre.filedCount} filed so far, of ${pre.cap ?? "no cap"}`,
+    `  case: ${row.label} (${row.caseId})`,
+  ].join("\n");
+}
+
+/** The next step after a filing that did not end filed. */
+function nextAfter(outcome: Exclude<FileOutcome, { outcome: "filed" }>, caseId: string): string {
+  if (outcome.outcome === "filing_unknown")
+    return `the dispute may exist on Kleros: do not file it again; find it in the Court interface by the alias addresses and the time, then record its ids, or mark the case failed once Kleros confirms none exists (pilot:case show ${caseId} has the trail)`;
+  return "nothing was sent: fix the cause, then run the same command again; the row is contested and keeps its attachment";
+}
+
+async function dispute(
+  ctx: PilotContext,
+  deps: PilotCommandDeps,
+  stage: KlerosStage,
+  p: ParsedDispute,
+): Promise<Record<string, unknown>> {
+  const pilot = ctx.cfg.pilot;
+  if (!pilot) refuse("the pilot keys are not set on this box");
+  const d: FileDisputeDeps = {
+    chain: buildPilotChain(ctx),
+    cases: ctx.cases,
+    docStore: ctx.docStore,
+    lookup: httpLookupClient(pilot.lookupBase),
+    stage,
+    klerosCfg: ctx.cfg.kleros,
+    arcNetwork: ctx.cfg.arcNetwork === "mainnet" ? "mainnet" : "testnet",
+    lookupBase: pilot.lookupBase,
+    now: deps.now,
+    sleep: deps.sleep,
+  };
+  const opts = p.allowStanding === undefined ? {} : { allowStanding: p.allowStanding };
+  const view = stageView(stage, p.script);
+
+  // A filing needs --yes and, in testnet and live, the mode's own flag; anything less is the dry run.
+  if (!p.yes || (stage.flag !== null && p.flag !== stage.flag)) {
+    const pre = await deps.preflightDispute(d, p.caseId, opts);
+    if (!pre.ok) refuse(pre.problem);
+    return {
+      dryRun: true,
+      caseId: p.caseId,
+      stage: view,
+      ...preflightView(pre),
+      note: PILOT_NOTE,
+      next:
+        stage.flag === null
+          ? "nothing was sent: run the same command with --yes to file it on the fake (a rehearsal sends nothing to Kleros)"
+          : `nothing was sent: read the evidence above, then run the same command with ${stage.flag} --yes to file it with Kleros, where it is public and permanent`,
+    };
+  }
+
+  if (stage.flag !== null) {
+    const pre = await deps.preflightDispute(d, p.caseId, opts);
+    if (!pre.ok) refuse(pre.problem);
+    console.log(bannerOf(stage, pre, findCase(ctx, p.caseId), ctx.cfg.kleros?.policyUri));
+    await deps.sleep(BANNER_WAIT_MS);
+  }
+
+  const outcome = await deps.fileDispute(d, p.caseId, { ...opts, confirmedFlag: p.flag });
+  const row = findCase(ctx, p.caseId);
+  const base = { ...outcome, caseId: p.caseId, status: row.status, stage: view };
+  if (outcome.outcome === "filed")
+    return {
+      ...base,
+      courtUrl: courtUrlOf(row),
+      case: row,
+      note: PILOT_NOTE,
+      next:
+        stage.mode === "rehearsal"
+          ? "a rehearsal: nothing was sent to Kleros, and the fake's dispute id is on the row"
+          : `open the Court URL now and check the evidence item, then record it with pilot:case seen-in-court ${p.caseId} --yes`,
+    };
+  print({ failed: true, ...base, next: nextAfter(outcome, p.caseId), note: PILOT_NOTE });
+  refuse(outcome.text);
+}
+
 function parseMode(value: string): PilotMode {
   if (!(PILOT_MODES as readonly string[]).includes(value))
     refuse("--mode must be rehearsal, testnet or live");
@@ -1117,5 +1345,68 @@ export function registerPilotCommands(
       await withPilot(open, async (ctx) =>
         print(failCase(ctx, id, reason, !!opts.force, !!opts.yes, deps.now())),
       );
+    });
+
+  program
+    .command("pilot:dispute")
+    .description(
+      "file a contested pilot case with Kleros (test data): print the pre-flight; with --yes (and --testnet or --live in those modes) pin the delivered file, create the dispute and submit the evidence, once",
+    )
+    .requiredOption("--case <caseId>", "the contested pilot case")
+    .option(
+      "--script <script>",
+      `the fake's script; rehearsal mode only (default ${DEFAULT_SCRIPT})`,
+    )
+    .option(
+      "--allow-standing <standing>",
+      "accept a legal body of this standing; the evidence says so",
+    )
+    .option("--testnet", "confirm a filing on the Kleros testnet court; testnet mode only")
+    .option("--live", "confirm a filing on the Kleros live court; live mode only")
+    .option("--yes", "confirm: file")
+    .action(async (opts: DisputeOptions) => {
+      // Options are checked and the stage built before the context opens, so a refused option
+      // never opens the database.
+      const cfg = deps.readConfig();
+      const parsed = parseDispute(opts, cfg);
+      const stage = deps.buildStage(
+        cfg,
+        parsed.mode === "rehearsal" ? { script: parsed.script ?? DEFAULT_SCRIPT } : {},
+      );
+      await withPilot(open, async (ctx) => print(await dispute(ctx, deps, stage, parsed)));
+    });
+
+  program
+    .command("pilot:kleros")
+    .description("the Kleros Dispute Service the mode selects")
+    .command("check")
+    .description(
+      "read the key's tools, its instructions and the court's clock, and name every problem; sends nothing",
+    )
+    .option(
+      "--real-reads <testnet|live>",
+      "rehearsal mode only: read that deployment with its key, writes disabled",
+    )
+    .action(async (opts: { realReads?: string }) => {
+      const cfg = deps.readConfig();
+      const mode = cfg.pilot?.mode;
+      if (!mode) refuse("the pilot keys are not set on this box");
+      let realReads: "testnet" | "live" | undefined;
+      if (opts.realReads !== undefined) {
+        if (opts.realReads !== "testnet" && opts.realReads !== "live")
+          refuse("--real-reads must be testnet or live");
+        if (mode !== "rehearsal")
+          refuse(
+            `--real-reads is accepted in rehearsal mode only, and this box runs in ${mode} mode`,
+          );
+        realReads = opts.realReads;
+      }
+      const stage = deps.buildStage(cfg, realReads === undefined ? {} : { realReads });
+      const result = await deps.checkKleros(stage);
+      print({ mode, ...result });
+      if (result.problems.length > 0)
+        refuse(
+          `the Kleros check found ${result.problems.length} problem${result.problems.length === 1 ? "" : "s"}: ${result.problems.join("; ")}`,
+        );
     });
 }
