@@ -810,6 +810,8 @@ describe("pilot:dispute end to end", () => {
       identityRegistry: "0x0000000000000000000000000000000000000005",
       ownerOf: (id) =>
         ({ "1001": jobClientAccount.address as Address, "1002": ADDR.seller })[id.toString()],
+      // The job's pre-flight reads every party's gas: each holds some.
+      nativeBalanceOf: () => 10n ** 18n,
     });
     node.mint(jobClientAccount.address as Address, 10_000_000n);
     const db = new Database(":memory:");

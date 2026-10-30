@@ -9,7 +9,7 @@
  */
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { type Address, type Hex, keccak256, sha256, stringToBytes } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -110,6 +110,8 @@ function setup(
     answerTransactions: true,
     identityRegistry: REGISTRY,
     ownerOf: (id) => ({ [BUYER_AGENT]: BUYER, [SELLER_AGENT]: SELLER })[id.toString()],
+    // The job's pre-flight reads every party's gas: each holds some.
+    nativeBalanceOf: () => 10n ** 18n,
   });
   node.mint(BUYER, 10_000_000n);
   const db = openDatabase(":memory:");
@@ -1101,13 +1103,13 @@ describe("the pre-flight refuses, and writes nothing", () => {
 });
 
 describe("the delivered file, read back and checked twice", () => {
-  test("the row's absolute path and the store's flat id both find the file", async () => {
+  test("the store's flat id and an older row's absolute path both find the file", async () => {
     const h = setup();
     const row = await h.contested();
-    expect(row.deliverablePath).toMatch(/^\//);
+    expect(row.deliverablePath).toMatch(/^pilot-/);
     const { stage } = rehearsal();
     expect((await preflightDispute(h.deps(stage), row.caseId, {})).ok).toBe(true);
-    h.cases.patch(row.caseId, { deliverablePath: basename(row.deliverablePath!) });
+    h.cases.patch(row.caseId, { deliverablePath: join(h.docDir, row.deliverablePath!) });
     expect((await preflightDispute(h.deps(stage), row.caseId, {})).ok).toBe(true);
   });
 
@@ -1161,12 +1163,13 @@ describe("the delivered file, read back and checked twice", () => {
     ],
     [
       "a deliverable missing from the store",
-      (h: Harness, r: PilotCaseRecord) => rmSync(r.deliverablePath!),
+      (h: Harness, r: PilotCaseRecord) => rmSync(join(h.docDir, r.deliverablePath!)),
       "cannot be read",
     ],
     [
       "a stored file whose bytes changed",
-      (_h: Harness, r: PilotCaseRecord) => writeFileSync(r.deliverablePath!, "date,amount\n"),
+      (h: Harness, r: PilotCaseRecord) =>
+        writeFileSync(join(h.docDir, r.deliverablePath!), "date,amount\n"),
       "hashes to",
     ],
     [
