@@ -1,49 +1,39 @@
 import Link from "next/link";
 
+type Tone = "ink" | "paper";
+
 type Props = {
   className?: string;
-  tone?: "ink" | "paper";
+  tone?: Tone;
 };
 
-/** Shared mark — matches app/icon.svg: rounded square, cream serif N, no accent dot. */
-function Mark({ tone = "ink" }: { tone?: "ink" | "paper" }) {
-  const ink = tone === "ink";
+const LOCKUP: Record<Tone, string> = {
+  ink: "/logo/novi-corpus-lockup-white.png",
+  paper: "/logo/novi-corpus-lockup-black.png",
+};
+
+const MARK: Record<Tone, string> = {
+  ink: "/logo/novi-corpus-mark-white.png",
+  paper: "/logo/novi-corpus-mark-black.png",
+};
+
+/** Courthouse mark. `ink` is the light mark for dark surfaces. */
+function Mark({ tone = "ink" }: { tone?: Tone }) {
   return (
-    <span
-      className={`inline-flex h-7 w-7 items-center justify-center rounded-[5px] border ${
-        ink
-          ? "border-line-strong bg-paper-2 text-[#EDE8DE]"
-          : "border-line-dark-strong bg-ink-3 text-[#EDE8DE]"
-      }`}
-    >
-      <span
-        className="text-[18px] leading-none -mt-0.5"
-        style={{ fontFamily: "Georgia, 'Times New Roman', Times, serif" }}
-      >
-        N
-      </span>
-    </span>
+    // eslint-disable-next-line @next/next/no-img-element
+    <img src={MARK[tone]} alt="" className="h-7 w-7 object-contain" />
   );
 }
 
 export function Wordmark({ className = "", tone = "ink" }: Props) {
-  const ink = tone === "ink";
   return (
     <Link
       href="/"
-      className={`group inline-flex items-center gap-2.5 ${className}`}
+      className={`group inline-flex items-center ${className}`}
       aria-label="Novi Corpus home"
     >
-      <Mark tone={tone} />
-      <span className="flex flex-col gap-1">
-        <span
-          className={`text-[15px] font-medium leading-tight tracking-tight ${
-            ink ? "text-ink" : "text-ink"
-          }`}
-        >
-          Novi Corpus
-        </span>
-      </span>
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img src={LOCKUP[tone]} alt="" className="h-8 w-auto" />
     </Link>
   );
 }
