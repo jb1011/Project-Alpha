@@ -318,6 +318,91 @@ input[type="reset"]:disabled {
   animation: guardianGlow 3.4s ease-in-out infinite;
 }
 
+/* Voxel bot pacing the sign in floor. The drawing faces right; the return trip flips it. */
+.voxel-track {
+  pointer-events: none;
+  position: fixed;
+  inset-inline: 0;
+  bottom: 0;
+  z-index: 0;
+  height: 11rem;
+  overflow: hidden;
+}
+
+.voxel-ground {
+  position: absolute;
+  inset-inline: 0;
+  bottom: 0;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.voxel-pace {
+  position: absolute;
+  bottom: -0.35rem;
+  left: 0;
+  width: 9.25rem;
+  height: 9.25rem;
+  animation: voxel-pace 12s linear infinite alternate;
+  will-change: transform;
+}
+
+.voxel-face {
+  width: 100%;
+  height: 100%;
+  transform-origin: center 72%;
+  animation: voxel-face 24s linear infinite;
+}
+
+.voxel-svg,
+.voxel-svg svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.voxel-leg {
+  transform-box: fill-box;
+  transform-origin: center bottom;
+}
+
+.voxel-leg-l {
+  animation: voxel-leg 0.52s ease-in-out infinite;
+}
+
+.voxel-leg-r {
+  animation: voxel-leg 0.52s ease-in-out infinite;
+  animation-delay: -0.26s;
+}
+
+.voxel-body {
+  transform-box: view-box;
+  transform-origin: 64px 108px;
+  animation: voxel-body 0.52s ease-in-out infinite;
+}
+
+@keyframes voxel-pace {
+  from { transform: translate3d(0.75rem, 0, 0); }
+  to { transform: translate3d(calc(100vw - 100% - 0.75rem), 0, 0); }
+}
+
+@keyframes voxel-face {
+  0%, 49.999% { transform: scaleX(1); }
+  50%, 100% { transform: scaleX(-1); }
+}
+
+@keyframes voxel-leg {
+  0%, 42%, 100% { transform: translate3d(0, 0, 0); }
+  14% { transform: translate3d(5px, -10px, 0); }
+  28% { transform: translate3d(2px, -10px, 0); }
+}
+
+@keyframes voxel-body {
+  0%, 100% { transform: translateY(-2px); }
+  50% { transform: translateY(1px); }
+}
+
 .text-balance {
   text-wrap: balance;
 }
@@ -355,5 +440,16 @@ input[type="reset"]:disabled {
   .guardian-glow {
     animation: none;
     filter: drop-shadow(0 0 4px rgba(110, 231, 183, 0.55));
+  }
+  .voxel-pace {
+    animation: none;
+    transform: translate3d(1.25rem, 0, 0);
+  }
+  .voxel-face,
+  .voxel-leg,
+  .voxel-leg-l,
+  .voxel-leg-r,
+  .voxel-body {
+    animation: none;
   }
 }

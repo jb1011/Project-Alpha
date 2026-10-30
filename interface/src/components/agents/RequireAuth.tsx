@@ -1,10 +1,17 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import { useCallback, useState, useSyncExternalStore, type ReactNode } from "react";
 import { Button, Callout, Card, Spinner } from "@/components/onboarding/primitives";
 import { useAuth } from "@/components/onboarding/AuthProvider";
 import { authPanelState } from "./authPanel";
 import { shortenErr } from "@/lib/errors";
+
+/** DiceBear's portrait package breaks the server bundle, same as the agent face. */
+const WalkingVoxel = dynamic(
+  () => import("@/components/agents/WalkingVoxel").then((mod) => mod.WalkingVoxel),
+  { ssr: false },
+);
 
 export function RequireAuth({ children }: { children: ReactNode }) {
   const { session, isConnected, isConnecting, isLoggingIn, connectWallet, login } =
@@ -49,8 +56,9 @@ export function RequireAuth({ children }: { children: ReactNode }) {
   if (session) return <>{children}</>;
 
   return (
-    <div className="mx-auto max-w-md px-5 py-24">
-      <Card className="p-6 text-center">
+    <div className="flex min-h-screen items-center justify-center px-5 py-16 pb-40">
+      <WalkingVoxel />
+      <Card className="relative z-10 w-full max-w-md p-6 text-center">
         <h1 className="text-[22px] font-medium text-ink">Sign in to continue</h1>
         <p className="mt-2 text-[13px] leading-relaxed text-muted">
           Connect the guardian wallet you used when creating your agents.
