@@ -105,6 +105,8 @@ import {
   backfillPocketAddresses,
 } from "../persistence/tier0";
 import { SqliteWorldStore } from "../persistence/worldStore";
+import { SqlitePilotCaseRepository } from "../pilot/casesRepository";
+import { pilotExplorerBase, pilotLookupBase } from "../pilot/views";
 import { usdToUnits } from "../policy/units";
 import { externalRecordDeps } from "../trackRecord/sources";
 import type { Address } from "../types";
@@ -119,6 +121,7 @@ import { buildApiApp } from "./app";
 import { ApiError } from "./errors";
 import { TokenBucket } from "./routes/agentBook";
 import { bucketsByKey } from "./routes/legalBodyOrders";
+import type { PilotCaseDeps } from "./routes/pilotCases";
 import { buildWorldIdDeps } from "./routes/worldId";
 import { buildX402DemoDeps } from "./routes/x402Demo";
 import { installShutdownHandlers, shouldInstallSignalHandlers } from "./shutdown";
@@ -1070,6 +1073,25 @@ async function main() {
         }
       : undefined;
 
+  /**
+   * The dispute pilot's cases, public and read only (`GET /pilot/cases`), only on a box with the
+   * pilot block or the Kleros block: elsewhere there is no pilot and both routes are a 404. The
+   * table is read through the pilot's own repository (the API never writes it), and the stored
+   * evidence text and lookup answers through this API's document store. The two link bases come
+   * from the pilot's helpers, and the environment is the deployment's network, as the AgentBook
+   * deps name it.
+   */
+  const pilotCases: PilotCaseDeps | undefined =
+    cfg.pilot || cfg.kleros
+      ? {
+          cases: new SqlitePilotCaseRepository(db),
+          docStore,
+          explorerBase: pilotExplorerBase(cfg),
+          lookupBase: pilotLookupBase(cfg),
+          environment: cfg.arcNetwork ?? "testnet",
+        }
+      : undefined;
+
   const app = buildApiApp({
     webOrigin: cfg.webOrigin,
     nonceStore,
@@ -1227,6 +1249,8 @@ async function main() {
       network: agentBook.network,
     },
     standingExposure,
+    // The pilot's cases, where the pilot or the Kleros block is set.
+    pilotCases,
   });
 
   const port = Number(process.env.PORT ?? 8789);
