@@ -566,6 +566,9 @@ describe("pilot:dispute: the filing", () => {
       status: "contested",
     });
     expect(String(out.next)).toContain("nothing was sent");
+    expect(String(out.next)).toContain(
+      "the row is contested (an attachment already pinned is kept)",
+    );
   });
 
   test("filing_unknown: the hash is printed, the next step never files again, and the command fails", async () => {
@@ -620,7 +623,7 @@ describe("pilot:dispute on a row left at filing, testnet mode, through the real 
       ...(o.ids ? { coreDisputeId: "186", localDisputeId: "42" } : {}),
     });
     fake.cases.recordEvent(caseId, "filing", "started", "arbitrum-sepolia-testnet", null);
-    fake.cases.recordEvent(caseId, "create", "sending", null, null);
+    fake.cases.recordEvent(caseId, "dispute_create", "sending", null, null);
     const requests: string[] = [];
     vi.stubGlobal("fetch", async (url: string | URL | Request) => {
       requests.push(String(url));

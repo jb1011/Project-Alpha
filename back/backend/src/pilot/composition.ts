@@ -13,9 +13,9 @@ import type {
 } from "../adapters/kleros/disputeService";
 import { FakeDisputeService, type FakeScript } from "../adapters/kleros/fakeDisputeService";
 import { HttpDisputeService } from "../adapters/kleros/httpDisputeService";
-import { arcTestnet } from "../chains";
 import type { Config, PilotKlerosMode } from "../config/env";
 import type { PilotContext } from "./context";
+import { pilotExplorerBase } from "./views";
 
 /**
  * THE PILOT'S CHAIN SIDE: one job adapter whose client is the buyer and whose evaluator is the
@@ -37,8 +37,8 @@ export interface PilotChain {
 
 export function buildPilotChain(ctx: PilotContext): PilotChain {
   const { cfg } = ctx;
-  const explorerBase = cfg.arcExplorerUrl ?? arcTestnet.blockExplorers?.default.url;
-  if (!explorerBase) throw new Error("the pilot needs a block explorer URL (ARC_EXPLORER_URL)");
+  // The one source of the explorer base, shared with the public case view.
+  const explorerBase = pilotExplorerBase(cfg);
   return {
     job: new JobAdapter({
       publicClient: ctx.publicClient,
@@ -54,7 +54,7 @@ export function buildPilotChain(ctx: PilotContext): PilotChain {
     jobContract: cfg.jobContract,
     chainId: cfg.chainId,
     identityRegistry: cfg.identityRegistry,
-    explorerBase: explorerBase.replace(/\/+$/, ""),
+    explorerBase,
   };
 }
 

@@ -133,6 +133,13 @@ const UNAUTHORIZED = "unauthorized";
 const PIN_CHECKED_ONLY = "pin_checked_only";
 const FILING_IN_PROGRESS = "filing_in_progress";
 const FILING_MOVED = "filing_moved";
+/**
+ * The filing's event steps are the Dispute Service's own tool names, so a trail filtered by step
+ * never mixes them with the job's chain steps (`create`, `fund`, `submit`).
+ */
+const PIN_STEP = "evidence_pin";
+const CREATE_STEP = "dispute_create";
+const SUBMIT_STEP = "evidence_submit";
 const DELIVERABLE_EXTENSION_INVALID = "deliverable_extension_invalid";
 /** The extensions the Dispute Service attaches: one to ten lowercase letters or digits. */
 const SERVICE_EXTENSION = /^[a-z0-9]{1,10}$/;
@@ -233,14 +240,14 @@ export async function fileDispute(
   let attachment: { fileUri: string; cid: string };
   if (moved.attachmentUri !== null && moved.attachmentCid !== null) {
     attachment = { fileUri: moved.attachmentUri, cid: moved.attachmentCid };
-    cases.recordEvent(caseId, "pin", "reused", attachment.fileUri, attachment.cid);
+    cases.recordEvent(caseId, PIN_STEP, "reused", attachment.fileUri, attachment.cid);
   } else {
     let pinned: PinOutcome;
     try {
-      pinned = await write("pin", () => stage.service.pin({ bytes, extension }));
+      pinned = await write(PIN_STEP, () => stage.service.pin({ bytes, extension }));
     } catch (e) {
       const detail = klerosTextOf(e);
-      cases.recordEvent(caseId, "pin", refusedOrFailed(e), null, detail);
+      cases.recordEvent(caseId, PIN_STEP, refusedOrFailed(e), null, detail);
       const never = neverRanCodeOf(e);
       if (never) return backToContested(d, moved, never, neverRanTextOf(never));
       return backToContested(
@@ -253,7 +260,7 @@ export async function fileDispute(
     if (pinned.status === "checked") {
       cases.recordEvent(
         caseId,
-        "pin",
+        PIN_STEP,
         "checked",
         null,
         "the key checked the file and published nothing",
@@ -268,7 +275,7 @@ export async function fileDispute(
     const published = pinned;
     cases.transaction(() => {
       cases.patch(caseId, { attachmentUri: published.fileUri, attachmentCid: published.cid });
-      cases.recordEvent(caseId, "pin", "published", published.fileUri, published.cid);
+      cases.recordEvent(caseId, PIN_STEP, "published", published.fileUri, published.cid);
     });
     attachment = { fileUri: published.fileUri, cid: published.cid };
   }
@@ -284,13 +291,13 @@ export async function fileDispute(
   };
   let created: CreateOutcome;
   try {
-    created = await write("create", () => {
+    created = await write(CREATE_STEP, () => {
       let current: PilotCaseRecord | undefined;
       try {
         current = cases.transaction(() => {
           const now = cases.find(caseId);
           if (now?.status === "filing" && now.filingStartedAt === moved.filingStartedAt)
-            cases.recordEvent(caseId, "create", "sending", null, null);
+            cases.recordEvent(caseId, CREATE_STEP, "sending", null, null);
           return now;
         });
       } catch (e) {
@@ -304,22 +311,22 @@ export async function fileDispute(
   } catch (e) {
     if (e instanceof MarkFailedError) {
       const text = `the create could not be marked as sending, so nothing was sent: ${e.text}`;
-      cases.recordEvent(caseId, "create", "not_marked", null, text);
+      cases.recordEvent(caseId, CREATE_STEP, "not_marked", null, text);
       return backToContested(d, moved, null, text);
     }
     if (e instanceof FilingMovedError) {
       const text = `pilot case ${caseId} moved from this command's filing before its create (it is now ${e.status}, or filed again by another command): nothing was sent; read pilot:case show ${caseId}`;
-      cases.recordEvent(caseId, "create", FILING_MOVED, null, text);
+      cases.recordEvent(caseId, CREATE_STEP, FILING_MOVED, null, text);
       return notSent(FILING_MOVED, text);
     }
     const detail = klerosTextOf(e, KLEROS_FILING_TEXT_MAX);
     const never = neverRanCodeOf(e);
     if (never) {
-      cases.recordEvent(caseId, "create", "refused", null, detail);
+      cases.recordEvent(caseId, CREATE_STEP, "refused", null, detail);
       return backToContested(d, moved, never, neverRanTextOf(never));
     }
     if (e instanceof KlerosRefusal && sentOf("dispute_create", e.code) === "no") {
-      cases.recordEvent(caseId, "create", "refused", null, detail);
+      cases.recordEvent(caseId, CREATE_STEP, "refused", null, detail);
       return backToContested(
         d,
         moved,
@@ -328,7 +335,7 @@ export async function fileDispute(
       );
     }
     // Anything else may have been sent: never file again.
-    cases.recordEvent(caseId, "create", "unknown", null, detail);
+    cases.recordEvent(caseId, CREATE_STEP, "unknown", null, detail);
     return frozenFiling(
       d,
       caseId,
@@ -339,12 +346,12 @@ export async function fileDispute(
   if (created.status === "simulated") {
     // A documented status of the service that neither key should give: nothing exists.
     const text = `${PRESET_SIMULATES}: the key simulated the filing; nothing was sent and no dispute exists. Read the key's instructions with pilot:kleros check`;
-    cases.recordEvent(caseId, "create", "simulated", null, text);
+    cases.recordEvent(caseId, CREATE_STEP, "simulated", null, text);
     return backToContested(d, moved, PRESET_SIMULATES, text);
   }
   if (created.status === "unknown") {
     const text = klerosTextOf(created.text, KLEROS_FILING_TEXT_MAX);
-    cases.recordEvent(caseId, "create", "unknown", created.txHash ?? null, text);
+    cases.recordEvent(caseId, CREATE_STEP, "unknown", created.txHash ?? null, text);
     return frozenFiling(d, caseId, created.txHash, text);
   }
   const { coreDisputeId, localDisputeId, txHash: createTx } = created;
@@ -357,7 +364,7 @@ export async function fileDispute(
       createDisputeTx: createTx,
       filedAt: (d.now ?? unixNow)(),
     });
-    cases.recordEvent(caseId, "create", "mined", createTx, `dispute ${coreDisputeId}`);
+    cases.recordEvent(caseId, CREATE_STEP, "mined", createTx, `dispute ${coreDisputeId}`);
   });
   const filed = { coreDisputeId, ...(localDisputeId === undefined ? {} : { localDisputeId }) };
 
@@ -365,7 +372,7 @@ export async function fileDispute(
   //    dispute exists whatever the answer, so the row never goes back to `contested`.
   let submitted: SubmitOutcome;
   try {
-    submitted = await write("submit", () =>
+    submitted = await write(SUBMIT_STEP, () =>
       stage.service.submitEvidence({
         coreDisputeId,
         name: pre.evidence.name,
@@ -377,24 +384,24 @@ export async function fileDispute(
   } catch (e) {
     const detail = klerosTextOf(e, KLEROS_FILING_TEXT_MAX);
     const refused = e instanceof KlerosRefusal || neverRanCodeOf(e) !== undefined;
-    cases.recordEvent(caseId, "submit", refused ? "refused" : "unknown", null, detail);
+    cases.recordEvent(caseId, SUBMIT_STEP, refused ? "refused" : "unknown", null, detail);
     return evidenceInDoubt(d, moved, filed, undefined, detail);
   }
   if (submitted.status === "simulated") {
     const text = `${PRESET_SIMULATES}: the key simulated the evidence; nothing was submitted`;
-    cases.recordEvent(caseId, "submit", "simulated", null, text);
+    cases.recordEvent(caseId, SUBMIT_STEP, "simulated", null, text);
     return evidenceInDoubt(d, moved, filed, undefined, text);
   }
   if (submitted.status === "unknown") {
     const text = klerosTextOf(submitted.text, KLEROS_FILING_TEXT_MAX);
-    cases.recordEvent(caseId, "submit", "unknown", submitted.txHash ?? null, text);
+    cases.recordEvent(caseId, SUBMIT_STEP, "unknown", submitted.txHash ?? null, text);
     return evidenceInDoubt(d, moved, filed, submitted.txHash, text);
   }
   const evidenceTx = submitted.txHash;
   cases.transaction(() => {
     const facts = { evidenceTx, evidenceStatus: "mined" };
     if (!cases.advance(caseId, "filing", "filed", facts)) cases.patch(caseId, facts);
-    cases.recordEvent(caseId, "submit", "mined", evidenceTx, null);
+    cases.recordEvent(caseId, SUBMIT_STEP, "mined", evidenceTx, null);
   });
   noteFiled(moved, coreDisputeId);
   return { outcome: "filed", ...filed, evidenceStatus: "mined" };
@@ -727,7 +734,7 @@ function otherDeploymentProblemOf(
 }
 
 function capProblemOf(mode: string, count: number, cap: number): string {
-  return `the ${mode} cap is reached: ${count} ${mode} cases filed or in doubt, of ${cap}; nothing was sent`;
+  return `the ${mode} cap is reached: ${count} ${mode} cases filed, in doubt or failed after filing, of ${cap}; nothing was sent`;
 }
 
 function statusProblemOf(row: PilotCaseRecord): string {
@@ -767,7 +774,7 @@ function createWasMarked(cases: PilotCaseRepository, row: PilotCaseRecord): bool
   events.forEach((e, i) => {
     if (e.step === "filing" && e.status === "started") start = i;
   });
-  return events.slice(start + 1).some((e) => e.step === "create" && e.status === "sending");
+  return events.slice(start + 1).some((e) => e.step === CREATE_STEP && e.status === "sending");
 }
 
 function filingProblemOf(d: FileDisputeDeps, row: PilotCaseRecord): string {

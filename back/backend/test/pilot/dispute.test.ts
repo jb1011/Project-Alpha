@@ -478,10 +478,10 @@ describe("a rehearsal: the fake, script by script", () => {
       expect(trail(h, row.caseId)).toEqual([
         ["evidence", "stored", done.evidenceSha256],
         ["filing", "started", "fake"],
-        ["pin", "published", done.attachmentUri],
-        ["create", "sending", null],
-        ["create", "mined", done.createDisputeTx],
-        ["submit", "mined", done.evidenceTx],
+        ["evidence_pin", "published", done.attachmentUri],
+        ["dispute_create", "sending", null],
+        ["dispute_create", "mined", done.createDisputeTx],
+        ["evidence_submit", "mined", done.evidenceTx],
       ]);
       expect(h.sleeps).toEqual([]);
     },
@@ -502,7 +502,7 @@ describe("a rehearsal: the fake, script by script", () => {
     expect(done.coreDisputeId).toBeNull();
     expect(done.error).toContain("must not be filed again");
     expect(kleros.calls.map((c) => c.tool)).not.toContain("evidence_submit");
-    expect(trail(h, row.caseId).at(-1)).toEqual(["create", "unknown", txHash]);
+    expect(trail(h, row.caseId).at(-1)).toEqual(["dispute_create", "unknown", txHash]);
   });
 
   test("unknown-create, then the same command again: zero create calls the second time", async () => {
@@ -537,7 +537,7 @@ describe("a rehearsal: the fake, script by script", () => {
     expect(done.evidenceStatus).toBe("unknown");
     expect(done.evidenceTx).toMatch(/^0x[0-9a-f]{64}$/);
     expect(done.coreDisputeId).toBe("1000");
-    expect(trail(h, row.caseId).at(-1)).toEqual(["submit", "unknown", done.evidenceTx]);
+    expect(trail(h, row.caseId).at(-1)).toEqual(["evidence_submit", "unknown", done.evidenceTx]);
   });
 
   test("write-in-progress-once: one more call at once, with no wait of its own, then filed", async () => {
@@ -551,7 +551,7 @@ describe("a rehearsal: the fake, script by script", () => {
     expect(h.sleeps).toEqual([]);
     expect(kleros.calls.filter((c) => c.tool === "dispute_create")).toHaveLength(2);
     expect(h.cases.find(row.caseId)?.status).toBe("filed");
-    const creates = trail(h, row.caseId).filter(([step]) => step === "create");
+    const creates = trail(h, row.caseId).filter(([step]) => step === "dispute_create");
     expect(creates.map(([, status]) => status)).toEqual([
       "sending",
       "write_in_progress",
@@ -582,7 +582,7 @@ describe("a rehearsal: the fake, script by script", () => {
     const done = h.cases.find(row.caseId)!;
     expect(done.status).toBe("evidence_unknown");
     expect(done.error).toContain("WRITE_IN_PROGRESS");
-    const submits = trail(h, row.caseId).filter(([step]) => step === "submit");
+    const submits = trail(h, row.caseId).filter(([step]) => step === "evidence_submit");
     expect(submits.map(([, status]) => status)).toEqual(["write_in_progress", "refused"]);
   });
 
@@ -627,7 +627,7 @@ describe("a rehearsal: the fake, script by script", () => {
       expect(kleros.calls.map((c) => c.tool)).not.toContain("evidence_submit");
       const last = h.cases.events(row.caseId).at(-1)!;
       expect([last.step, last.status]).toEqual([
-        "create",
+        "dispute_create",
         script === "simulated" ? "simulated" : "refused",
       ]);
       expect(last.detail).toContain(code);
@@ -855,7 +855,9 @@ describe("the caps and the live gate", () => {
     const { stage, seen } = http("testnet");
     const out = await fileDispute(h.deps(stage), row.caseId, { confirmedFlag: "--testnet" });
     expect(notSent(out)).toBe(true);
-    expect(textOf(out)).toContain("cap");
+    expect(textOf(out)).toContain(
+      "the testnet cap is reached: 10 testnet cases filed, in doubt or failed after filing, of 10",
+    );
     expect(seen).toEqual([]);
     expect(h.cases.find(row.caseId)?.status).toBe("contested");
   });
@@ -1427,7 +1429,7 @@ describe("the move to filing, and the mark before the create", () => {
       get(target, prop, receiver) {
         if (prop === "recordEvent")
           return (...a: Parameters<typeof target.recordEvent>) => {
-            if (a[1] === "pin" && a[2] === "published") pinned = true;
+            if (a[1] === "evidence_pin" && a[2] === "published") pinned = true;
             target.recordEvent(...a);
           };
         if (prop === "transaction")
@@ -1448,8 +1450,8 @@ describe("the move to filing, and the mark before the create", () => {
     expect(kleros.calls.filter((c) => c.tool === "dispute_create")).toEqual([]);
     const done = h.cases.find(row.caseId)!;
     expect([done.status, done.createDisputeTx]).toEqual(["contested", null]);
-    // The filing's own trail (the job step's chain create is also a "create" event).
-    const creates = trail(h, row.caseId).filter(([step]) => step === "create");
+    // The filing's own trail, from its pre-flight on.
+    const creates = trail(h, row.caseId).filter(([step]) => step === "dispute_create");
     expect(creates.map(([, status]) => status)).toEqual(["not_marked"]);
   });
 
@@ -1484,7 +1486,9 @@ describe("the move to filing, and the mark before the create", () => {
         aliases: Record<string, Address>;
       }): Promise<CreateOutcome> {
         const trailNow = h.cases.events(row.caseId);
-        marked.push(trailNow.at(-1)?.step === "create" && trailNow.at(-1)?.status === "sending");
+        marked.push(
+          trailNow.at(-1)?.step === "dispute_create" && trailNow.at(-1)?.status === "sending",
+        );
         return super.createDispute(p);
       }
     }
@@ -1564,7 +1568,7 @@ describe("a filing that stopped part way", () => {
       ...(o.ids ? { coreDisputeId: "77", localDisputeId: "78", createDisputeTx: CREATE_TX } : {}),
     });
     h.cases.recordEvent(row.caseId, "filing", "started", "fake", null);
-    if (o.createSent) h.cases.recordEvent(row.caseId, "create", "sending", null, null);
+    if (o.createSent) h.cases.recordEvent(row.caseId, "dispute_create", "sending", null, null);
   }
 
   test("under 30 minutes old, a filing is in progress: wait, with no move and no call", async () => {
@@ -1612,7 +1616,7 @@ describe("a filing that stopped part way", () => {
     const h = setup();
     const row = await h.contested();
     // A create marked on an earlier attempt is not this attempt's: the text reads this one's.
-    h.cases.recordEvent(row.caseId, "create", "sending", null, null);
+    h.cases.recordEvent(row.caseId, "dispute_create", "sending", null, null);
     atFiling(h, row, { startedAgo: 3_600 });
     const { stage, kleros } = rehearsal();
 
@@ -1706,8 +1710,10 @@ describe("a filing that stopped part way", () => {
     ]);
     expect(done.error).toContain("no create was marked as sent");
     const trailNow = h.cases.events(row.caseId);
-    expect(trailNow.filter((e) => e.step === "create" && e.status === "sending")).toEqual([]);
-    expect(trailNow.at(-1)).toMatchObject({ step: "create", status: "filing_moved" });
+    expect(trailNow.filter((e) => e.step === "dispute_create" && e.status === "sending")).toEqual(
+      [],
+    );
+    expect(trailNow.at(-1)).toMatchObject({ step: "dispute_create", status: "filing_moved" });
   });
 
   test("a slow command whose row another command is filing again (a new filing start) sends nothing", async () => {
@@ -2135,7 +2141,7 @@ describe("what the service answers on the writes", () => {
     expect(done.status).toBe("filing_unknown");
     expect(done.error).toContain('"coreDisputeID":"186","localDisputeID":"42"');
     const event = h.cases.events(row.caseId).at(-1)!;
-    expect([event.step, event.status]).toEqual(["create", "unknown"]);
+    expect([event.step, event.status]).toEqual(["dispute_create", "unknown"]);
     expect(event.detail).toContain('"coreDisputeID":"186"');
   });
 
@@ -2244,6 +2250,57 @@ describe("what the service answers on the writes", () => {
     expect(seen.map((s) => s.tool)).not.toContain("dispute_create");
     expect(h.cases.find(row.caseId)?.status).toBe("contested");
   });
+});
+
+test("a case's trail names the filing's steps by the service's tools, and the job's by its own", async () => {
+  const h = setup();
+  // Every kind of filing writes its steps: filed, a call once more after WRITE_IN_PROGRESS, an
+  // evidence in doubt, a refused create, a create in doubt, and a re-filing that reuses its pin.
+  const filings: (FakeScript | "refile")[] = [
+    "pay",
+    "write-in-progress-once",
+    "unknown-submit",
+    "insufficient-balance",
+    "unknown-create",
+    "refile",
+  ];
+  const trails: { step: string; status: string }[][] = [];
+  for (const kind of filings) {
+    const row = await h.contested();
+    if (kind === "refile") {
+      await fileDispute(h.deps(rehearsal("insufficient-balance").stage), row.caseId, {
+        confirmedFlag: null,
+      });
+      await fileDispute(h.deps(rehearsal("pay").stage), row.caseId, { confirmedFlag: null });
+    } else {
+      await fileDispute(h.deps(rehearsal(kind).stage), row.caseId, { confirmedFlag: null });
+    }
+    trails.push(h.cases.events(row.caseId));
+  }
+  const FILING_STEPS = ["evidence", "filing", "evidence_pin", "dispute_create", "evidence_submit"];
+  for (const events of trails) {
+    const from = events.findIndex((e) => e.step === "evidence");
+    expect(from).toBeGreaterThan(0);
+    const job = events.slice(0, from).map((e) => e.step);
+    const filing = events.slice(from).map((e) => e.step);
+    // The job's chain steps keep their own names, and only the job's do.
+    expect(job).toEqual(expect.arrayContaining(["create", "fund", "submit"]));
+    for (const step of filing) expect(FILING_STEPS).toContain(step);
+    for (const old of ["create", "submit", "pin"]) expect(filing).not.toContain(old);
+  }
+  const all = trails.flat();
+  for (const [step, status] of [
+    ["evidence_pin", "published"],
+    ["evidence_pin", "reused"],
+    ["dispute_create", "sending"],
+    ["dispute_create", "write_in_progress"],
+    ["dispute_create", "mined"],
+    ["dispute_create", "refused"],
+    ["dispute_create", "unknown"],
+    ["evidence_submit", "mined"],
+    ["evidence_submit", "unknown"],
+  ])
+    expect(all, `${step}/${status}`).toContainEqual(expect.objectContaining({ step, status }));
 });
 
 test("no key reaches an outcome, a row, an event, a stored file or a log line", async () => {
