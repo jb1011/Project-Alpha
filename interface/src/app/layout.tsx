@@ -24,6 +24,10 @@ export const metadata: Metadata = {
       "Agents with enforceable spending rules, Wyoming DAO LLC operating agreements, custody choice, and guardian controls. Deploy and fund on Arc.",
     type: "website",
   },
+  icons: {
+    icon: "/favicon.ico",
+    apple: "/logo/apple-touch-icon-180.png",
+  },
 };
 
 export default function RootLayout({

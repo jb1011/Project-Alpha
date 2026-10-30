@@ -6,7 +6,7 @@ import { Mark, Wordmark } from "@/components/landing/Wordmark";
 
 export const metadata: Metadata = {
   title: "Novi Corpus brand kit",
-  description: "Marks and color for Novi Corpus. Download the lockup and the N.",
+  description: "Marks and color for Novi Corpus. Download the lockup and the courthouse mark.",
 };
 
 const marks: {
@@ -15,25 +15,51 @@ const marks: {
   src: string;
   file: string;
   wide?: boolean;
+  onDark: boolean;
 }[] = [
   {
-    title: "Full lockup",
-    note: "Wordmark with the line Autonomous entities. The file includes a black field. Place it on dark backgrounds.",
-    src: "/novi-corpus-logo.jpg",
-    file: "novi-corpus-logo.jpg",
+    title: "Lockup, dark backgrounds",
+    note: "Courthouse mark with the name. Place it on dark backgrounds.",
+    src: "/logo/novi-corpus-lockup-white.png",
+    file: "novi-corpus-lockup-white.png",
     wide: true,
+    onDark: true,
   },
   {
-    title: "Mark",
-    note: "The N with the blue dot, cropped square. Use this when the full wordmark will not fit.",
-    src: "/novi-corpus-icon-n.png",
-    file: "novi-corpus-icon-n.png",
+    title: "Lockup, light backgrounds",
+    note: "The same lockup in black. Place it on light backgrounds.",
+    src: "/logo/novi-corpus-lockup-black.png",
+    file: "novi-corpus-lockup-black.png",
+    wide: true,
+    onDark: false,
   },
   {
-    title: "Mark, wide",
-    note: "The same N on a wide black field, for covers and slides.",
-    src: "/novi-corpus-icon-n-original.jpg",
-    file: "novi-corpus-icon-n-original.jpg",
+    title: "App icon, dark",
+    note: "Rounded square icon for the favicon and home screen on dark surfaces.",
+    src: "/logo/novi-corpus-icon-dark-1024.png",
+    file: "novi-corpus-icon-dark-1024.png",
+    onDark: true,
+  },
+  {
+    title: "App icon, light",
+    note: "Rounded square icon for light surfaces.",
+    src: "/logo/novi-corpus-icon-light-1024.png",
+    file: "novi-corpus-icon-light-1024.png",
+    onDark: false,
+  },
+  {
+    title: "Mark, white",
+    note: "The courthouse alone, for places the full lockup will not fit. Transparent background.",
+    src: "/logo/novi-corpus-mark-white.png",
+    file: "novi-corpus-mark-white.png",
+    onDark: true,
+  },
+  {
+    title: "Mark, black",
+    note: "The courthouse alone, in black, on a transparent background.",
+    src: "/logo/novi-corpus-mark-black.png",
+    file: "novi-corpus-mark-black.png",
+    onDark: false,
   },
 ];
 
@@ -43,10 +69,10 @@ const colors: { name: string; hex: string; role: string }[] = [
   { name: "Paper 3", hex: "#1A1A1A", role: "Deeper band" },
   { name: "Ink", hex: "#F2F0EA", role: "Primary text" },
   { name: "Muted", hex: "#9C9A92", role: "Secondary text" },
-  { name: "Accent", hex: "#4D8EF7", role: "Links and the blue dot" },
+  { name: "Accent", hex: "#4D8EF7", role: "Links" },
   { name: "Accent soft", hex: "#93C5FD", role: "Accent on dark" },
   { name: "Highlight", hex: "#6366F1", role: "Secondary accent" },
-  { name: "Mark cream", hex: "#EDE8DE", role: "The N" },
+  { name: "Mark cream", hex: "#EDE8DE", role: "Mark on dark backgrounds" },
 ];
 
 export default function BrandPage() {
@@ -64,14 +90,14 @@ export default function BrandPage() {
               {marks.map((mark) => (
                 <figure
                   key={mark.file}
-                  className={`overflow-hidden rounded-2xl border hairline bg-black ${
-                    mark.wide ? "lg:col-span-2" : ""
-                  }`}
+                  className={`overflow-hidden rounded-2xl border hairline ${
+                    mark.onDark ? "bg-black" : "bg-[#F4F1EA]"
+                  } ${mark.wide ? "lg:col-span-2" : ""}`}
                 >
                   <div
-                    className={`flex items-center justify-center bg-black ${
-                      mark.wide ? "h-56 sm:h-72" : "h-64"
-                    }`}
+                    className={`flex items-center justify-center ${
+                      mark.onDark ? "bg-black" : "bg-[#F4F1EA]"
+                    } ${mark.wide ? "h-56 sm:h-72" : "h-64"}`}
                   >
                     {/* eslint-disable-next-line @next/next/no-img-element */}
                     <img
@@ -111,11 +137,11 @@ export default function BrandPage() {
                   <Mark />
                 </div>
                 <p className="mt-4 text-[13.5px] leading-[1.55] text-muted">
-                  Navigation and the favicon use this N, set in Georgia, with no blue dot.
+                  Navigation uses the white lockup. The favicon uses the dark app icon.
                 </p>
                 <a
-                  href="/icon.svg"
-                  download="novi-corpus-icon.svg"
+                  href="/logo/novi-corpus-icon-dark-1024.png"
+                  download="novi-corpus-icon-dark-1024.png"
                   className="mt-4 inline-flex items-center text-[13px] text-accent-soft hover:text-ink"
                 >
                   Download app icon
