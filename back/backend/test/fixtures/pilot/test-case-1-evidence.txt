@@ -1,0 +1,37 @@
+**TEST DATA.** This case is part of the Kleros x Novi Corpus pilot. The job runs on Arc Testnet with testnet USDC, which has no value. The companies named below are test entities, not real filings. Both agents are test agents operated by Novi Corpus, which also operates the referee that filed this record: a controlled test. Please decide it as a case between unrelated parties.
+
+**1. The job in short.** The client agent created a job on Arc Testnet on 20 October 2026 and paid the price, 2.00 USDC (testnet), into the job's escrow. The provider agent submitted its delivery on 21 October 2026. The client agent contested it the same day. The job expires on 27 October 2026. The job's referee (its "evaluator") is run by Novi Corpus.
+
+**2. What the client asked for, word for word as written on chain:**
+"Deliver a CSV report of daily USDC transfer activity on Arc Testnet for 1 to 7 October 2026 (UTC). One row per day, 7 rows. Columns: date (YYYY-MM-DD), transfer_count, total_volume_usdc (USDC with 2 decimals, for example 512300.00). Source: public Arc Testnet on-chain data. Deliver as one CSV file."
+
+**3. What the provider delivered, word for word.** This is the delivered file. Its fingerprint (keccak256 hash), recorded on chain when the provider submitted it, matches this exact content (see section 8).
+
+```
+date,transfer_count,volume_raw
+2026-10-01,18402,512300000000000000000000
+2026-10-02,17951,498120000000000000000000
+2026-10-03,16210,441870000000000000000000
+2026-10-04,15876,430050000000000000000000
+2026-10-05,19033,527640000000000000000000
+```
+
+**4. The client's reason for contesting (21 October 2026):** "The report covers 5 of the 7 days required: 6 and 7 October are missing. The volume column is a raw integer under a different name, not total_volume_usdc in USDC with 2 decimals as the description requires. We ask for a refund."
+
+**5. The provider's reply (21 October 2026):** "The explorer API rate-limited our requests for 6 and 7 October. The five days delivered are correct. The volume column is the raw on-chain amount in Arc's native units, which have 18 decimals: 512300000000000000000000 is 512,300.00 USDC. Converting it is a one-line formatting step the client can do. We ask to be paid."
+
+**6. Who answers for each agent** (Novi Corpus records, snapshot taken when the case was created, 22 October 2026):
+- Client agent: "Novi Pilot Test Buyer DAO LLC" (test entity), a Wyoming DAO LLC, standing active, controlled by a person verified as a unique human (World ID).
+- Provider agent: "Novi Pilot Test Seller DAO LLC" (test entity), a Wyoming DAO LLC, standing active, controlled by a person verified as a unique human (World ID).
+
+These records say who answers for each agent. They say nothing about the quality of the work (dispute policy, section 2).
+
+**7. The question.** Did the provider agent deliver what the ERC-8183 job on Arc describes? Answer 1, "Pay the provider", or Answer 2, "Refund the client". The dispute policy linked to this case says how to decide.
+
+**8. On-chain references** (for anyone who wants to check):
+- Network: Arc Testnet, chain id 5042002. Job contract (ERC-8183): 0x0747EEf0706327138c69792bF28Cd525089e4583. Job id: 17.
+- Client agent: 0x70997970C51812dc3A010C7d01b50e0d17dc79C8, ERC-8004 agent id 1001, public record https://api.novicorpus.com/legal-bodies/by-agent/1001
+- Provider agent: 0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC, ERC-8004 agent id 1002, public record https://api.novicorpus.com/legal-bodies/by-agent/1002
+- Referee (evaluator): 0x90F79bf6EB2c4f870365E785982E1f101E93b906.
+- Transactions: job creation 0x3bc0c3e2d9d092b515f8170d4413bb3d5225a1d036d9c3026754882c1b3f969f, funding 0xb05ea8530f2bd62bf18878bd2c0bf7686ba1c56d251ea14e54c37b8f4bc68a83, submission 0x20d025688a024819f1f0efc77809ec830e72e5baf9e80edebbd212dfd4470d9b (explorer: https://explorer.testnet.arc.io).
+- Fingerprint of the delivered file recorded at submission: keccak256 0xadedff9ae723ade4bfc2b287cd6818eb22151ed6a168c50f6df101c97d6cffb5 (the CSV above as a UTF-8 file with LF line endings and one trailing newline, 241 bytes).

@@ -1,0 +1,57 @@
+{
+  "agentId": "1002",
+  "legalBody": true,
+  "standing": "active",
+  "publicId": "SENTINEL-seller-publicId",
+  "network": "testnet",
+  "links": {
+    "transparency": "SENTINEL-seller-links-transparency",
+    "statement": "SENTINEL-seller-links-statement"
+  },
+  "checkedAt": "2026-10-22T08:30:05.104Z",
+  "statement": {
+    "domain": {
+      "name": "SENTINEL-seller-domain-name",
+      "version": "SENTINEL-seller-domain-version",
+      "chainId": 5042002
+    },
+    "primaryType": "LegalBodyStatement",
+    "message": {
+      "chainId": "SENTINEL-seller-chainId",
+      "identityRegistry": "0x1111111111111111111111111111111111111111",
+      "factory": "0x2222222222222222222222222222222222222222",
+      "legalBody": "0x4444444444444444444444444444444444444444",
+      "agentId": "1002",
+      "agentWallet": "0x976EA74026E726554dB657fA54763abd0C3a0aa9",
+      "identityOwnerAtCreation": "0x14dC79964da2C08b23698B3D3cc7Ca32193d9955",
+      "bindingState": "linked",
+      "identityOwnerIsContract": false,
+      "agentWalletIsContract": false,
+      "standing": "active",
+      "attestationState": "active",
+      "jurisdiction": "WY",
+      "entityType": "LLC",
+      "legalName": "Novi Pilot Test Seller DAO LLC",
+      "filingNumber": "TEST-PILOT-SELLER-01",
+      "source": "customer",
+      "environment": "sandbox",
+      "controlVerified": true,
+      "existenceCheckedAt": "SENTINEL-seller-existenceCheckedAt",
+      "filedAt": "SENTINEL-seller-filedAt",
+      "einIssued": false,
+      "filingStatus": "not_yet_due",
+      "lastFiledPeriod": "SENTINEL-seller-lastFiledPeriod",
+      "lastFiledAt": "SENTINEL-seller-lastFiledAt",
+      "lastFiledConfirmedBy": "",
+      "nextDue": "SENTINEL-seller-nextDue",
+      "oaManifestHash": "0xd6fc5a90a53f82047467fa4fa23baf9db990906f6d25bb9a7bfbcc5d7c50bcae",
+      "oaManifestVersion": "SENTINEL-seller-oaManifestVersion",
+      "guardianHumanVerified": true,
+      "observedAtBlock": "SENTINEL-seller-observedAtBlock",
+      "issuedAt": "SENTINEL-seller-issuedAt",
+      "expiresAt": "SENTINEL-seller-expiresAt"
+    },
+    "attestor": "0x23618e81E3f5cdF7f54C3d65f7FBc0aBf5B21E8f",
+    "signature": "0x5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e"
+  }
+}
