@@ -474,3 +474,46 @@ describe("Pilot config: redaction", () => {
     expect(r.kleros.apiKeyLive).toBe("REDACTED");
   });
 });
+
+describe("Pilot config: the two agent ids", () => {
+  test("unset by default", () => {
+    const cfg = loadConfig({ ...BASE, ...PILOT_KEYS });
+    expect(cfg.pilot?.buyerAgentId).toBeUndefined();
+    expect(cfg.pilot?.sellerAgentId).toBeUndefined();
+  });
+
+  test("decimal ids are carried as strings; blank is unset", () => {
+    const cfg = loadConfig({
+      ...BASE,
+      ...PILOT_KEYS,
+      PILOT_BUYER_AGENT_ID: "12",
+      PILOT_SELLER_AGENT_ID: "0",
+    });
+    expect(cfg.pilot?.buyerAgentId).toBe("12");
+    expect(cfg.pilot?.sellerAgentId).toBe("0");
+    expect(
+      loadConfig({ ...BASE, ...PILOT_KEYS, PILOT_SELLER_AGENT_ID: " " }).pilot?.sellerAgentId,
+    ).toBeUndefined();
+  });
+
+  test.each([
+    ["PILOT_BUYER_AGENT_ID", "0x12"],
+    ["PILOT_BUYER_AGENT_ID", "012"],
+    ["PILOT_SELLER_AGENT_ID", "-1"],
+    ["PILOT_SELLER_AGENT_ID", "1.5"],
+    ["PILOT_SELLER_AGENT_ID", "1".repeat(79)],
+  ])("%s=%s is refused by name: an agent id is a decimal", (name, value) => {
+    expect(() => loadConfig({ ...BASE, ...PILOT_KEYS, [name]: value })).toThrow(new RegExp(name));
+  });
+
+  test("an agent id is bounded to uint256: 2^256 - 1 is accepted, 2^256 refused by name", () => {
+    const max = ((1n << 256n) - 1n).toString();
+    expect(
+      loadConfig({ ...BASE, ...PILOT_KEYS, PILOT_BUYER_AGENT_ID: max }).pilot?.buyerAgentId,
+    ).toBe(max);
+    for (const name of ["PILOT_BUYER_AGENT_ID", "PILOT_SELLER_AGENT_ID"])
+      expect(() => loadConfig({ ...BASE, ...PILOT_KEYS, [name]: (1n << 256n).toString() })).toThrow(
+        new RegExp(`${name}.*uint256`),
+      );
+  });
+});

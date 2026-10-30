@@ -27,13 +27,15 @@ import {
   custom,
   decodeFunctionData,
   defineChain,
+  encodeAbiParameters,
+  encodeEventTopics,
   encodeFunctionResult,
   keccak256,
   parseTransaction,
   recoverTransactionAddress,
 } from "viem";
 import { type PrivateKeyAccount, privateKeyToAccount } from "viem/accounts";
-import { iErc8183JobAbi } from "../../src/abis/generated";
+import { iErc8183JobAbi, iIdentityRegistryAbi } from "../../src/abis/generated";
 import { JobAdapter } from "../../src/adapters/arc/jobAdapter";
 import type { ReputationAdapter } from "../../src/adapters/arc/reputationAdapter";
 import { ChainTxRevertedError, ChainTxUnconfirmedError } from "../../src/errors";
@@ -45,6 +47,7 @@ import { type JobWorker, TrivialWorker } from "../../src/jobs/worker";
 import { withKeyedLock } from "../../src/payments/keyedMutex";
 import { migrate } from "../../src/persistence/db";
 import { SqliteEntityRepository } from "../../src/persistence/entityRepository";
+import { jobCreatedEventAbi, jobSubmittedEventAbi } from "../../src/pilot/jobEvents";
 import { FAKE_PROVIDER_ADDRESS, makeFakeDocStore, seedBoundEntity } from "./runJobDeps";
 
 /** The two ERC-20 entry points this node implements, as `jobAdapter.ts` calls them. */
@@ -92,7 +95,15 @@ const word = (v: bigint): Hex => `0x${v.toString(16).padStart(64, "0")}`;
 
 /** One state-changing call the node executed, in the order it executed them. */
 export interface NodeAction {
-  call: "approve" | "fund" | "createJob" | "complete" | "reject" | "claimRefund" | "other";
+  call:
+    | "approve"
+    | "fund"
+    | "createJob"
+    | "complete"
+    | "reject"
+    | "claimRefund"
+    | "submit"
+    | "other";
   from: Address;
   status: "success" | "reverted";
 }
@@ -138,7 +149,7 @@ export interface UsdcJobNodeOptions {
    * Accept the first `approve` (or `fund`) and then never produce its receipt — the transaction is
    * on the chain and we cannot read what it did. Withheld ONCE, so a later job still gets answers.
    */
-  withholdReceipt?: "approve" | "fund";
+  withholdReceipt?: "approve" | "fund" | "submit";
   /**
    * The chain's clock, in SECONDS — what the node answers as the block timestamp and what
    * `claimRefund` measures `expiredAt` against. A function, so a test can warp past an expiry
@@ -157,6 +168,51 @@ export interface UsdcJobNodeOptions {
   rejectPreflightFails?: boolean;
   /** Mine every `complete` as REVERTED — the second way a funded job dies after its money moved. */
   revertComplete?: boolean;
+  /**
+   * An identity registry at this address, answering `ownerOf` from {ownerOf}. Off by default: a
+   * node without it answers `0x` to every call outside the USDC and job contracts, as before.
+   */
+  identityRegistry?: Address;
+  /** The owner of an agent id, or undefined for an id that was never minted (the call reverts). */
+  ownerOf?: (agentId: bigint) => Address | undefined;
+  /**
+   * Run `submit` as the deployed contract does: a Funded job moves to Submitted and the receipt
+   * carries a `JobSubmitted(jobId, provider, deliverable)` log, the provider being the sender; any
+   * other status reverts. Off by default, where a submit is mined as `other` and changes nothing,
+   * as before.
+   */
+  runSubmit?: boolean;
+  /**
+   * With {runSubmit}, mine a successful `submit` without its `JobSubmitted` log: a contract that
+   * emits another shape or none. Off by default, where the log is written as before.
+   */
+  omitSubmittedLog?: boolean;
+  /**
+   * With {runSubmit}, write the `JobSubmitted` log with these values instead of the call's: a log
+   * that disagrees with the submit it came from. Off by default, where the log repeats the call.
+   */
+  skewJobSubmittedLog?: { deliverable?: Hex; provider?: Address };
+  /**
+   * Give a mined `createJob` a receipt carrying a `JobCreated` log of the deployed contract's
+   * shape. Off by default, where a create's receipt carries no log, as before.
+   */
+  emitJobCreatedLog?: boolean;
+  /**
+   * Mine the first `createJob` this many ids past the one its simulation answered, as if other
+   * creates landed in between. Off by default, where the mined id is the simulated one.
+   */
+  skewJobCreatedId?: bigint;
+  /**
+   * Answer `eth_getBalance` with the address's native (gas) balance. Off by default, where the
+   * node refuses the call as one it does not expect, as before.
+   */
+  nativeBalanceOf?: (address: Address) => bigint;
+  /**
+   * Answer `eth_getTransactionByHash` with the transaction the node accepted under that hash
+   * (pending, with no block, while its receipt is withheld). Off by default, where the node
+   * answers null to every hash, as before.
+   */
+  answerTransactions?: boolean;
 }
 
 export function usdcJobNode(opts: UsdcJobNodeOptions) {
@@ -172,6 +228,19 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
   /** `${address}:${nonce}` — a repeat is the collision the send lock exists to prevent. */
   const claimed = new Set<string>();
   const receipts = new Map<string, "0x1" | "0x0">();
+  /** A withheld receipt's status, published only by `releaseWithheld`. */
+  const withheldReceipts = new Map<string, "0x1" | "0x0">();
+  /** The logs a receipt carries, by transaction hash; only an opted-in `submit` writes one. */
+  const logsOf = new Map<string, { jobId: bigint; provider: Address; deliverable: Hex }>();
+  /** The `JobSubmitted` log of the transaction being executed, picked up when it is accepted. */
+  let pendingLog: { jobId: bigint; provider: Address; deliverable: Hex } | undefined;
+  /** The `JobCreated` logs a receipt carries, by hash; only an opted-in create writes one. */
+  const createdLogsOf = new Map<string, ChainJob>();
+  /** The created job of the transaction being executed, for {emitJobCreatedLog}. */
+  let pendingCreated: ChainJob | undefined;
+  let createSkewed = false;
+  /** The raw signed transaction accepted under each hash, for {answerTransactions}. */
+  const rawOf = new Map<string, Hex>();
   const actions: NodeAction[] = [];
   const sends: { hash: Hex; from: Address; nonce: number; to: Address }[] = [];
   let jobCounter = 0n;
@@ -222,6 +291,18 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
         return word(balanceOf(owner));
       }
     }
+    if (opts.identityRegistry && target === opts.identityRegistry.toLowerCase() && data) {
+      const asked = decodeFunctionData({ abi: iIdentityRegistryAbi, data });
+      if (asked.functionName === "ownerOf") {
+        const owner = opts.ownerOf?.(asked.args[0]);
+        if (!owner) throw new Error("execution reverted: ERC721NonexistentToken");
+        return encodeFunctionResult({
+          abi: iIdentityRegistryAbi,
+          functionName: "ownerOf",
+          result: owner,
+        });
+      }
+    }
     if (target === opts.jobContract.toLowerCase()) {
       if (decoded?.functionName === "createJob") return word(jobCounter + 1n);
       // THE READ THE REFUND DECISION IS MADE FROM. An unknown id answers the zero job, which is
@@ -262,6 +343,10 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
     if (to.toLowerCase() !== opts.jobContract.toLowerCase())
       return { call: "other", from, status: "success" };
     if (decoded?.functionName === "createJob") {
+      if (opts.skewJobCreatedId !== undefined && !createSkewed) {
+        createSkewed = true;
+        jobCounter += opts.skewJobCreatedId;
+      }
       jobCounter += 1n;
       const [provider, evaluator, expiredAt, description, hook] = decoded.args as [
         Address,
@@ -283,6 +368,7 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
         status: 0,
         hook,
       });
+      if (opts.emitJobCreatedLog) pendingCreated = chainJobs.get(jobCounter.toString());
       return { call: "createJob", from, status: "success" };
     }
     if (decoded?.functionName === "fund") {
@@ -313,6 +399,20 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
         credit(j.provider, j.budget);
       }
       return { call: "complete", from, status: "success" };
+    }
+    if (opts.runSubmit && decoded?.functionName === "submit") {
+      const [jobId, deliverable] = decoded.args as [bigint, Hex, Hex];
+      const j = jobOf(jobId);
+      if (!j || j.status !== 1 || from.toLowerCase() !== j.provider.toLowerCase())
+        return { call: "submit", from, status: "reverted" };
+      j.status = 2; // Submitted
+      if (!opts.omitSubmittedLog)
+        pendingLog = {
+          jobId,
+          provider: opts.skewJobSubmittedLog?.provider ?? from,
+          deliverable: opts.skewJobSubmittedLog?.deliverable ?? deliverable,
+        };
+      return { call: "submit", from, status: "success" };
     }
     // ── The two refunds, with the contract's own rules (see `test/mocks/MockERC8183Job.sol`) ──
     if (decoded?.functionName === "reject") {
@@ -374,6 +474,11 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
         const [{ to, data }] = params as [{ to?: Address; data?: Hex }];
         return call(to, data);
       }
+      case "eth_getBalance": {
+        if (!opts.nativeBalanceOf) throw new Error(`unexpected RPC call ${method}`);
+        const [address] = params as [Address];
+        return `0x${opts.nativeBalanceOf(address).toString(16)}`;
+      }
       case "eth_getTransactionCount": {
         const address = ((params as string[])[0] ?? "").toLowerCase();
         return `0x${(acceptedCount.get(address) ?? 0).toString(16)}`;
@@ -394,16 +499,27 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
         const action = execute(from, tx.to as Address, tx.data);
         actions.push(action);
         const hash = keccak256(raw);
-        if (opts.withholdReceipt === action.call && !withheld) withheld = true;
-        else receipts.set(hash, action.status === "success" ? "0x1" : "0x0");
+        rawOf.set(hash, raw);
+        if (pendingLog) logsOf.set(hash, pendingLog);
+        pendingLog = undefined;
+        if (pendingCreated) createdLogsOf.set(hash, pendingCreated);
+        pendingCreated = undefined;
+        if (opts.withholdReceipt === action.call && !withheld) {
+          withheld = true;
+          withheldReceipts.set(hash, action.status === "success" ? "0x1" : "0x0");
+        } else receipts.set(hash, action.status === "success" ? "0x1" : "0x0");
         sends.push({ hash, from, nonce, to: tx.to as Address });
         return hash;
       }
       // A node knows nothing about a hash it never accepted, and says so by answering null. The
       // default used to be "success", which is a way to write a green test about a transaction
       // that never existed.
-      case "eth_getTransactionByHash":
-        return null;
+      case "eth_getTransactionByHash": {
+        const hash = (params as Hex[])[0]!;
+        const raw = opts.answerTransactions ? rawOf.get(hash) : undefined;
+        if (!raw) return null;
+        return await rpcTransactionOf(hash, raw, receipts.has(hash));
+      }
       case "eth_getTransactionReceipt": {
         const hash = (params as Hex[])[0]!;
         const status = receipts.get(hash);
@@ -418,7 +534,49 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
           to: opts.jobContract,
           cumulativeGasUsed: "0x1",
           gasUsed: "0x1",
-          logs: [],
+          logs: (() => {
+            const created = createdLogsOf.get(hash);
+            if (created)
+              return [
+                {
+                  address: opts.jobContract,
+                  topics: encodeEventTopics({
+                    abi: jobCreatedEventAbi,
+                    eventName: "JobCreated",
+                    args: { jobId: created.id, client: created.client, provider: created.provider },
+                  }),
+                  data: encodeAbiParameters(
+                    [{ type: "address" }, { type: "uint256" }, { type: "address" }],
+                    [created.evaluator, created.expiredAt, created.hook],
+                  ),
+                  blockNumber: "0x1",
+                  blockHash: `0x${"11".repeat(32)}`,
+                  transactionHash: hash,
+                  transactionIndex: "0x0",
+                  logIndex: "0x0",
+                  removed: false,
+                },
+              ];
+            const l = logsOf.get(hash);
+            if (!l) return [];
+            return [
+              {
+                address: opts.jobContract,
+                topics: encodeEventTopics({
+                  abi: jobSubmittedEventAbi,
+                  eventName: "JobSubmitted",
+                  args: { jobId: l.jobId, provider: l.provider },
+                }),
+                data: encodeAbiParameters([{ type: "bytes32" }], [l.deliverable]),
+                blockNumber: "0x1",
+                blockHash: `0x${"11".repeat(32)}`,
+                transactionHash: hash,
+                transactionIndex: "0x0",
+                logIndex: "0x0",
+                removed: false,
+              },
+            ];
+          })(),
           logsBloom: `0x${"0".repeat(512)}`,
           type: "0x2",
           effectiveGasPrice: "0x1",
@@ -477,6 +635,11 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
         debit(j.client, j.budget);
       }
     },
+    /** Publish the receipt `withholdReceipt` held back: the transaction has landed after all. */
+    releaseWithheld: () => {
+      for (const [hash, status] of withheldReceipts) receipts.set(hash, status);
+      withheldReceipts.clear();
+    },
     /** What the provider's remote-signed `submit` does to the chain, without signing anything. */
     markSubmitted: (jobId: bigint) => {
       const j = jobOf(jobId);
@@ -486,6 +649,38 @@ export function usdcJobNode(opts: UsdcJobNodeOptions) {
 }
 
 export type UsdcJobNode = ReturnType<typeof usdcJobNode>;
+
+const hex = (v: bigint | number | undefined): Hex => `0x${BigInt(v ?? 0).toString(16)}`;
+
+/** A transaction as a node returns it: in block 1 once its receipt is out, pending before. */
+async function rpcTransactionOf(hash: Hex, raw: Hex, mined: boolean) {
+  const tx = parseTransaction(raw);
+  const from = await recoverTransactionAddress({
+    serializedTransaction: raw as `0x02${string}`,
+  });
+  return {
+    hash,
+    from,
+    to: tx.to ?? null,
+    input: tx.data ?? "0x",
+    nonce: hex(tx.nonce),
+    value: hex(tx.value),
+    gas: hex(tx.gas),
+    maxFeePerGas: hex(tx.maxFeePerGas),
+    maxPriorityFeePerGas: hex(tx.maxPriorityFeePerGas),
+    gasPrice: hex(tx.maxFeePerGas),
+    chainId: hex(tx.chainId),
+    type: "0x2",
+    accessList: [],
+    r: tx.r,
+    s: tx.s,
+    yParity: hex(tx.yParity),
+    v: hex(tx.yParity),
+    blockNumber: mined ? "0x1" : null,
+    blockHash: mined ? `0x${"11".repeat(32)}` : null,
+    transactionIndex: mined ? "0x0" : null,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // THE SAGA, WIRED THE WAY THE COMPOSITION ROOT WIRES IT

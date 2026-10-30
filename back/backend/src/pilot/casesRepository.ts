@@ -43,9 +43,13 @@ export interface PilotCaseRepository {
     detail: string | null;
     createdAt: string;
   }[];
-  /** Rows of `mode` that count against that mode's cap: status in filing, filed, ruled, settling, settled, filing_unknown, evidence_unknown. */
+  /**
+   * Rows of `mode` that count against that mode's cap: status in filing, filed, ruled, settling,
+   * settled, filing_unknown, evidence_unknown, and failed rows whose filing started, since their
+   * dispute exists or may exist whatever the row says, so failing one frees no slot.
+   */
   countFiled(mode: PilotMode): number;
-  /** Testnet rows at filed or later that carry a `seen_in_court` event: the live gate of design section 5.5 reads it. */
+  /** Testnet rows at filed or later that carry a `seen_in_court` event: the gate before a live filing reads it. */
   countSeenInCourt(mode: PilotMode): number;
   transaction<T>(fn: () => T): T;
 }
@@ -120,7 +124,7 @@ const COLUMN_OF = {
 const IDENTITY_FIELDS: ReadonlySet<string> = new Set(["mode", "chainId", "jobContract"]);
 
 /** The Kleros deployment of the case, written together by the `contested` to `filing` advance.
- *  Once `kleros_chain` is set, none of the three changes (design section 5.2). */
+ *  Once `kleros_chain` is set, none of the three changes: the deployment a case was filed on is part of its identity. */
 const KLEROS_DEPLOYMENT_FIELDS = ["klerosChain", "klerosCourtId", "klerosPolicyUri"] as const;
 
 /** The row as SQLite returns it: one property per column, snake_case. */
@@ -139,10 +143,28 @@ function toRecord(r: Row): PilotCaseRecord {
 
 /** The statuses that count against a mode's cap: every status from `filing` on, and the two
  *  in-doubt exits. `failed` is not among them: it is an error before any money moved. */
-const FILED_STATUSES_SQL =
-  "('filing','filed','ruled','settling','settled','filing_unknown','evidence_unknown')";
+export const PILOT_FILED_STATUSES: readonly PilotStatus[] = Object.freeze([
+  "filing",
+  "filed",
+  "ruled",
+  "settling",
+  "settled",
+  "filing_unknown",
+  "evidence_unknown",
+]);
 /** Filed or later: the dispute exists. `filing` and `filing_unknown` are before it is known to. */
-const FILED_OR_LATER_SQL = "('filed','ruled','settling','settled','evidence_unknown')";
+export const PILOT_FILED_OR_LATER_STATUSES: readonly PilotStatus[] = Object.freeze([
+  "filed",
+  "ruled",
+  "settling",
+  "settled",
+  "evidence_unknown",
+]);
+/** A status list as an SQL `IN` list. The statuses are the fixed words above, never input. */
+const sqlList = (statuses: readonly PilotStatus[]) =>
+  `(${statuses.map((s) => `'${s}'`).join(",")})`;
+const FILED_STATUSES_SQL = sqlList(PILOT_FILED_STATUSES);
+const FILED_OR_LATER_SQL = sqlList(PILOT_FILED_OR_LATER_STATUSES);
 
 export class SqlitePilotCaseRepository implements PilotCaseRepository {
   private readonly stmts;
@@ -174,7 +196,7 @@ export class SqlitePilotCaseRepository implements PilotCaseRepository {
       ),
       countFiled: db
         .prepare(
-          `SELECT COUNT(*) FROM pilot_cases WHERE mode = ? AND status IN ${FILED_STATUSES_SQL}`,
+          `SELECT COUNT(*) FROM pilot_cases WHERE mode = ? AND (status IN ${FILED_STATUSES_SQL} OR (status = 'failed' AND filing_started_at IS NOT NULL))`,
         )
         .pluck(),
       countSeenInCourt: db

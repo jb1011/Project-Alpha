@@ -119,7 +119,7 @@ export interface JobResult {
   status: number;
   hook: Address;
   // Note: the submitted deliverable is NOT in the Job struct on-chain.
-  // To read it, query the Submitted(jobId, deliverable) event log.
+  // To read it, query the JobSubmitted(jobId, provider, deliverable) event log.
 }
 
 /**
@@ -203,8 +203,9 @@ export class JobAdapter {
   /**
    * createJob — client creates a new job.
    *
-   * The real contract emits no JobCreated event, so the jobId comes from simulateContract's
-   * return value. On a shared, heavily-used counter a concurrent createJob mining between
+   * The interface ABI declares no events, so the jobId is taken from simulateContract's return
+   * value rather than from a log. On a shared, heavily-used counter a concurrent createJob
+   * mining between
    * simulate and inclusion could shift the id — acceptable for the demo (our createJobs are
    * infrequent and persisted immediately), flagged as a V2 hardening caveat.
    *
@@ -459,9 +460,20 @@ export class JobAdapter {
    * client. Permissionless on chain, and the refund goes to the job's CLIENT whoever sends it, so
    * we send it as the client: the key that paid the escrow is the one that gets it back, and no
    * other key of ours gains anything by paying that gas.
+   *
+   * `wallet` is the local key that sends the call and pays its gas; the refund lands with the
+   * job's client whichever key that is. The default stays the client, for the reason above and so
+   * every existing caller is unchanged. A caller that settles on another party's behalf, such as
+   * the Kleros pilot's referee, passes its own wallet and pays that gas itself. Named in a refusal
+   * as `reject` names it.
    */
-  async claimRefund(jobId: bigint): Promise<Hex> {
-    const h = await this.sendAsLocalKey(this.d.clientWallet, JOB_CLIENT, {
+  async claimRefund(jobId: bigint, wallet: WalletClient = this.d.clientWallet): Promise<Hex> {
+    const who =
+      wallet.account?.address?.toLowerCase() ===
+      this.d.evaluatorWallet?.account?.address?.toLowerCase()
+        ? JOB_EVALUATOR
+        : JOB_CLIENT;
+    const h = await this.sendAsLocalKey(wallet, who, {
       to: this.d.jobContract,
       data: encodeFunctionData({
         abi: iErc8183JobAbi,

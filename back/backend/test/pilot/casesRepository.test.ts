@@ -343,3 +343,22 @@ test("newCaseId is pc_ and 12 lower-case hex, and differs each call", () => {
   expect(ids.size).toBe(50);
   for (const id of ids) expect(id).toMatch(/^pc_[0-9a-f]{12}$/);
 });
+
+describe("countFiled after a filed case is failed", () => {
+  test("a failed row whose filing started still counts, so failing it frees no slot under the cap", () => {
+    const filed = repo.insert(newCase({ mode: "live" }));
+    db.prepare("UPDATE pilot_cases SET status = 'filed' WHERE case_id = ?").run(filed.caseId);
+    repo.patch(filed.caseId, { filingStartedAt: 1_800_000_000 });
+    expect(repo.countFiled("live")).toBe(1);
+
+    expect(repo.advance(filed.caseId, "filed", "failed", { error: "forced" })?.status).toBe(
+      "failed",
+    );
+    expect(repo.countFiled("live")).toBe(1);
+  });
+
+  test("a failed row that never started filing does not count", () => {
+    at("failed", "live");
+    expect(repo.countFiled("live")).toBe(0);
+  });
+});
