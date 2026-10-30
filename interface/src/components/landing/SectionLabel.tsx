@@ -9,7 +9,7 @@ export function SectionLabel({ index, label, tone = "ink", className = "" }: Pro
   const isInk = tone === "ink";
   return (
     <div
-      className={`inline-flex items-center gap-2 text-[11.5px] uppercase tracking-[0.22em] ${
+      className={`inline-flex items-center gap-2 text-[13px] uppercase tracking-[0.16em] ${
         isInk ? "text-muted-2" : "text-muted-dark"
       } ${className}`}
     >

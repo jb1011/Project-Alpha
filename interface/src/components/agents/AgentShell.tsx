@@ -33,7 +33,7 @@ export function AgentShell({ children }: { children: ReactNode }) {
           </nav>
         </div>
       </header>
-      <main className="mx-auto max-w-[1180px] px-5 pb-24 pt-8 lg:px-8">
+      <main id="content" className="mx-auto max-w-[1180px] px-5 pb-24 pt-8 lg:px-8">
         {children}
       </main>
     </div>

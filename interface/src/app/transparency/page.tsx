@@ -117,7 +117,7 @@ export default function TransparencyPage() {
   return (
     <div className="flex flex-1 flex-col bg-paper font-sans text-ink">
       <Nav />
-      <main className="flex flex-1 flex-col">
+      <main id="content" className="flex flex-1 flex-col">
         <section className="relative bg-paper">
           <div className="mx-auto max-w-[1240px] px-6 py-20 lg:px-10 lg:py-28">
             <SectionLabel index="01" label="Transparency" />

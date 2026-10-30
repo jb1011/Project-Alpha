@@ -1,13 +1,13 @@
-"use client";
+import type { Metadata } from "next";
+import type { ReactNode } from "react";
+import { AgentsProviders } from "./providers";
 
-import { type ReactNode } from "react";
-import { Web3Provider } from "@/components/providers/Web3Provider";
-import { AuthProvider } from "@/components/onboarding/AuthProvider";
+export const metadata: Metadata = {
+  title: "Your agents",
+  description: "Companies you have started on Arc testnet.",
+  robots: { index: false, follow: true },
+};
 
 export default function AgentsLayout({ children }: { children: ReactNode }) {
-  return (
-    <Web3Provider>
-      <AuthProvider>{children}</AuthProvider>
-    </Web3Provider>
-  );
+  return <AgentsProviders>{children}</AgentsProviders>;
 }

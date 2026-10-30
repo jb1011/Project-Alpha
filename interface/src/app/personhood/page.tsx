@@ -1,13 +1,21 @@
+import type { Metadata } from "next";
 import Link from "next/link";
 import { SectionLabel } from "@/components/landing/SectionLabel";
 import { Nav } from "@/components/landing/Nav";
 import { Footer } from "@/components/landing/Footer";
 
+export const metadata: Metadata = {
+  title: "Proof of personhood",
+  description:
+    "How Novi Corpus uses World ID so one person stands behind an agent, without storing a name, a document, or a face.",
+  alternates: { canonical: "/personhood" },
+};
+
 export default function PersonhoodPage() {
   return (
     <div className="flex flex-1 flex-col bg-paper font-sans text-ink">
       <Nav />
-      <main className="flex flex-1 flex-col">
+      <main id="content" className="flex flex-1 flex-col">
         <section className="relative bg-paper">
           <div className="mx-auto max-w-[840px] px-6 py-20 lg:px-10 lg:py-28">
             <SectionLabel index="01" label="Proof of personhood" />

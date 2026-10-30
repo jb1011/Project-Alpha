@@ -18,10 +18,16 @@ const MARK: Record<Tone, string> = {
 };
 
 /** Courthouse mark. `ink` is the light mark for dark surfaces. */
-function Mark({ tone = "ink" }: { tone?: Tone }) {
+function Mark({ tone = "ink", className = "" }: { tone?: Tone; className?: string }) {
   return (
     // eslint-disable-next-line @next/next/no-img-element
-    <img src={MARK[tone]} alt="" className="h-7 w-7 object-contain" />
+    <img
+      src={MARK[tone]}
+      alt=""
+      width={1068}
+      height={1000}
+      className={`h-8 w-auto object-contain ${className}`}
+    />
   );
 }
 
@@ -33,7 +39,21 @@ export function Wordmark({ className = "", tone = "ink" }: Props) {
       aria-label="Novi Corpus home"
     >
       {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img src={LOCKUP[tone]} alt="" className="h-8 w-auto" />
+      <img
+        src={MARK[tone]}
+        alt=""
+        width={1068}
+        height={1000}
+        className="h-8 w-auto sm:hidden"
+      />
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={LOCKUP[tone]}
+        alt=""
+        width={2419}
+        height={400}
+        className="hidden h-8 w-auto sm:block"
+      />
     </Link>
   );
 }

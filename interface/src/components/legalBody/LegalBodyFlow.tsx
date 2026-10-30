@@ -647,11 +647,11 @@ function FlowLayout({
   );
   if (!rail) {
     return (
-      <main className="mx-auto max-w-[820px] px-5 pb-24 pt-10 lg:px-8 lg:pt-14">{content}</main>
+      <main id="content" className="mx-auto max-w-[820px] px-5 pb-24 pt-10 lg:px-8 lg:pt-14">{content}</main>
     );
   }
   return (
-    <main className="mx-auto grid max-w-[1180px] grid-cols-1 gap-10 px-5 pb-24 pt-10 lg:grid-cols-[230px_1fr] lg:gap-14 lg:px-8 lg:pt-14">
+    <main id="content" className="mx-auto grid max-w-[1180px] grid-cols-1 gap-10 px-5 pb-24 pt-10 lg:grid-cols-[230px_1fr] lg:gap-14 lg:px-8 lg:pt-14">
       <div className="lg:sticky lg:top-24 lg:self-start">
         <LegalBodyRail phases={phases} current={current} done={done} onJump={onJump} />
       </div>
@@ -667,9 +667,9 @@ function DoorScreen({
   door: Exclude<LegalBodyDoor, { kind: "open" }>;
   onRetry: () => void;
 }) {
-  if (door.kind === "loading") return <main className="min-h-[60vh]" aria-busy />;
+  if (door.kind === "loading") return <main id="content" className="min-h-[60vh]" aria-busy />;
   return (
-    <main className="mx-auto max-w-[720px] px-5 pb-24 pt-16 lg:px-8">
+    <main id="content" className="mx-auto max-w-[720px] px-5 pb-24 pt-16 lg:px-8">
       <Card className="p-6">
         <p className="text-[14px] leading-[1.6] text-ink">{door.sentence}</p>
       </Card>

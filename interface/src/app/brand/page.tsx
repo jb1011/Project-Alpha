@@ -5,8 +5,9 @@ import { SectionLabel } from "@/components/landing/SectionLabel";
 import { Mark, Wordmark } from "@/components/landing/Wordmark";
 
 export const metadata: Metadata = {
-  title: "Novi Corpus brand kit",
+  title: "Brand kit",
   description: "Marks and color for Novi Corpus. Download the lockup and the courthouse mark.",
+  alternates: { canonical: "/brand" },
 };
 
 const marks: {
@@ -79,7 +80,7 @@ export default function BrandPage() {
   return (
     <div className="flex flex-1 flex-col bg-paper font-sans text-ink">
       <Nav />
-      <main className="flex flex-1 flex-col">
+      <main id="content" className="flex flex-1 flex-col">
         <section className="relative bg-paper">
           <div className="mx-auto max-w-[1100px] px-6 py-16 lg:px-10 lg:py-20">
             <SectionLabel index="01" label="Marks" />
@@ -129,7 +130,7 @@ export default function BrandPage() {
 
             <div className="mt-4 grid gap-4 sm:grid-cols-2">
               <div className="rounded-2xl border hairline bg-paper-2 p-5">
-                <div className="text-[11.5px] uppercase tracking-[0.22em] text-muted-2">
+                <div className="text-[13px] uppercase tracking-[0.22em] text-muted-2">
                   In the product
                 </div>
                 <div className="mt-5 flex items-center gap-6">
@@ -148,7 +149,7 @@ export default function BrandPage() {
                 </a>
               </div>
               <div className="rounded-2xl border hairline bg-paper-2 p-5">
-                <div className="text-[11.5px] uppercase tracking-[0.22em] text-muted-2">
+                <div className="text-[13px] uppercase tracking-[0.22em] text-muted-2">
                   Name
                 </div>
                 <p className="mt-5 text-[28px] font-medium leading-none tracking-[-0.02em]">
@@ -183,10 +184,10 @@ export default function BrandPage() {
                   />
                   <span>
                     <span className="block text-[14px] font-medium">{color.name}</span>
-                    <span className="mt-0.5 block font-mono text-[12px] uppercase tracking-[0.08em] text-muted">
+                    <span className="mt-0.5 block font-mono text-[13px] uppercase tracking-[0.08em] text-muted">
                       {color.hex}
                     </span>
-                    <span className="mt-0.5 block text-[12.5px] text-muted-2">
+                    <span className="mt-0.5 block text-[13px] text-muted-2">
                       {color.role}
                     </span>
                   </span>

@@ -309,7 +309,7 @@ function OnboardingFlowInner({ initial }: { initial: Persisted | null }) {
         </div>
       </header>
 
-      <main className="mx-auto grid max-w-[1180px] grid-cols-1 gap-10 px-5 pb-24 pt-10 lg:grid-cols-[230px_1fr] lg:gap-14 lg:px-8 lg:pt-14">
+      <main id="content" className="mx-auto grid max-w-[1180px] grid-cols-1 gap-10 px-5 pb-24 pt-10 lg:grid-cols-[230px_1fr] lg:gap-14 lg:px-8 lg:pt-14">
         <div className="lg:sticky lg:top-24 lg:self-start">
           <Stepper
             phases={phases}
