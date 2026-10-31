@@ -59,27 +59,102 @@ export function duplicateKey(raw: string): string {
  *  - `byLower` makes "is what they typed exactly a label?" an O(1) lookup, and returns the label
  *    in its CANONICAL casing — which is what must be committed, because the door accepts the
  *    labels as shipped;
- *  - `known` is the exact-match set the validator asks.
+ *  - `known` is the exact-match set the validator asks;
+ *  - `suggested` is what the empty field offers, and `rank` puts those labels ahead of the
+ *    alphabet when a query matches several.
  */
 export interface IndustryIndex {
-  /** As served, in the order doola published it — the picker sorts nothing for itself. */
+  /** As served, in the order doola published it, minus `HIDDEN_INDUSTRIES`. */
   options: readonly string[];
   lowered: readonly { label: string; lower: string }[];
   byLower: ReadonlyMap<string, string>;
   known: ReadonlySet<string>;
+  /** `AGENT_INDUSTRIES` that the served list actually carries, in that order. */
+  suggested: readonly string[];
+  rank: ReadonlyMap<string, number>;
 }
+
+/**
+ * Labels the picker never offers. doola files them and the backend still accepts them; they are
+ * hidden because they are not what an agent's company does, and a founder opening the field should
+ * not meet them first. The served list stays the authority on what is FILABLE.
+ */
+export const HIDDEN_INDUSTRIES: ReadonlySet<string> = new Set(["Adult entertainment"]);
+
+/**
+ * What an agent's company actually does: offered in this order when the field is empty, and ahead
+ * of the alphabet when a query matches several labels ("soft" means "Software", not "Soft drink
+ * manufacturing"). Each entry must be a label doola serves, exactly as spelled; one the list does
+ * not carry is dropped by `industryIndex`, never shown, so a suggestion is never a refused label.
+ */
+export const AGENT_INDUSTRIES: readonly string[] = [
+  "Marketing",
+  "Digital marketing",
+  "Social media marketing",
+  "Content creator",
+  "Writing and editing service",
+  "Communications / public relations",
+  "Research",
+  "Data analysis",
+  "Data science",
+  "Artificial intelligence",
+  "Software development",
+  "SaaS",
+  "Automation",
+  "Website development",
+  "Customer service",
+  "Virtual assistant",
+  "Admin support",
+  "Bookkeeping",
+  "E-commerce",
+  "Online sales",
+  "Trading",
+  "Fintech",
+  "Financial services",
+  "Business consulting",
+  "Technology consulting",
+  "Media production",
+  "Graphic design",
+  "Online education services",
+  "Logistics",
+];
 
 /** `undefined` (the list has not arrived) yields an EMPTY index rather than a null one, so every
  *  consumer reads the same shape and nothing is claimed about a label until the list is in. */
 export function industryIndex(options: readonly string[] | undefined): IndustryIndex {
-  const list = options ?? [];
+  const list = (options ?? []).filter((label) => !HIDDEN_INDUSTRIES.has(label));
   const lowered = list.map((label) => ({ label, lower: label.toLowerCase() }));
+  const known = new Set(list);
+  const suggested = AGENT_INDUSTRIES.filter((label) => known.has(label));
   return {
     options: list,
     lowered,
     byLower: new Map(lowered.map(({ label, lower }) => [lower, label])),
-    known: new Set(list),
+    known,
+    suggested,
+    rank: new Map(suggested.map((label, i) => [label, i])),
   };
+}
+
+const UNRANKED = Number.MAX_SAFE_INTEGER;
+
+/**
+ * The type-ahead's choices for what is typed. Empty: the agent suggestions (or, on a list that
+ * carries none of them, the first `max` labels). Otherwise prefix matches before the ones that only
+ * contain the query, each group with the suggestions first and the alphabet after, capped at `max`.
+ */
+export function industryMatches(index: IndustryIndex, query: string, max: number): string[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return index.suggested.length > 0 ? [...index.suggested] : index.options.slice(0, max);
+  const starts: string[] = [];
+  const contains: string[] = [];
+  for (const { label, lower } of index.lowered) {
+    if (lower.startsWith(q)) starts.push(label);
+    else if (lower.includes(q)) contains.push(label);
+  }
+  const byRank = (a: string, b: string) =>
+    (index.rank.get(a) ?? UNRANKED) - (index.rank.get(b) ?? UNRANKED);
+  return [...starts.sort(byRank), ...contains.sort(byRank)].slice(0, max);
 }
 
 export type CompanyIntakeForm = {

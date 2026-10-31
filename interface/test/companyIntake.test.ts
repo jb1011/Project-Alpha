@@ -12,9 +12,13 @@
  * the backend holds, whose client copy would be a second list. A test asserting its absence is
  * what stops somebody adding it back "for the nicer error message".
  */
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { expect, test } from "vitest";
 import {
+  AGENT_INDUSTRIES,
   FALLBACK_INTAKE_RULES,
+  HIDDEN_INDUSTRIES,
   intakeRulesOf,
   canAttach,
   companyLabel,
@@ -22,6 +26,7 @@ import {
   emptyCompanyIntake,
   isCompanyIntakeValid,
   industryIndex,
+  industryMatches,
   intakeFormOf,
   legalBodyBranch,
   stripEntityEnding,
@@ -271,6 +276,70 @@ test("INDEX: an unarrived list is an EMPTY index, not a null one", () => {
   expect(
     validateCompanyIntake({ ...VALID, industryLabel: "Anything" }, RULES, index.known).industryLabel,
   ).toBeNull();
+});
+
+/* ── what the field offers: agent suggestions first, the hidden label never ── */
+
+/** The backend's generated copy of doola's list: the one the create door checks against. */
+const SERVED = [
+  ...readFileSync(
+    fileURLToPath(
+      new URL("../../back/backend/src/formation/naicsLabelsData.ts", import.meta.url),
+    ),
+    "utf8",
+  ).matchAll(/^ {2}"([^"]+)",$/gm),
+].map((m) => m[1]);
+
+test("SUGGEST: every agent suggestion is a label doola serves, spelled exactly", () => {
+  // A typo would not break anything, it would vanish: `industryIndex` drops what the list does not
+  // carry. This is what notices.
+  expect(SERVED.length).toBeGreaterThan(800);
+  const served = new Set(SERVED);
+  expect(AGENT_INDUSTRIES.filter((label) => !served.has(label))).toEqual([]);
+  expect(new Set(AGENT_INDUSTRIES).size).toBe(AGENT_INDUSTRIES.length);
+});
+
+test("SUGGEST: a hidden label is neither offered, matched nor accepted", () => {
+  expect(SERVED).toContain("Adult entertainment");
+  const index = industryIndex(SERVED);
+  for (const label of HIDDEN_INDUSTRIES) {
+    expect(index.options).not.toContain(label);
+    expect(index.known.has(label)).toBe(false);
+    expect(index.byLower.get(label.toLowerCase())).toBeUndefined();
+  }
+  expect(industryMatches(index, "", 12)).not.toContain("Adult entertainment");
+  expect(industryMatches(index, "adult", 12)).toEqual([]);
+  expect(index.options).toHaveLength(SERVED.length - HIDDEN_INDUSTRIES.size);
+});
+
+test("SUGGEST: the empty field offers the agent list, in its order, and only served labels", () => {
+  const index = industryIndex(["Coffee shops", "Research", "Marketing", "Adult entertainment"]);
+  expect(index.suggested).toEqual(["Marketing", "Research"]);
+  expect(industryMatches(index, "", 12)).toEqual(["Marketing", "Research"]);
+  expect(industryMatches(index, "   ", 12)).toEqual(["Marketing", "Research"]);
+  // On the real list it is the whole agent list, not the first twelve of the alphabet.
+  expect(industryMatches(industryIndex(SERVED), "", 12)).toEqual([...AGENT_INDUSTRIES]);
+});
+
+test("SUGGEST: a list with none of the suggestions falls back to its first labels", () => {
+  const index = industryIndex(["Coffee shops", "Bakery", "Florist"]);
+  expect(index.suggested).toEqual([]);
+  expect(industryMatches(index, "", 2)).toEqual(["Coffee shops", "Bakery"]);
+});
+
+test("SUGGEST: typed, prefix matches come first, suggestions lead each group, capped", () => {
+  const index = industryIndex(SERVED);
+  // "soft" means Software, not the drinks factory the alphabet puts first.
+  const soft = industryMatches(index, "soft", 12);
+  expect(soft[0]).toBe("Software development");
+  expect(soft).toContain("Soft drink manufacturing");
+  // A prefix match outranks a suggestion that only CONTAINS the query.
+  const market = industryMatches(index, "market", 12);
+  expect(market[0]).toBe("Marketing");
+  expect(market.indexOf("Digital marketing")).toBeGreaterThan(market.indexOf("Marketing consulting"));
+  expect(industryMatches(index, "a", 5)).toHaveLength(5);
+  // Case and surrounding spaces do not change the answer.
+  expect(industryMatches(index, "  MARKET ", 12)).toEqual(market);
 });
 
 test("INTAKE FORM: a stored row becomes exactly three whole-string candidates", () => {
