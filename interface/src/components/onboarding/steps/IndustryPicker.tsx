@@ -1,7 +1,7 @@
 "use client";
 
 import { useId, useMemo, useRef, useState } from "react";
-import type { IndustryIndex } from "@/lib/formation/companyIntake";
+import { type IndustryIndex, industryMatches } from "@/lib/formation/companyIntake";
 import { Field, TextInput, cx } from "../primitives";
 
 /**
@@ -44,20 +44,12 @@ export function IndustryPicker({
   const [open, setOpen] = useState(false);
   const blurTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const matches = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return industries.options.slice(0, MAX_SUGGESTIONS);
-    // Prefix matches first — a founder typing "cons" means "Consulting", not "Air conditioning
-    // contractors" — then everything else that contains the query, capped.
-    const starts: string[] = [];
-    const contains: string[] = [];
-    for (const { label, lower } of industries.lowered) {
-      if (lower.startsWith(q)) starts.push(label);
-      else if (lower.includes(q)) contains.push(label);
-      if (starts.length >= MAX_SUGGESTIONS) break;
-    }
-    return [...starts, ...contains].slice(0, MAX_SUGGESTIONS);
-  }, [query, industries]);
+  // Empty: the agent suggestions. Typed: prefix matches before contains, suggestions first in
+  // each, so "soft" leads with "Software" rather than "Soft drink manufacturing".
+  const matches = useMemo(
+    () => industryMatches(industries, query, MAX_SUGGESTIONS),
+    [query, industries],
+  );
 
   // O(1), and it hands back the label in its CANONICAL casing — which is what must be committed,
   // because the create door accepts the labels exactly as it ships them.
@@ -83,7 +75,7 @@ export function IndustryPicker({
           role="combobox"
           aria-expanded={open}
           aria-controls={`${id}-list`}
-          placeholder={loading ? "…" : "Start typing — e.g. software, consulting, coffee"}
+          placeholder={loading ? "…" : "Pick one below or type, e.g. marketing, research, software"}
           disabled={loading}
           value={query}
           invalid={!!error}
