@@ -8,8 +8,8 @@ import { authPanelState } from "./authPanel";
 import { shortenErr } from "@/lib/errors";
 
 /** DiceBear's portrait package breaks the server bundle, same as the agent face. */
-const WalkingVoxel = dynamic(
-  () => import("@/components/agents/WalkingVoxel").then((mod) => mod.WalkingVoxel),
+const PeekingVoxel = dynamic(
+  () => import("@/components/agents/PeekingVoxel").then((mod) => mod.PeekingVoxel),
   { ssr: false },
 );
 
@@ -56,31 +56,33 @@ export function RequireAuth({ children }: { children: ReactNode }) {
   if (session) return <>{children}</>;
 
   return (
-    <div className="flex min-h-screen items-center justify-center px-5 py-16 pb-40">
-      <WalkingVoxel />
-      <Card className="relative z-10 w-full max-w-md p-6 text-center">
-        <h1 className="text-[22px] font-medium text-ink">Sign in to continue</h1>
-        <p className="mt-2 text-[13px] leading-relaxed text-muted">
-          Connect the guardian wallet you used when creating your agents.
-        </p>
-        <div className="mt-6 flex flex-col gap-3">
-          <Button
-            onClick={() =>
-              void (panel.action === "connect"
-                ? run(connectWallet, "Wallet connection failed.")
-                : run(login, "Sign-in failed."))
-            }
-            loading={panel.pending}
-          >
-            {panel.label}
-          </Button>
-          {error ? (
-            <Callout tone="warn" title="Something went wrong" className="text-left">
-              {error}
-            </Callout>
-          ) : null}
-        </div>
-      </Card>
+    <div className="flex min-h-screen items-center justify-center px-5 py-24">
+      <div className="relative z-10 w-full max-w-md">
+        <PeekingVoxel />
+        <Card className="relative z-10 w-full p-6 text-center">
+          <h1 className="text-[22px] font-medium text-ink">Sign in to continue</h1>
+          <p className="mt-2 text-[13px] leading-relaxed text-muted">
+            Connect the guardian wallet you used when creating your agents.
+          </p>
+          <div className="mt-6 flex flex-col gap-3">
+            <Button
+              onClick={() =>
+                void (panel.action === "connect"
+                  ? run(connectWallet, "Wallet connection failed.")
+                  : run(login, "Sign-in failed."))
+              }
+              loading={panel.pending}
+            >
+              {panel.label}
+            </Button>
+            {error ? (
+              <Callout tone="warn" title="Something went wrong" className="text-left">
+                {error}
+              </Callout>
+            ) : null}
+          </div>
+        </Card>
+      </div>
     </div>
   );
 }
